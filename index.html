@@ -174,13 +174,81 @@ function persistState(){
     // Embedded starting reports already live inside the HTML, so do not duplicate
     // their ~thousands of rows in localStorage. Only user-added/replaced datasets
     // and tombstones for removed embedded datasets are persisted.
-    const serializable={...state,version:6,datasets:state.datasets.filter(d=>!d.embedded)};
+    const serializable={...state,version:6,datasets:state.datasets.filter(d=>!d.embedded&&!d.apiAuto)};
     const json=JSON.stringify(serializable);
     const val=window.LZString?LZString.compressToUTF16(json):json;
     localStorage.setItem(STORAGE_KEY,val);
   }catch(e){
     showMessage('Не удалось сохранить состояние в localStorage. Вероятно, браузер достиг лимита хранилища. Удалите старые отчёты в «Настройках» или сохраните меньше периодов.', 'error');
   }
+}
+
+
+/* ---------------------- automatic Ozon Seller API sync ----------------------
+   GitHub Actions writes encrypted data/ozon-data.enc.json. The API key never
+   reaches the browser. The browser asks for DASHBOARD_PASSWORD and decrypts the
+   payload locally with PBKDF2 + AES-GCM. If the remote file is unavailable or
+   the password is wrong, the embedded Excel baseline remains usable.
+---------------------------------------------------------------------------- */
+const API_DATA_URL='./data/ozon-data.enc.json';
+const API_STATUS_URL='./data/ozon-status.json';
+const API_PW_SESSION='ozonDashboard.apiPassword.session';
+const API_PW_REMEMBER='ozonDashboard.apiPassword.remember';
+let apiSyncStatus={available:false,loaded:false,generatedAt:null,error:null};
+
+function b64bytes(s){const bin=atob(s);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return a}
+async function decryptApiEnvelope(env,password){
+  const enc=new TextEncoder();
+  const base=await crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']);
+  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64bytes(env.salt),iterations:env.iterations||250000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['decrypt']);
+  const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64bytes(env.iv),tagLength:128},key,b64bytes(env.data));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+function apiPasswordDialog(){
+  return new Promise(resolve=>{
+    const wrap=document.createElement('div');wrap.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(3,5,10,.78);backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px';
+    wrap.innerHTML=`<div style="width:min(460px,100%);background:#11151f;border:1px solid #2b3346;border-radius:18px;padding:22px;box-shadow:0 22px 80px rgba(0,0,0,.5)"><div style="font-size:18px;font-weight:800;margin-bottom:6px">Автообновление Ozon подключено</div><div style="color:#8f9ab0;margin-bottom:16px">GitHub уже получил свежие данные через Seller API. Введите пароль <b>DASHBOARD_PASSWORD</b>, который вы сохранили в GitHub Secrets. API-ключ сюда вводить не нужно.</div><input id="apiPwInput" type="password" autocomplete="current-password" placeholder="Пароль дашборда" style="width:100%;background:#090b11;color:#ecf1fb;border:1px solid #30394d;border-radius:10px;padding:11px 12px;outline:none"><label style="display:flex;gap:8px;align-items:center;color:#aab4c8;margin:12px 0"><input id="apiRemember" type="checkbox"> Запомнить пароль в этом браузере</label><div id="apiPwErr" style="display:none;color:#ff7c8a;margin-bottom:10px"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button id="apiSkip" style="background:#202637;color:#dce4f5;border:0;border-radius:10px;padding:9px 13px;cursor:pointer">Пока открыть старые данные</button><button id="apiUnlock" style="background:#7c8cff;color:white;border:0;border-radius:10px;padding:9px 13px;cursor:pointer;font-weight:700">Открыть актуальные данные</button></div></div>`;
+    document.body.appendChild(wrap);const inp=wrap.querySelector('#apiPwInput');inp.focus();
+    const done=v=>{wrap.remove();resolve(v)};
+    wrap.querySelector('#apiSkip').onclick=()=>done(null);
+    wrap.querySelector('#apiUnlock').onclick=()=>done({password:inp.value,remember:wrap.querySelector('#apiRemember').checked,err:wrap.querySelector('#apiPwErr')});
+    inp.addEventListener('keydown',e=>{if(e.key==='Enter')wrap.querySelector('#apiUnlock').click()});
+  });
+}
+function applyApiPayload(payload){
+  if(!payload?.datasets?.length)throw new Error('В файле автообновления нет наборов данных.');
+  const remoteTypes=new Set(payload.datasets.map(d=>d.type));
+  // API is authoritative for the types it returned. Keep the 1C cost dataset and
+  // any source types not present in this particular API run.
+  state.datasets=state.datasets.filter(d=>!remoteTypes.has(d.type));
+  for(const d of payload.datasets)state.datasets.push({...d,apiAuto:true,embedded:false});
+  apiSyncStatus={available:true,loaded:true,generatedAt:payload.generatedAt,error:null,diagnostics:payload.diagnostics};
+  state.activePeriod='all';
+  rebuildPeriodSelect();renderAll();
+  showMessage(`Актуальные данные Ozon API загружены. Последняя синхронизация: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}.`,'success');
+}
+async function loadRemoteAutoData(){
+  try{
+    // A small public status file contains no financial values or secrets.
+    const statusRes=await fetch(`${API_STATUS_URL}?t=${Date.now()}`,{cache:'no-store'});
+    if(!statusRes.ok)return;
+    const status=await statusRes.json();apiSyncStatus.available=true;apiSyncStatus.generatedAt=status.generatedAt||null;renderSourceChips();
+    const encRes=await fetch(`${API_DATA_URL}?t=${Date.now()}`,{cache:'no-store'});if(!encRes.ok)throw new Error(`Файл данных API недоступен: HTTP ${encRes.status}`);
+    const env=await encRes.json();
+    let password=sessionStorage.getItem(API_PW_SESSION)||localStorage.getItem(API_PW_REMEMBER)||'';
+    let remember=!!localStorage.getItem(API_PW_REMEMBER);
+    if(!password){const ans=await apiPasswordDialog();if(!ans)return;password=ans.password;remember=ans.remember}
+    try{
+      const payload=await decryptApiEnvelope(env,password);
+      sessionStorage.setItem(API_PW_SESSION,password);if(remember)localStorage.setItem(API_PW_REMEMBER,password);
+      applyApiPayload(payload);
+    }catch(e){
+      sessionStorage.removeItem(API_PW_SESSION);localStorage.removeItem(API_PW_REMEMBER);
+      apiSyncStatus.error='Неверный пароль или повреждённый файл данных';renderSourceChips();
+      showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_PASSWORD. Пока показаны встроенные данные из Excel.','error');
+      const ans=await apiPasswordDialog();if(ans?.password){try{const payload=await decryptApiEnvelope(env,ans.password);sessionStorage.setItem(API_PW_SESSION,ans.password);if(ans.remember)localStorage.setItem(API_PW_REMEMBER,ans.password);applyApiPayload(payload)}catch{showMessage('Пароль снова не подошёл. Оставлены встроенные данные.','error')}}
+    }
+  }catch(e){apiSyncStatus.error=e.message||String(e);renderSourceChips();console.warn('Ozon API auto sync:',e)}
 }
 
 /* ------------------------------ helpers ------------------------------ */
@@ -447,7 +515,7 @@ function buildModel(){
   const manual=state.manualCosts;const useFinanceAccrual=financeDs.some(d=>d.capabilities?.accrualReport);const financeRevenueBase=sum(products,x=>Math.max(0,x.finance.grossRevenue));
   for(const o of products){
     const m=manual[o.key]||manual[`A:${o.article}`]||manual[`S:${o.sku}`];o.cost=o.costConflict?null:(o.reportCost!=null?o.reportCost:(m&&Number.isFinite(+m.value)?+m.value:null));o.costSource=o.costConflict?'missing':(o.reportCost!=null?'report':(o.cost!=null?'manual':'missing'));
-    o.revenue=useFinanceAccrual?o.finance.grossRevenue:(o.finance.hasGross?o.finance.grossRevenue:o.sales.revenue);o.units=useFinanceAccrual?(o.finance.soldQty-o.finance.returnedQty):(o.sales.delivered>0?o.sales.delivered:o.sales.ordered);o.price=o.units>0&&o.revenue>0?o.revenue/o.units:o.currentPrice;
+    o.revenue=useFinanceAccrual?o.finance.grossRevenue:(o.finance.hasGross?o.finance.grossRevenue:o.sales.revenue);const financeUnits=o.finance.soldQty-o.finance.returnedQty;o.units=useFinanceAccrual?(financeUnits!==0?financeUnits:(o.sales.delivered>0?o.sales.delivered:o.sales.ordered)):(o.sales.delivered>0?o.sales.delivered:o.sales.ordered);o.price=o.units>0&&o.revenue>0?o.revenue/o.units:o.currentPrice;
     const periodDays=salesDs.length?unionDays(salesDs):7;o.velocity=o.sales.ordered>0&&periodDays?o.sales.ordered/periodDays:(o.tariff?.orders7>0?o.tariff.orders7/7:0);o.daysToZero=o.stock==null?null:(o.velocity>0?o.stock/o.velocity:(o.stock>0?Infinity:0));
     o.cogs=o.cost!=null&&o.units>0?o.cost*o.units:(o.cost!=null&&o.units===0?0:null);
     const tf=o.tariff;const scheme=norm(o.scheme);let tariffPer={commission:null,acquiring:null,logistics:null,storage:null};
@@ -503,7 +571,7 @@ function rebuildPeriodSelect(){
   const sel=$('#periodSelect');sel.innerHTML=`<option value="all">Все загруженные периоды</option>`+[...ranges].sort((a,b)=>b[0].localeCompare(a[0])).map(([k,v])=>`<option value="${k}">${v}</option>`).join('');if(![...sel.options].some(o=>o.value===state.activePeriod))state.activePeriod='all';sel.value=state.activePeriod;
 }
 function renderAll(){currentModel=buildModel();renderSourceChips();renderQuality();renderKpis();renderOverview();renderPlan();renderUnit();renderProducts();renderAds();renderStock();renderSettings();renderChartsForTab(activeTab)}
-function renderSourceChips(){const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;const labels={sales:'Продажи',stock:'Остатки',price:'Цены/тарифы',finance:'Финансы',ads:'Реклама'};$('#sourceChips').innerHTML=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('')}
+function renderSourceChips(){const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;const labels={sales:'Продажи',stock:'Остатки',price:'Цены/тарифы',finance:'Финансы',ads:'Реклама'};let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;else if(apiSyncStatus.available)html+=`<span class="chip warn">API: данные заблокированы</span>`;else if(apiSyncStatus.error)html+=`<span class="chip warn">API: ошибка sync</span>`;$('#sourceChips').innerHTML=html}
 function renderQuality(){const m=currentModel;const missing=[];if(!m.salesDs.length)missing.push('отчёт продаж / воронки');if(!m.stockDs)missing.push('отчёт остатков');if(!m.priceDs)missing.push('отчёт «Товары и цены»');if(!m.financeDs.length)missing.push('фактический финансовый отчёт Ozon');if(!m.adsDs.length)missing.push('детальный отчёт по рекламе (для кампаний и распределения по SKU)');if(!Number.isFinite(state.settings.taxRate))missing.push('ставка налога продавца');const knownPct=pct(m.costRev.report+m.costRev.manual,m.totalRevenue);const finNote=m.financeDs.length?` Финансовый отчёт загружен: фактические начисления за период учтены${m.financeNetAccrued!=null?`; итог начислений после услуг Ozon — ${fmtMoney(m.financeNetAccrued)}`:''}. Общие начисления без SKU распределяются по выручке и явно помечаются как распределённые.`:'';$('#dataQuality').innerHTML=`<b>Качество данных.</b> Себестоимость известна по ${fmtPct(knownPct||0)} выручки.${finNote} ${missing.length?`Для полного расчёта не хватает: ${missing.join(', ')}.`:'Все основные источники загружены.'} Тарифы из «Товары и цены» используются только там, где нет фактических начислений.`}
 function renderKpis(){const m=currentModel;const coverage=pct(m.costRev.report+m.costRev.manual,m.totalRevenue)||0;const reportShare=pct(m.costRev.report,m.totalRevenue)||0,manualShare=pct(m.costRev.manual,m.totalRevenue)||0,missingShare=pct(m.costRev.missing,m.totalRevenue)||0;const cogsPct=(m.costRev.report+m.costRev.manual)>0?pct(m.totalCogs,m.costRev.report+m.costRev.manual):null;const profitCoverage=pct(m.completeRevenue,m.totalRevenue)||0;const margin=m.completeRevenue?pct(m.completeProfit,m.completeRevenue):null;const roi=m.totalCogs?pct(m.completeProfit,sum(m.complete,x=>x.cogs)):null;const drr=m.adsSpend!=null?pct(m.adsSpend,m.totalRevenue):null;const losses=m.complete.filter(x=>x.cleanProfit<0).length;const attention=m.stockStats.critical+losses;const profitClass=m.completeProfit>=0?'positive':'negative';const profitStatus=m.complete.length?(m.completeProfit>=0?'операционно прибыльно':'операционный убыток'):'нет полной юнит-экономики';
   const cards=[
@@ -599,7 +667,7 @@ $('#tabs').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');i
 const dz=$('#dropZone');['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag')}));['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag')}));dz.addEventListener('drop',e=>{const files=[...e.dataTransfer.files].filter(f=>/\.xlsx?$/i.test(f.name));if(files.length)ingestFiles(files)})
 
 // Initial render. The supplied Ozon reports and the filtered 1C purchase costs are embedded as the starting dataset; later changes are persisted in browser localStorage.
-rebuildPeriodSelect();renderAll();
+rebuildPeriodSelect();renderAll();loadRemoteAutoData();
 </script>
 </body>
 </html>
