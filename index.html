@@ -208,7 +208,7 @@ const API_DATA_URL='./data/ozon-data.enc.json';
 const API_STATUS_URL='./data/ozon-status.json';
 const API_PW_SESSION='ozonDashboard.apiPassword.session';
 const API_PW_REMEMBER='ozonDashboard.apiPassword.remember';
-let apiSyncStatus={available:false,loaded:false,generatedAt:null,error:null};
+let apiSyncStatus={available:false,loaded:false,loading:false,generatedAt:null,error:null};
 
 function b64bytes(s){const bin=atob(s);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return a}
 async function decryptApiEnvelope(env,password){
@@ -241,28 +241,64 @@ function applyApiPayload(payload){
   rebuildPeriodSelect();renderAll();
   showMessage(`Актуальные данные Ozon API загружены. Последняя синхронизация: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}.`,'success');
 }
-async function loadRemoteAutoData(){
+async function loadRemoteAutoData(force=false){
+  if(apiSyncStatus.loading)return;
+  apiSyncStatus.loading=true;
+  if(force)apiSyncStatus.error=null;
+  renderSourceChips();
   try{
-    // A small public status file contains no financial values or secrets.
+    // The small public status file contains no financial values or secrets.
+    // Do not fail silently: if a Pages deployment accidentally omitted /data,
+    // surface the problem and allow the user to retry after the next sync.
     const statusRes=await fetch(`${API_STATUS_URL}?t=${Date.now()}`,{cache:'no-store'});
-    if(!statusRes.ok)return;
-    const status=await statusRes.json();apiSyncStatus.available=true;apiSyncStatus.generatedAt=status.generatedAt||null;renderSourceChips();
-    const encRes=await fetch(`${API_DATA_URL}?t=${Date.now()}`,{cache:'no-store'});if(!encRes.ok)throw new Error(`Файл данных API недоступен: HTTP ${encRes.status}`);
+    if(!statusRes.ok)throw new Error(`Статус API недоступен: HTTP ${statusRes.status}`);
+    const status=await statusRes.json();
+    apiSyncStatus.available=true;
+    apiSyncStatus.generatedAt=status.generatedAt||null;
+    apiSyncStatus.error=null;
+    renderSourceChips();
+
+    const encRes=await fetch(`${API_DATA_URL}?t=${Date.now()}`,{cache:'no-store'});
+    if(!encRes.ok)throw new Error(`Файл данных API недоступен: HTTP ${encRes.status}`);
     const env=await encRes.json();
+
     let password=sessionStorage.getItem(API_PW_SESSION)||localStorage.getItem(API_PW_REMEMBER)||'';
     let remember=!!localStorage.getItem(API_PW_REMEMBER);
-    if(!password){const ans=await apiPasswordDialog();if(!ans)return;password=ans.password;remember=ans.remember}
+    if(!password){
+      const ans=await apiPasswordDialog();
+      if(!ans)return;
+      password=ans.password;remember=ans.remember;
+    }
     try{
       const payload=await decryptApiEnvelope(env,password);
-      sessionStorage.setItem(API_PW_SESSION,password);if(remember)localStorage.setItem(API_PW_REMEMBER,password);
+      sessionStorage.setItem(API_PW_SESSION,password);
+      if(remember)localStorage.setItem(API_PW_REMEMBER,password);
       applyApiPayload(payload);
     }catch(e){
-      sessionStorage.removeItem(API_PW_SESSION);localStorage.removeItem(API_PW_REMEMBER);
-      apiSyncStatus.error='Неверный пароль или повреждённый файл данных';renderSourceChips();
+      sessionStorage.removeItem(API_PW_SESSION);
+      localStorage.removeItem(API_PW_REMEMBER);
+      apiSyncStatus.error='Неверный пароль или повреждённый файл данных';
+      renderSourceChips();
       showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_PASSWORD. Пока показаны встроенные данные из Excel.','error');
-      const ans=await apiPasswordDialog();if(ans?.password){try{const payload=await decryptApiEnvelope(env,ans.password);sessionStorage.setItem(API_PW_SESSION,ans.password);if(ans.remember)localStorage.setItem(API_PW_REMEMBER,ans.password);applyApiPayload(payload)}catch{showMessage('Пароль снова не подошёл. Оставлены встроенные данные.','error')}}
+      const ans=await apiPasswordDialog();
+      if(ans?.password){
+        try{
+          const payload=await decryptApiEnvelope(env,ans.password);
+          sessionStorage.setItem(API_PW_SESSION,ans.password);
+          if(ans.remember)localStorage.setItem(API_PW_REMEMBER,ans.password);
+          applyApiPayload(payload);
+        }catch{
+          showMessage('Пароль снова не подошёл. Оставлены встроенные данные.','error');
+        }
+      }
     }
-  }catch(e){apiSyncStatus.error=e.message||String(e);renderSourceChips();console.warn('Ozon API auto sync:',e)}
+  }catch(e){
+    apiSyncStatus.error=e.message||String(e);
+    console.warn('Ozon API auto sync:',e);
+  }finally{
+    apiSyncStatus.loading=false;
+    renderSourceChips();
+  }
 }
 
 /* ------------------------------ helpers ------------------------------ */
@@ -628,7 +664,24 @@ function rebuildPeriodSelect(){
   const sel=$('#periodSelect');sel.innerHTML=`<option value="all">Все загруженные периоды</option>`+[...ranges].sort((a,b)=>b[0].localeCompare(a[0])).map(([k,v])=>`<option value="${k}">${v}</option>`).join('');if(![...sel.options].some(o=>o.value===state.activePeriod))state.activePeriod='all';sel.value=state.activePeriod;
 }
 function renderAll(){currentModel=buildModel();renderSourceChips();renderQuality();renderKpis();renderOverview();renderPlan();renderUnit();renderProducts();renderAds();renderStock();renderSettings();renderChartsForTab(activeTab)}
-function renderSourceChips(){const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;const labels={sales:'Продажи',stock:'Остатки',price:'Цены/тарифы',finance:'Финансы',ads:'Реклама'};let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;else if(apiSyncStatus.available)html+=`<span class="chip warn">API: данные заблокированы</span>`;else if(apiSyncStatus.error)html+=`<span class="chip warn">API: ошибка sync</span>`;$('#sourceChips').innerHTML=html}
+function renderSourceChips(){
+  const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
+  const labels={sales:'Продажи',stock:'Остатки',price:'Цены/тарифы',finance:'Финансы',ads:'Реклама'};
+  let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
+  if(apiSyncStatus.loaded){
+    html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
+  }else if(apiSyncStatus.loading){
+    html+=`<span class="chip">API: подключение…</span>`;
+  }else if(apiSyncStatus.available){
+    html+=`<span id="apiRetryChip" class="chip warn" style="cursor:pointer" title="Нажмите, чтобы открыть актуальные данные">API: данные заблокированы · открыть</span>`;
+  }else if(apiSyncStatus.error){
+    html+=`<span id="apiRetryChip" class="chip warn" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
+  }else{
+    html+=`<span id="apiRetryChip" class="chip" style="cursor:pointer">API: проверить</span>`;
+  }
+  $('#sourceChips').innerHTML=html;
+  const retry=$('#apiRetryChip');if(retry)retry.addEventListener('click',()=>loadRemoteAutoData(true));
+}
 function renderQuality(){const m=currentModel;const missing=[];if(!m.salesDs.length)missing.push('продажи / воронка');if(!m.stockDs)missing.push('остатки');if(!m.priceDs)missing.push('цены');if(!m.financeDs.length)missing.push('финансовые начисления Ozon');const knownPct=pct(m.costRev.report+m.costRev.manual,m.totalRevenue)||0;const profitPct=pct(m.completeRevenue,m.totalRevenue)||0;const finNote=m.financeDs.length?` Фактические начисления Ozon учтены${m.financeNetAccrued!=null?`; начислено после услуг Ozon — ${fmtMoney(m.financeNetAccrued)}`:''}. Общие операции без SKU распределяются по выручке и помечаются как распределённые.`:'';const taxNote=state.settings.taxRate!=null&&Number.isFinite(+state.settings.taxRate)?` Для управленческого P&L применяется оценка УСН «доходы − расходы» ${fmtPct(+state.settings.taxRate)} к положительной покрытой базе. Это управленческая оценка: сумма в налоговой декларации может отличаться из-за правил признания доходов и расходов.`:' Ставка УСН не задана.';const adsNote=!state.settings.adsActive?' Реклама сейчас помечена как отключённая; исторические расходы на продвижение продолжают учитываться в P&L.':'';$('#dataQuality').innerHTML=`<b>Качество данных.</b> Себестоимость известна по ${fmtPct(knownPct)} выручки; итоговая прибыль рассчитана по ${fmtPct(profitPct)} выручки.${finNote}${taxNote}${adsNote} ${missing.length?`Не хватает источников: ${missing.join(', ')}.`:'Основные источники данных подключены.'}`}
 function renderKpis(){const m=currentModel;const coverage=pct(m.costRev.report+m.costRev.manual,m.totalRevenue)||0;const reportShare=pct(m.costRev.report,m.totalRevenue)||0,manualShare=pct(m.costRev.manual,m.totalRevenue)||0,missingShare=pct(m.costRev.missing,m.totalRevenue)||0;const cogsPct=(m.costRev.report+m.costRev.manual)>0?pct(m.totalCogs,m.costRev.report+m.costRev.manual):null;const opCoverage=pct(m.operatingRevenue,m.totalRevenue)||0;const profitCoverage=pct(m.completeRevenue,m.totalRevenue)||0;const margin=m.completeRevenue?pct(m.completeProfit,m.completeRevenue):null;const roi=sum(m.complete,x=>x.cogs)?pct(m.completeProfit,sum(m.complete,x=>x.cogs)):null;const drr=m.adsSpend!=null?pct(m.adsSpend,m.totalRevenue):null;const losses=m.complete.filter(x=>x.cleanProfit<0).length;const attention=m.stockStats.critical+losses;const opClass=m.operatingProfit>=0?'positive':'negative';const profitClass=m.completeProfit>=0?'positive':'negative';const adSub=state.settings.adsActive?(drr==null?'реклама включена · нет данных о расходах':`реклама включена · ДРР ${fmtPct(drr)}`):'реклама сейчас отключена · расход исторический';
   const cards=[
