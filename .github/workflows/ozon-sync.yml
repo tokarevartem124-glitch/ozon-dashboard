@@ -12,11 +12,21 @@ on:
           - fast
           - daily
 
-  schedule:
-    # Быстрая синхронизация каждый час
-    - cron: "17 * * * *"
+  # Any change to the dashboard/sync code is immediately published together
+  # with a fresh encrypted API snapshot. This prevents a plain branch deploy
+  # from publishing index.html without /data/ozon-data.enc.json.
+  push:
+    branches:
+      - main
+    paths:
+      - "index.html"
+      - "ozon-sync.mjs"
+      - ".github/workflows/ozon-sync.yml"
 
-    # Полная аналитика один раз в сутки
+  schedule:
+    # Fast refresh every hour.
+    - cron: "17 * * * *"
+    # Daily funnel/analytics refresh once per day.
     - cron: "37 2 * * *"
 
 permissions:
@@ -51,7 +61,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "37 2 * * *" ]; then
+          elif [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "37 2 * * *" ]; then
             echo "mode=daily" >> "$GITHUB_OUTPUT"
           else
             echo "mode=fast" >> "$GITHUB_OUTPUT"
