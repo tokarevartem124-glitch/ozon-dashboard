@@ -348,6 +348,7 @@ function parseRuDate(s){const m=String(s||'').match(/(\d{2})\.(\d{2})\.(\d{4})/)
 function dateLabel(iso){if(!iso)return 'дата не определена'; return new Date(iso+'T12:00:00').toLocaleDateString('ru-RU')}
 function rangeLabel(ds){return ds.start&&ds.end?`${dateLabel(ds.start)} — ${dateLabel(ds.end)}`:ds.snapshot?`срез ${dateLabel(ds.snapshot)}`:'без периода'}
 function daysInclusive(a,b){if(!a||!b)return null;return Math.max(1,Math.round((new Date(b)-new Date(a))/86400000)+1)}
+function addDays(iso,delta){if(!iso)return null;const d=new Date(String(iso).slice(0,10)+'T00:00:00Z');if(Number.isNaN(d.getTime()))return String(iso).slice(0,10);d.setUTCDate(d.getUTCDate()+Number(delta||0));return d.toISOString().slice(0,10)}
 function overlap(a,b){if(a.snapshot&&b.snapshot)return a.snapshot===b.snapshot;if(!a.start||!a.end||!b.start||!b.end)return false;return a.start<=b.end&&b.start<=a.end}
 function median(arr){const a=arr.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;const m=Math.floor(a.length/2);return a.length%2?a[m]:(a[m-1]+a[m])/2}
 function sum(arr,fn=x=>x){return arr.reduce((s,x)=>s+safe(fn(x)),0)}
