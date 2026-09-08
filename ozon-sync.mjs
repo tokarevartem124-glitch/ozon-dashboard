@@ -22,10 +22,9 @@ import crypto from 'node:crypto';
 const BASE = 'https://api-seller.ozon.ru';
 const CLIENT_ID = process.env.OZON_CLIENT_ID;
 const API_KEY = process.env.OZON_API_KEY;
-const PASSWORD_RAW = process.env.DASHBOARD_PASSWORD;
-// Normalize the dashboard passphrase on the server side too. This avoids
-// invisible trailing newlines/spaces from copy-paste in GitHub Secrets.
-const PASSWORD = String(PASSWORD_RAW ?? '').normalize('NFKC').trim();
+const DASHBOARD_KEY = String(process.env.DASHBOARD_KEY ?? '').trim().toLowerCase();
+// Deterministic 256-bit raw key. Using a 64-hex key removes all passphrase/KDF/Unicode ambiguity.
+if (!/^[0-9a-f]{64}$/.test(DASHBOARD_KEY)) throw new Error('DASHBOARD_KEY must be exactly 64 hex characters (32 random bytes)');
 const SYNC_MODE = String(process.env.SYNC_MODE || 'fast').toLowerCase();
 const PREVIOUS_DATA_URL = process.env.PREVIOUS_DATA_URL || '';
 const FINANCE_LOOKBACK_DAYS = Math.max(1, Number(process.env.FINANCE_LOOKBACK_DAYS || 3));
@@ -34,7 +33,7 @@ const RETURN_LOOKBACK_DAYS = Math.max(7, Number(process.env.RETURN_LOOKBACK_DAYS
 const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const ANALYTICS_MAX_CATCHUP_DAYS = Math.max(1, Number(process.env.ANALYTICS_MAX_CATCHUP_DAYS || 7));
 
-if (!CLIENT_ID || !API_KEY || !PASSWORD) throw new Error('Missing OZON_CLIENT_ID, OZON_API_KEY or DASHBOARD_PASSWORD');
+if (!CLIENT_ID || !API_KEY) throw new Error('Missing OZON_CLIENT_ID or OZON_API_KEY');
 if (!['fast','daily'].includes(SYNC_MODE)) throw new Error(`Unknown SYNC_MODE=${SYNC_MODE}`);
 
 const isoDate = d => d.toISOString().slice(0,10);
@@ -75,20 +74,24 @@ async function post(endpoint, body, {allowError=false,retries=3,analytics=false}
 async function testAuth(){ return post('/v4/product/info/limit',{}); }
 
 /* ----------------------------- encryption ----------------------------- */
-function encryptJson(obj,password){
-  const salt=crypto.randomBytes(16),iv=crypto.randomBytes(12),iterations=250000;
-  const key=crypto.pbkdf2Sync(password,salt,iterations,32,'sha256');
+function keyFromHex(hex){
+  if(!/^[0-9a-f]{64}$/i.test(hex)) throw new Error('Invalid DASHBOARD_KEY');
+  return Buffer.from(hex,'hex');
+}
+function encryptJson(obj,keyHex){
+  const iv=crypto.randomBytes(12);
+  const key=keyFromHex(keyHex);
   const cipher=crypto.createCipheriv('aes-256-gcm',key,iv);
   const plain=Buffer.from(JSON.stringify(obj),'utf8');
   const ciphertext=Buffer.concat([cipher.update(plain),cipher.final()]);
   const tag=cipher.getAuthTag();
-  return {v:1,alg:'AES-256-GCM',kdf:'PBKDF2-SHA256',iterations,salt:salt.toString('base64'),iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt};
+  return {v:2,alg:'AES-256-GCM',keyMode:'RAW-HEX-256',iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt};
 }
-function decryptJson(env,password){
-  const salt=Buffer.from(env.salt,'base64'),iv=Buffer.from(env.iv,'base64'),data=Buffer.from(env.data,'base64');
+function decryptJson(env,keyHex){
+  if(env?.keyMode!=='RAW-HEX-256') throw new Error('Previous encrypted state uses legacy password format; clean API-only backfill required');
+  const iv=Buffer.from(env.iv,'base64'),data=Buffer.from(env.data,'base64');
   const ciphertext=data.subarray(0,data.length-16),tag=data.subarray(data.length-16);
-  const key=crypto.pbkdf2Sync(password,salt,Number(env.iterations||250000),32,'sha256');
-  const decipher=crypto.createDecipheriv('aes-256-gcm',key,iv); decipher.setAuthTag(tag);
+  const decipher=crypto.createDecipheriv('aes-256-gcm',keyFromHex(keyHex),iv); decipher.setAuthTag(tag);
   return JSON.parse(Buffer.concat([decipher.update(ciphertext),decipher.final()]).toString('utf8'));
 }
 async function loadPreviousPayload(){
@@ -97,7 +100,7 @@ async function loadPreviousPayload(){
     const sep=PREVIOUS_DATA_URL.includes('?')?'&':'?';
     const res=await fetch(`${PREVIOUS_DATA_URL}${sep}t=${Date.now()}`,{headers:{Accept:'application/json'},signal:AbortSignal.timeout(15000)});
     if(!res.ok)throw new Error(`HTTP ${res.status}`);
-    const payload=decryptJson(await res.json(),PASSWORD);
+    const payload=decryptJson(await res.json(),DASHBOARD_KEY);
     if(payload?.version!==4||payload?.sourcePolicy!=='ozon-api-only') {
       console.warn(`Previous payload ignored: version=${payload?.version}, sourcePolicy=${payload?.sourcePolicy||'none'}. A clean API-only backfill will be created.`);
       return null;
@@ -585,7 +588,7 @@ const payload={
 };
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
-await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,PASSWORD)));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
