@@ -197,30 +197,28 @@ function persistState(){
 
 /* ---------------------- automatic Ozon Seller API sync ----------------------
    GitHub Actions writes encrypted data/ozon-data.enc.json. The API key never
-   reaches the browser. The browser asks for DASHBOARD_PASSWORD and decrypts the
-   payload locally with PBKDF2 + AES-GCM. If the remote file is unavailable or the password is wrong, Ozon KPI blocks stay unavailable; purchase costs remain local.
+   reaches the browser. The browser asks for DASHBOARD_KEY and decrypts the
+   payload locally with a raw 256-bit AES-GCM key. If the remote file is unavailable or the password is wrong, Ozon KPI blocks stay unavailable; purchase costs remain local.
 ---------------------------------------------------------------------------- */
 const API_DATA_URL='./data/ozon-data.enc.json';
 const API_STATUS_URL='./data/ozon-status.json';
-const API_PW_SESSION='ozonDashboard.apiPassword.session';
-const API_PW_REMEMBER='ozonDashboard.apiPassword.remember';
+const API_PW_SESSION='ozonDashboard.apiKey.session';
+const API_PW_REMEMBER='ozonDashboard.apiKey.remember';
 let apiSyncStatus={available:false,loaded:false,loading:false,generatedAt:null,error:null};
 
 function b64bytes(s){const bin=atob(s);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return a}
-function normalizeDashboardPassword(v){return String(v??'').normalize('NFKC').trim()}
-async function decryptApiEnvelope(env,password){
-  const enc=new TextEncoder();
-  const normalizedPassword=normalizeDashboardPassword(password);
-  if(!normalizedPassword)throw new Error('Пустой DASHBOARD_PASSWORD');
-  const base=await crypto.subtle.importKey('raw',enc.encode(normalizedPassword),'PBKDF2',false,['deriveKey']);
-  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64bytes(env.salt),iterations:env.iterations||250000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['decrypt']);
+function normalizeDashboardKey(v){return String(v??'').replace(/\s+/g,'').toLowerCase()}
+function hexBytes(hex){const s=normalizeDashboardKey(hex);if(!/^[0-9a-f]{64}$/.test(s))throw new Error('DASHBOARD_KEY должен содержать ровно 64 hex-символа');const a=new Uint8Array(32);for(let i=0;i<32;i++)a[i]=parseInt(s.slice(i*2,i*2+2),16);return a}
+async function decryptApiEnvelope(env,keyHex){
+  if(env?.keyMode!=='RAW-HEX-256')throw new Error('Файл данных зашифрован старым форматом. Дождитесь нового workflow после перехода на DASHBOARD_KEY.');
+  const key=await crypto.subtle.importKey('raw',hexBytes(keyHex),{name:'AES-GCM'},false,['decrypt']);
   const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64bytes(env.iv),tagLength:128},key,b64bytes(env.data));
   return JSON.parse(new TextDecoder().decode(plain));
 }
 function apiPasswordDialog(){
   return new Promise(resolve=>{
     const wrap=document.createElement('div');wrap.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(3,5,10,.78);backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px';
-    wrap.innerHTML=`<div style="width:min(460px,100%);background:#11151f;border:1px solid #2b3346;border-radius:18px;padding:22px;box-shadow:0 22px 80px rgba(0,0,0,.5)"><div style="font-size:18px;font-weight:800;margin-bottom:6px">Автообновление Ozon подключено</div><div style="color:#8f9ab0;margin-bottom:16px">GitHub уже получил свежие данные через Seller API. Введите пароль <b>DASHBOARD_PASSWORD</b>, который вы сохранили в GitHub Secrets. API-ключ сюда вводить не нужно.</div><input id="apiPwInput" type="password" autocomplete="current-password" placeholder="Пароль дашборда" style="width:100%;background:#090b11;color:#ecf1fb;border:1px solid #30394d;border-radius:10px;padding:11px 12px;outline:none"><label style="display:flex;gap:8px;align-items:center;color:#aab4c8;margin:12px 0"><input id="apiRemember" type="checkbox"> Запомнить пароль в этом браузере</label><div id="apiPwErr" style="display:none;color:#ff7c8a;margin-bottom:10px"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button id="apiSkip" style="background:#202637;color:#dce4f5;border:0;border-radius:10px;padding:9px 13px;cursor:pointer">Открыть без данных Ozon</button><button id="apiUnlock" style="background:#7c8cff;color:white;border:0;border-radius:10px;padding:9px 13px;cursor:pointer;font-weight:700">Открыть актуальные данные</button></div></div>`;
+    wrap.innerHTML=`<div style="width:min(460px,100%);background:#11151f;border:1px solid #2b3346;border-radius:18px;padding:22px;box-shadow:0 22px 80px rgba(0,0,0,.5)"><div style="font-size:18px;font-weight:800;margin-bottom:6px">Автообновление Ozon подключено</div><div style="color:#8f9ab0;margin-bottom:16px">GitHub уже получил свежие данные через Seller API. Введите 64-символьный ключ <b>DASHBOARD_KEY</b>, который вы сохранили в GitHub Secrets. Это отдельный ключ шифрования дашборда; Ozon API-key сюда вводить не нужно.</div><input id="apiPwInput" type="password" autocomplete="current-password" placeholder="DASHBOARD_KEY — 64 hex-символа" style="width:100%;background:#090b11;color:#ecf1fb;border:1px solid #30394d;border-radius:10px;padding:11px 12px;outline:none"><label style="display:flex;gap:8px;align-items:center;color:#aab4c8;margin:12px 0"><input id="apiRemember" type="checkbox"> Запомнить ключ в этом браузере</label><div id="apiPwErr" style="display:none;color:#ff7c8a;margin-bottom:10px"></div><div style="display:flex;gap:10px;justify-content:flex-end"><button id="apiSkip" style="background:#202637;color:#dce4f5;border:0;border-radius:10px;padding:9px 13px;cursor:pointer">Открыть без данных Ozon</button><button id="apiUnlock" style="background:#7c8cff;color:white;border:0;border-radius:10px;padding:9px 13px;cursor:pointer;font-weight:700">Открыть актуальные данные</button></div></div>`;
     document.body.appendChild(wrap);const inp=wrap.querySelector('#apiPwInput');inp.focus();
     const done=v=>{wrap.remove();resolve(v)};
     wrap.querySelector('#apiSkip').onclick=()=>done(null);
@@ -267,29 +265,29 @@ async function loadRemoteAutoData(force=false){
     if(!password){
       const ans=await apiPasswordDialog();
       if(!ans)return;
-      password=normalizeDashboardPassword(ans.password);remember=ans.remember;
+      password=normalizeDashboardKey(ans.password);remember=ans.remember;
     }
     try{
       const payload=await decryptApiEnvelope(env,password);
-      password=normalizeDashboardPassword(password);sessionStorage.setItem(API_PW_SESSION,password);
+      password=normalizeDashboardKey(password);sessionStorage.setItem(API_PW_SESSION,password);
       if(remember)localStorage.setItem(API_PW_REMEMBER,password);
       applyApiPayload(payload);
     }catch(e){
       sessionStorage.removeItem(API_PW_SESSION);
       localStorage.removeItem(API_PW_REMEMBER);
-      apiSyncStatus.error='Неверный пароль или повреждённый файл данных';
+      apiSyncStatus.error='Неверный DASHBOARD_KEY или повреждённый файл данных';
       renderSourceChips();
-      showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_PASSWORD. Данные Ozon пока недоступны; закупочные цены сохранены локально.','error');
+      showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_KEY. Данные Ozon пока недоступны; закупочные цены сохранены локально.','error');
       const ans=await apiPasswordDialog();
       if(ans?.password){
         try{
-          const normalizedRetry=normalizeDashboardPassword(ans.password);
+          const normalizedRetry=normalizeDashboardKey(ans.password);
           const payload=await decryptApiEnvelope(env,normalizedRetry);
           sessionStorage.setItem(API_PW_SESSION,normalizedRetry);
           if(ans.remember)localStorage.setItem(API_PW_REMEMBER,normalizedRetry);
           applyApiPayload(payload);
         }catch{
-          showMessage('Пароль не совпадает с текущим зашифрованным файлом. Проверьте DASHBOARD_PASSWORD в GitHub Secrets; пробелы по краям теперь автоматически игнорируются.','error');
+          showMessage('DASHBOARD_KEY не совпадает с текущим зашифрованным файлом. Проверьте, что в GitHub Secret и в дашборде используются одни и те же 64 hex-символа.','error');
         }
       }
     }
