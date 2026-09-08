@@ -3,8 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <script>
+    window.__OZON_DASHBOARD_BUILD__ = "v4.5-2026-09-08-1725";
+    window.addDays = function(iso, delta){
+      if(!iso) return null;
+      const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
+      if(Number.isNaN(d.getTime())) return String(iso).slice(0,10);
+      d.setUTCDate(d.getUTCDate() + Number(delta || 0));
+      return d.toISOString().slice(0,10);
+    };
+  </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — API-only v4</title>
+  <title>Ozon Seller Analytics — API-only v4.5</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -36,7 +49,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v4</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v4.5</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -348,7 +361,7 @@ function parseRuDate(s){const m=String(s||'').match(/(\d{2})\.(\d{2})\.(\d{4})/)
 function dateLabel(iso){if(!iso)return 'дата не определена'; return new Date(iso+'T12:00:00').toLocaleDateString('ru-RU')}
 function rangeLabel(ds){return ds.start&&ds.end?`${dateLabel(ds.start)} — ${dateLabel(ds.end)}`:ds.snapshot?`срез ${dateLabel(ds.snapshot)}`:'без периода'}
 function daysInclusive(a,b){if(!a||!b)return null;return Math.max(1,Math.round((new Date(b)-new Date(a))/86400000)+1)}
-function addDays(iso,delta){if(!iso)return null;const d=new Date(String(iso).slice(0,10)+'T00:00:00Z');if(Number.isNaN(d.getTime()))return String(iso).slice(0,10);d.setUTCDate(d.getUTCDate()+Number(delta||0));return d.toISOString().slice(0,10)}
+const addDays = window.addDays;
 function overlap(a,b){if(a.snapshot&&b.snapshot)return a.snapshot===b.snapshot;if(!a.start||!a.end||!b.start||!b.end)return false;return a.start<=b.end&&b.start<=a.end}
 function median(arr){const a=arr.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;const m=Math.floor(a.length/2);return a.length%2?a[m]:(a[m-1]+a[m])/2}
 function sum(arr,fn=x=>x){return arr.reduce((s,x)=>s+safe(fn(x)),0)}
@@ -958,6 +971,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
+  html+=`<span class="chip" title="Версия интерфейса">Build: v4.5</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
