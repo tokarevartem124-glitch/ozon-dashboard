@@ -230,14 +230,31 @@ function applyApiPayload(payload){
   if(payload?.version!==4||payload?.sourcePolicy!=='ozon-api-only'){
     throw new Error(`Нужен API-only payload v4. Получено: version=${payload?.version??'?'}, source=${payload?.sourcePolicy??'?'}`);
   }
-  if(!payload?.datasets?.length)throw new Error('В файле автообновления нет наборов данных.');
+  if(!Array.isArray(payload?.datasets)||!payload.datasets.length)throw new Error('В файле автообновления нет наборов данных.');
+  for(const d of payload.datasets){
+    if(!d||!d.type||!Array.isArray(d.rows))throw new Error(`Повреждён набор API: ${d?.type||d?.id||'без типа'}`);
+  }
   const selected=state.activePeriod;
-  state.datasets=state.datasets.filter(d=>['cost','rrp'].includes(d.type)&&!d.apiAuto);
-  for(const d of payload.datasets)state.datasets.push({...d,apiAuto:true,embedded:false});
-  apiSyncStatus={available:true,loaded:true,generatedAt:payload.generatedAt,error:null,diagnostics:payload.diagnostics||{},syncMode:payload.syncMode||null};
+  const previousDatasets=state.datasets;
+  const previousStatus={...apiSyncStatus};
+  const nextDatasets=state.datasets.filter(d=>['cost','rrp'].includes(d.type)&&!d.apiAuto);
+  for(const d of payload.datasets)nextDatasets.push({...d,apiAuto:true,embedded:false});
+  state.datasets=nextDatasets;
+  apiSyncStatus={available:true,loaded:false,loading:true,generatedAt:payload.generatedAt,error:null,diagnostics:payload.diagnostics||{},syncMode:payload.syncMode||null};
   state.activePeriod=selected||'all';
-  rebuildPeriodSelect();renderAll();
-  showMessage(`Ozon API обновлён: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}. Excel Ozon в расчётах не используется.`,'success');
+  try{
+    rebuildPeriodSelect();
+    renderAll();
+    apiSyncStatus.loaded=true;apiSyncStatus.loading=false;apiSyncStatus.error=null;
+    // Re-render the status-dependent blocks after the model is already valid.
+    renderSourceChips();renderQuality();renderKpis();
+    showMessage(`Ozon API обновлён: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}. Excel Ozon в расчётах не используется.`,'success');
+  }catch(e){
+    state.datasets=previousDatasets;
+    apiSyncStatus={...previousStatus,available:true,loaded:false,loading:false,generatedAt:payload.generatedAt,error:`Ошибка применения API-данных: ${e?.message||e}`};
+    try{rebuildPeriodSelect();renderAll()}catch{}
+    throw new Error(`API расшифрован, но дашборд не смог применить данные: ${e?.message||e}`);
+  }
 }
 async function loadRemoteAutoData(force=false){
   if(apiSyncStatus.loading)return;
@@ -245,9 +262,6 @@ async function loadRemoteAutoData(force=false){
   if(force)apiSyncStatus.error=null;
   renderSourceChips();
   try{
-    // The small public status file contains no financial values or secrets.
-    // Do not fail silently: if a Pages deployment accidentally omitted /data,
-    // surface the problem and allow the user to retry after the next sync.
     const statusRes=await fetch(`${API_STATUS_URL}?t=${Date.now()}`,{cache:'no-store'});
     if(!statusRes.ok)throw new Error(`Статус API недоступен: HTTP ${statusRes.status}`);
     const status=await statusRes.json();
@@ -260,40 +274,48 @@ async function loadRemoteAutoData(force=false){
     if(!encRes.ok)throw new Error(`Файл данных API недоступен: HTTP ${encRes.status}`);
     const env=await encRes.json();
 
-    let password=sessionStorage.getItem(API_PW_SESSION)||localStorage.getItem(API_PW_REMEMBER)||'';
+    let keyHex=sessionStorage.getItem(API_PW_SESSION)||localStorage.getItem(API_PW_REMEMBER)||'';
     let remember=!!localStorage.getItem(API_PW_REMEMBER);
-    if(!password){
+    if(!keyHex){
       const ans=await apiPasswordDialog();
-      if(!ans)return;
-      password=normalizeDashboardKey(ans.password);remember=ans.remember;
+      if(!ans){apiSyncStatus.loading=false;renderSourceChips();return}
+      keyHex=normalizeDashboardKey(ans.password);remember=ans.remember;
     }
+
+    let payload=null;
     try{
-      const payload=await decryptApiEnvelope(env,password);
-      password=normalizeDashboardKey(password);sessionStorage.setItem(API_PW_SESSION,password);
-      if(remember)localStorage.setItem(API_PW_REMEMBER,password);
-      applyApiPayload(payload);
+      payload=await decryptApiEnvelope(env,keyHex);
     }catch(e){
-      sessionStorage.removeItem(API_PW_SESSION);
-      localStorage.removeItem(API_PW_REMEMBER);
-      apiSyncStatus.error='Неверный DASHBOARD_KEY или повреждённый файл данных';
+      sessionStorage.removeItem(API_PW_SESSION);localStorage.removeItem(API_PW_REMEMBER);
+      apiSyncStatus.loaded=false;apiSyncStatus.error='DASHBOARD_KEY не подошёл или файл повреждён';
       renderSourceChips();
-      showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_KEY. Данные Ozon пока недоступны; закупочные цены сохранены локально.','error');
+      showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_KEY.','error');
       const ans=await apiPasswordDialog();
-      if(ans?.password){
-        try{
-          const normalizedRetry=normalizeDashboardKey(ans.password);
-          const payload=await decryptApiEnvelope(env,normalizedRetry);
-          sessionStorage.setItem(API_PW_SESSION,normalizedRetry);
-          if(ans.remember)localStorage.setItem(API_PW_REMEMBER,normalizedRetry);
-          applyApiPayload(payload);
-        }catch{
-          showMessage('DASHBOARD_KEY не совпадает с текущим зашифрованным файлом. Проверьте, что в GitHub Secret и в дашборде используются одни и те же 64 hex-символа.','error');
-        }
+      if(!ans?.password){apiSyncStatus.loading=false;renderSourceChips();return}
+      keyHex=normalizeDashboardKey(ans.password);remember=ans.remember;
+      try{payload=await decryptApiEnvelope(env,keyHex)}catch(e2){
+        apiSyncStatus.loaded=false;apiSyncStatus.error='DASHBOARD_KEY не совпадает с текущим файлом';
+        showMessage('DASHBOARD_KEY не совпадает с текущим зашифрованным файлом.','error');
+        apiSyncStatus.loading=false;renderSourceChips();return;
       }
     }
+
+    // From this point the key is proven correct. Any later error is a data/render error,
+    // and must never be reported as a wrong password.
+    const normalizedKey=normalizeDashboardKey(keyHex);
+    sessionStorage.setItem(API_PW_SESSION,normalizedKey);
+    if(remember)localStorage.setItem(API_PW_REMEMBER,normalizedKey);
+    try{
+      applyApiPayload(payload);
+    }catch(e){
+      console.error('Ozon API payload apply error:',e);
+      apiSyncStatus.loaded=false;apiSyncStatus.error=e?.message||String(e);
+      showMessage(`Данные Ozon расшифрованы, но не применились: ${e?.message||e}`,'error');
+    }
   }catch(e){
-    apiSyncStatus.error=e.message||String(e);
+    apiSyncStatus.loaded=false;apiSyncStatus.error=e.message||String(e);
     console.warn('Ozon API auto sync:',e);
+    showMessage(`Ошибка загрузки Ozon API: ${e.message||e}`,'error');
   }finally{
     apiSyncStatus.loading=false;
     renderSourceChips();
@@ -922,15 +944,23 @@ function rebuildPeriodSelect(){
   const sel=$('#periodSelect');sel.innerHTML=uniq.map(([k,v])=>`<option value="${k}">${escapeHtml(v)}</option>`).join('');
   if(!uniq.some(o=>o[0]===state.activePeriod))state.activePeriod='all';sel.value=state.activePeriod;
 }
-function renderAll(){currentModel=buildModel();renderSourceChips();renderQuality();renderKpis();renderOverview();renderPlan();renderUnit();renderProducts();renderAds();renderStock();renderSettings();renderChartsForTab(activeTab)}
+function renderAll(){
+  currentModel=buildModel();
+  const steps=[['источники',renderSourceChips],['контроль данных',renderQuality],['KPI',renderKpis],['обзор',renderOverview],['план-факт',renderPlan],['юнит-экономика',renderUnit],['товары',renderProducts],['реклама/воронка',renderAds],['остатки',renderStock],['настройки',renderSettings]];
+  const errs=[];
+  for(const [name,fn] of steps){try{fn()}catch(e){console.error(`Render ${name}:`,e);errs.push(`${name}: ${e?.message||e}`)}}
+  try{renderChartsForTab(activeTab)}catch(e){console.error('Render charts:',e);errs.push(`графики: ${e?.message||e}`)}
+  if(errs.length)showMessage(`Часть интерфейса не отрисована, но данные загружены: ${errs.slice(0,3).join('; ')}`,'error');
+  return errs;
+}
 function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
-  else if(apiSyncStatus.available)html+=`<span id="apiRetryChip" class="chip warn" style="cursor:pointer">API: данные заблокированы · открыть</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
+  else if(apiSyncStatus.available)html+=`<span id="apiRetryChip" class="chip warn" style="cursor:pointer">API: данные заблокированы · открыть</span>`;
   else html+=`<span id="apiRetryChip" class="chip" style="cursor:pointer">API: проверить</span>`;
   $('#sourceChips').innerHTML=html;
   const retry=$('#apiRetryChip');if(retry)retry.addEventListener('click',()=>loadRemoteAutoData(true));
