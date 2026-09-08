@@ -22,7 +22,10 @@ import crypto from 'node:crypto';
 const BASE = 'https://api-seller.ozon.ru';
 const CLIENT_ID = process.env.OZON_CLIENT_ID;
 const API_KEY = process.env.OZON_API_KEY;
-const PASSWORD = process.env.DASHBOARD_PASSWORD;
+const PASSWORD_RAW = process.env.DASHBOARD_PASSWORD;
+// Normalize the dashboard passphrase on the server side too. This avoids
+// invisible trailing newlines/spaces from copy-paste in GitHub Secrets.
+const PASSWORD = String(PASSWORD_RAW ?? '').normalize('NFKC').trim();
 const SYNC_MODE = String(process.env.SYNC_MODE || 'fast').toLowerCase();
 const PREVIOUS_DATA_URL = process.env.PREVIOUS_DATA_URL || '';
 const FINANCE_LOOKBACK_DAYS = Math.max(1, Number(process.env.FINANCE_LOOKBACK_DAYS || 3));
