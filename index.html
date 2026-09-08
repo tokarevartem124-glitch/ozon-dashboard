@@ -543,7 +543,7 @@ function buildModel(){
   const products=[];const articleMap=new Map(),skuMap=new Map();
   function ensure(r){
     const a=idNorm(r.article),s=idNorm(r.sku);let obj=(a&&articleMap.get(a))||(s&&skuMap.get(s));
-    if(!obj){obj={key:a?`A:${a}`:`S:${s||uid()}`,article:a,sku:s,name:r.name||'',category:'',category2:'',category3:'',type:'',brand:'',scheme:'',productId:'',currentPrice:null,stock:null,volume:null,reportCost:null,reportCostColumn:null,tariff:null,sales:{revenue:0,impressions:0,visits:0,carts:0,ordered:0,delivered:0},finance:{grossRevenue:0,hasGross:false,soldQty:0,returnedQty:0,commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,hasRows:false},ads:{spend:0,impressions:0,clicks:0,carts:0,orders:0,revenue:0,hasRows:false}};products.push(obj)}
+    if(!obj){obj={key:a?`A:${a}`:`S:${s||uid()}`,article:a,sku:s,name:r.name||'',category:'',category2:'',category3:'',type:'',brand:'',scheme:'',productId:'',currentPrice:null,stock:null,volume:null,reportCost:null,reportCostColumn:null,tariff:null,sales:{revenue:0,impressions:0,visits:0,carts:0,ordered:0,delivered:0},finance:{grossRevenue:0,rawNet:0,hasGross:false,soldQty:0,returnedQty:0,commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,hasRows:false},ads:{spend:0,impressions:0,clicks:0,carts:0,orders:0,revenue:0,hasRows:false}};products.push(obj)}
     if(a){articleMap.set(a,obj);if(!obj.article)obj.article=a}if(s){skuMap.set(s,obj);if(!obj.sku)obj.sku=s}if(r.name&&!obj.name)obj.name=r.name;return obj;
   }
   if(stockDs)for(const r of stockDs.rows){const o=ensure(r);Object.assign(o,{name:r.name||o.name,category:r.category||o.category,type:r.type||o.type,brand:r.brand||o.brand,productId:r.productId||o.productId,volume:r.volume??o.volume,currentPrice:r.currentPrice??o.currentPrice,stock:safe(r.stockFbo)+safe(r.stockFbs)+safe(r.stockRealFbs)});}
@@ -552,8 +552,8 @@ function buildModel(){
   const financeCaps=new Set(financeDs.flatMap(d=>d.capabilities?.components||[]));
   const financeGrossCap=financeDs.some(d=>d.capabilities?.grossRevenue);
   const adsSkuAllocatable=adsDs.some(d=>d.capabilities?.skuAllocation);
-  let unallocatedFinance={commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,grossRevenue:0};
-  for(const ds of financeDs)for(const r of ds.rows){if(!filterDatedRow(r,p))continue;const hasId=r.article||r.sku;const target=hasId?ensure(r):null;const f=target?target.finance:unallocatedFinance;if(target)f.hasRows=true;if(r.grossRevenue!=null){f.grossRevenue+=r.grossRevenue;if(target)f.hasGross=true}if(target){f.soldQty+=safe(r.soldQty);f.returnedQty+=safe(r.returnedQty)}for(const k of ['commission','acquiring','logistics','storage','ads','taxes','fines','returns','other'])f[k]+=safe(r[k]);}
+  let unallocatedFinance={commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,grossRevenue:0,rawNet:0};
+  for(const ds of financeDs)for(const r of ds.rows){if(!filterDatedRow(r,p))continue;const hasId=r.article||r.sku;const target=hasId?ensure(r):null;const f=target?target.finance:unallocatedFinance;if(target)f.hasRows=true;if(r.grossRevenue!=null){f.grossRevenue+=r.grossRevenue;if(target)f.hasGross=true}f.rawNet+=safe(r.rawAmount);if(target){f.soldQty+=safe(r.soldQty);f.returnedQty+=safe(r.returnedQty)}for(const k of ['commission','acquiring','logistics','storage','ads','taxes','fines','returns','other'])f[k]+=safe(r[k]);}
   let adsTotal=0,adsUnallocated=0;const campaigns=new Map();
   for(const ds of adsDs)for(const r of ds.rows){if(!filterDatedRow(r,p))continue;adsTotal+=safe(r.spend);const c=campaigns.get(r.campaign)||{campaign:r.campaign,spend:0,impressions:0,clicks:0,orders:0,revenue:0};for(const k of ['spend','impressions','clicks','orders','revenue'])c[k]+=safe(r[k]);campaigns.set(r.campaign,c);if(r.article||r.sku){const o=ensure(r);o.ads.hasRows=true;for(const k of ['spend','impressions','clicks','carts','orders','revenue'])o.ads[k]+=safe(r[k])}else adsUnallocated+=safe(r.spend)}
   // Dedicated purchase-cost exports (e.g. 1C) are joined ONLY to products that already exist in Ozon data.
@@ -565,13 +565,20 @@ function buildModel(){
   const manual=state.manualCosts;const useFinanceAccrual=financeDs.some(d=>d.capabilities?.accrualReport);const financeRevenueBase=sum(products,x=>Math.max(0,x.finance.grossRevenue));
   for(const o of products){
     const m=manual[o.key]||manual[`A:${o.article}`]||manual[`S:${o.sku}`];o.cost=o.costConflict?null:(o.reportCost!=null?o.reportCost:(m&&Number.isFinite(+m.value)?+m.value:null));o.costSource=o.costConflict?'missing':(o.reportCost!=null?'report':(o.cost!=null?'manual':'missing'));
-    o.revenue=useFinanceAccrual?o.finance.grossRevenue:(o.finance.hasGross?o.finance.grossRevenue:o.sales.revenue);const financeUnits=o.finance.soldQty-o.finance.returnedQty;o.units=useFinanceAccrual?(financeUnits!==0?financeUnits:(o.sales.delivered>0?o.sales.delivered:o.sales.ordered)):(o.sales.delivered>0?o.sales.delivered:o.sales.ordered);o.price=o.units>0&&o.revenue>0?o.revenue/o.units:o.currentPrice;
+    // Finance API contains some multi-item / no-SKU operations. Their gross revenue and net payout
+    // are allocated by the product's share of directly-attributed finance revenue. This keeps the
+    // catalogue P&L reconcilable to the exact finance total while clearly remaining a management allocation.
+    const financeAllocShare=useFinanceAccrual&&financeRevenueBase>0?Math.max(0,o.finance.grossRevenue)/financeRevenueBase:0;
+    const allocatedGross=useFinanceAccrual?safe(unallocatedFinance.grossRevenue)*financeAllocShare:0;
+    o.revenue=useFinanceAccrual?(o.finance.grossRevenue+allocatedGross):(o.finance.hasGross?o.finance.grossRevenue:o.sales.revenue);const financeUnits=o.finance.soldQty-o.finance.returnedQty;o.units=useFinanceAccrual?(financeUnits!==0?financeUnits:(o.sales.delivered>0?o.sales.delivered:o.sales.ordered)):(o.sales.delivered>0?o.sales.delivered:o.sales.ordered);o.price=o.units>0&&o.revenue>0?o.revenue/o.units:o.currentPrice;
     const periodDays=salesDs.length?unionDays(salesDs):7;o.velocity=o.sales.ordered>0&&periodDays?o.sales.ordered/periodDays:(o.tariff?.orders7>0?o.tariff.orders7/7:0);o.daysToZero=o.stock==null?null:(o.velocity>0?o.stock/o.velocity:(o.stock>0?Infinity:0));
     o.cogs=o.cost!=null&&o.units>0?o.cost*o.units:(o.cost!=null&&o.units===0?0:null);
     const tf=o.tariff;const scheme=norm(o.scheme);let tariffPer={commission:null,acquiring:null,logistics:null,storage:null};
     if(tf&&o.price!=null){const fbs=scheme.includes('fbs')&&!scheme.includes('fbo'),fbo=scheme.includes('fbo')&&!scheme.includes('fbs');let cpct,log;if(fbs){cpct=tf.commissionFbs;log=safe(tf.logMaxFbs)+safe(tf.lastMileFbs)+safe(tf.procMaxFbs)+safe(tf.nonstandardFbs)}else if(fbo){cpct=tf.commissionFbo;log=safe(tf.logMaxFbo)+safe(tf.lastMileFbo)+safe(tf.nonstandardFbo)}else{const ps=[tf.commissionFbo,tf.commissionFbs].filter(Number.isFinite);cpct=ps.length?sum(ps)/ps.length:null;const ls=[safe(tf.logMaxFbo)+safe(tf.lastMileFbo)+safe(tf.nonstandardFbo),safe(tf.logMaxFbs)+safe(tf.lastMileFbs)+safe(tf.procMaxFbs)+safe(tf.nonstandardFbs)];log=sum(ls)/ls.length}tariffPer.commission=cpct!=null?o.price*cpct/100:null;tariffPer.acquiring=tf.acquiring??null;tariffPer.logistics=log;}
     o.tariffPer=tariffPer;
-    const fin=o.finance;const hasFinance=fin.hasRows;const financeAllocShare=useFinanceAccrual&&financeRevenueBase>0?Math.max(0,fin.grossRevenue)/financeRevenueBase:0;
+    const fin=o.finance;const hasFinance=fin.hasRows;
+    const allocatedRawNet=useFinanceAccrual?(fin.rawNet+safe(unallocatedFinance.rawNet)*financeAllocShare):null;
+    o.netAfterOzon=allocatedRawNet;
     const financeGlobalUnallocated=(k)=>Math.abs(safe(unallocatedFinance[k]))>0.005;
     const actualFin=(k)=>financeCaps.has(k)&&(useFinanceAccrual||hasFinance)&&!financeGlobalUnallocated(k);
     const allocatedFin=(k)=>financeCaps.has(k)&&(useFinanceAccrual||hasFinance)&&financeGlobalUnallocated(k);
@@ -592,22 +599,29 @@ function buildModel(){
     const operationalRequired=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
     o.missingOperating=[];
     if(o.cost==null)o.missingOperating.push('себестоимость');
-    for(const k of operationalRequired){
-      const c=o.components[k];
-      if(c.value==null||c.source==='estimate'){
-        o.missingOperating.push(c.source==='estimate'?`${k==='commission'?'комиссия':k==='acquiring'?'эквайринг':k==='logistics'?'логистика':k} (есть только тарифная оценка)`:k==='ads'?'продвижение':k==='storage'?'хранение':k==='commission'?'комиссия':k==='acquiring'?'эквайринг':k==='logistics'?'логистика':k==='fines'?'штрафы':k==='returns'?'возвраты':'прочие удержания');
+    if(useFinanceAccrual&&o.netAfterOzon==null)o.missingOperating.push('финансовые начисления Ozon');
+    // For the main management P&L, the exact signed finance payout is the source of truth.
+    // Individual fee components remain visible for diagnostics, but a missing per-SKU split no longer
+    // blocks profit for the whole catalogue. No-SKU finance is explicitly allocated by revenue share.
+    o.operatingProfit=null;o.operatingMargin=null;o.operatingRoi=null;o.operatingProfitPerUnit=null;
+    if(o.cost!=null){
+      if(useFinanceAccrual&&o.netAfterOzon!=null){
+        o.operatingProfit=o.netAfterOzon-o.cogs;
+      }else if(!useFinanceAccrual){
+        const knownParts=operationalRequired.filter(k=>o.components[k].value!=null);
+        if(knownParts.length===operationalRequired.length){
+          o.operatingProfit=o.revenue-o.cogs-sum(knownParts,k=>o.components[k].value);
+        }
+      }
+      if(o.operatingProfit!=null){
+        o.operatingMargin=pct(o.operatingProfit,o.revenue);
+        o.operatingRoi=pct(o.operatingProfit,o.cogs);
+        o.operatingProfitPerUnit=o.units?o.operatingProfit/o.units:null;
+        o.missingOperating=[];
       }
     }
-    o.operatingProfit=null;o.operatingMargin=null;o.operatingRoi=null;o.operatingProfitPerUnit=null;
-    if(!o.missingOperating.length){
-      const opExpenses=sum(operationalRequired,k=>o.components[k].value);
-      o.operatingProfit=o.revenue-o.cogs-opExpenses;
-      o.operatingMargin=pct(o.operatingProfit,o.revenue);
-      o.operatingRoi=pct(o.operatingProfit,o.cogs);
-      o.operatingProfitPerUnit=o.units?o.operatingProfit/o.units:null;
-    }
     o.cleanProfit=null;o.margin=null;o.roi=null;o.profitPerUnit=null;o.missingProfit=[...o.missingOperating];
-    o.partialProfit=o.cost!=null?o.revenue-o.cogs-sum(operationalRequired.filter(k=>o.components[k].value!=null),k=>o.components[k].value):null;
+    o.partialProfit=o.operatingProfit!=null?o.operatingProfit:(o.cost!=null?o.revenue-o.cogs-sum(operationalRequired.filter(k=>o.components[k].value!=null),k=>o.components[k].value):null);
     o.drr=o.revenue>0&&o.components.ads.value!=null?pct(o.components.ads.value,o.revenue):null;o.revenueShare=0;
   }
 
@@ -641,7 +655,7 @@ function buildModel(){
   const totalPeriodDays=salesDs.length?unionDays(salesDs):null;
   const costRev={report:0,manual:0,missing:0};for(const o of products)costRev[o.costSource]+=safe(o.revenue);
   const complete=products.filter(x=>x.cleanProfit!=null);const completeRevenue=sum(complete,x=>x.revenue);const totalCogs=sum(products.filter(x=>x.cogs!=null),x=>x.cogs);const completeProfit=sum(complete,x=>x.cleanProfit);
-  const actualAdSpend=adsDs.length?adsTotal:(financeDs.length?sum(products,x=>x.finance.ads)+unallocatedFinance.ads:null);const financeNetAccrued=financeDs.length?sum(products,x=>x.finance.grossRevenue)-sum(['commission','acquiring','logistics','storage','ads','taxes','fines','returns','other'],k=>sum(products,x=>x.finance[k])+unallocatedFinance[k]):null;
+  const actualAdSpend=adsDs.length?adsTotal:(financeDs.length?sum(products,x=>x.finance.ads)+unallocatedFinance.ads:null);const financeNetAccrued=financeDs.length?(sum(products,x=>x.finance.rawNet)+safe(unallocatedFinance.rawNet)):null;
   const categories=aggregateCategories(products);const stockStats=computeStock(products);const signals=computeGrowthSignals(products);const campaignRows=[...campaigns.values()].map(c=>({...c,ctr:pct(c.clicks,c.impressions),drr:pct(c.spend,c.revenue)}));
   return{products,totalRevenue,totalCogs,complete,completeRevenue,completeProfit,operatingComplete,operatingRevenue,operatingProfit,estimatedTax,taxRate,costRev,categories,stockStats,signals,campaigns:campaignRows,adsSpend:actualAdSpend,adsUnallocated,unallocatedFinance,financeNetAccrued,salesDs,stockDs,priceDs,financeDs,adsDs,costDs,periodDays:totalPeriodDays,period:p};
 }
