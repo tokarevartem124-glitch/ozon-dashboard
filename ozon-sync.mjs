@@ -26,26 +26,41 @@ function asNum(v, fallback = 0) {
 function asStr(v) { return v == null ? '' : String(v); }
 function first(...xs) { return xs.find(v => v !== undefined && v !== null && v !== ''); }
 
-async function post(endpoint, body, {allowError = false} = {}) {
-  const res = await fetch(BASE + endpoint, {
-    method: 'POST',
-    headers: {
-      'Client-Id': CLIENT_ID,
-      'Api-Key': API_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify(body ?? {})
-  });
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : {}; } catch { json = {raw: text}; }
-  if (!res.ok) {
+async function post(endpoint, body, {allowError = false, retries = 4} = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(BASE + endpoint, {
+      method: 'POST',
+      headers: {
+        'Client-Id': CLIENT_ID,
+        'Api-Key': API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(body ?? {})
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : {}; } catch { json = {raw: text}; }
+
+    if (res.ok) return json;
+
     const msg = `${endpoint}: HTTP ${res.status} ${JSON.stringify(json).slice(0, 800)}`;
+    const canRetry = res.status === 429 || res.status >= 500;
+    if (canRetry && attempt < retries) {
+      const headerDelay = Number(res.headers.get('retry-after'));
+      const waitMs = Number.isFinite(headerDelay) && headerDelay > 0
+        ? headerDelay * 1000
+        : endpoint.includes('/v1/analytics/data')
+          ? 75000
+          : Math.min(30000, 3000 * (attempt + 1));
+      console.warn(`${msg} — retry ${attempt + 1}/${retries} after ${Math.round(waitMs/1000)}s`);
+      await sleep(waitMs);
+      continue;
+    }
+
     if (allowError) return {__error: msg, __status: res.status};
     throw new Error(msg);
   }
-  return json;
 }
 
 async function testAuth() {
@@ -101,39 +116,90 @@ async function fetchPrices() {
 }
 
 async function fetchStocks() {
-  // This endpoint includes item_code (seller article) + SKU and is convenient for joining.
-  const rows = [];
+  // Product stock endpoint is the primary source: it covers the catalogue and
+  // returns stock blocks per product. The warehouse analytics endpoint is kept
+  // only as an auxiliary diagnostic because some sellers may have very few FBO
+  // warehouse rows even when they have a large FBS assortment.
+  const product = await fetchProductStocks();
+
+  const warehouseRows = [];
+  let warehouseError = null;
   for (let offset = 0, guard = 0; guard < 100; guard++, offset += 1000) {
     const r = await post('/v2/analytics/stock_on_warehouses', {
       limit: 1000, offset, warehouse_type: 'ALL'
-    }, {allowError:true});
+    }, {allowError:true, retries:2});
     if (r.__error) {
-      // Fall back to product stock API. Shape differs; handled later.
-      const fallback = await fetchProductStocks();
-      return {rows: fallback, source: 'v4/product/info/stocks'};
+      warehouseError = r.__error;
+      break;
     }
     const batch = r?.result?.rows || [];
-    rows.push(...batch);
+    warehouseRows.push(...batch);
     if (batch.length < 1000) break;
   }
-  return {rows, source: 'v2/analytics/stock_on_warehouses'};
+
+  return {
+    rows: product.rows,
+    source: product.source,
+    complete: product.complete,
+    warehouseRows,
+    warehouseError
+  };
 }
 
 async function fetchProductStocks() {
+  // Current Ozon stock method uses cursor pagination. If a cabinet/API version
+  // does not accept v4, fall back to the older v3 last_id pagination.
   const items = [];
-  let lastId = '';
+  let cursor = '';
+  let endpoint = '/v4/product/info/stocks';
+
   for (let guard = 0; guard < 100; guard++) {
-    const r = await post('/v4/product/info/stocks', {
-      filter:{visibility:'ALL'}, last_id:lastId, limit:1000
-    });
+    const body = {
+      cursor,
+      filter: {visibility:'ALL'},
+      limit: 1000
+    };
+    let r = await post(endpoint, body, {allowError:true, retries:3});
+
+    if (r.__error && guard === 0) {
+      endpoint = '/v3/product/info/stocks';
+      break;
+    }
+    if (r.__error) throw new Error(r.__error);
+
     const result = r.result || r;
     const batch = Array.isArray(result.items) ? result.items : [];
     items.push(...batch);
-    const next = asStr(first(result.last_id, result.cursor));
-    if (!batch.length || !next || next === lastId) break;
-    lastId = next;
+
+    const next = asStr(first(result.cursor, r.cursor));
+    if (!batch.length || batch.length < 1000 || !next || next === cursor) {
+      return {rows:items, source:endpoint, complete:true};
+    }
+    cursor = next;
   }
-  return items;
+
+  if (endpoint === '/v3/product/info/stocks') {
+    const legacy = [];
+    let lastId = '';
+    for (let guard = 0; guard < 100; guard++) {
+      const r = await post(endpoint, {
+        filter:{visibility:'ALL'},
+        last_id:lastId,
+        limit:1000
+      }, {retries:3});
+      const result = r.result || r;
+      const batch = Array.isArray(result.items) ? result.items : [];
+      legacy.push(...batch);
+      const next = asStr(first(result.last_id, r.last_id));
+      if (!batch.length || batch.length < 1000 || !next || next === lastId) {
+        return {rows:legacy, source:endpoint, complete:true};
+      }
+      lastId = next;
+    }
+    return {rows:legacy, source:endpoint, complete:false};
+  }
+
+  return {rows:items, source:endpoint, complete:false};
 }
 
 function monthChunks(fromStr, toStr) {
@@ -183,35 +249,52 @@ async function analyticsRequest(metrics, offset = 0) {
     sort: [{key: 'revenue', order: 'DESC'}],
     limit: 1000,
     offset
-  }, {allowError:true});
+  }, {allowError:true, retries:5});
 }
 
 async function fetchAnalytics() {
   const premiumMetrics = ['revenue','ordered_units','delivered_units','returns','cancellations','hits_view','session_view_pdp','hits_tocart'];
   const basicMetrics = ['revenue','ordered_units'];
   let metrics = premiumMetrics;
+
   let firstPage = await analyticsRequest(metrics, 0);
   if (firstPage.__error) {
     console.warn('Premium analytics metrics unavailable; using basic metrics only.');
-    // Ozon documents a 1 request/minute limit for analytics/data.
-    await sleep(65000);
+    // The analytics endpoint is limited very aggressively. A failed request may
+    // also consume the window, so wait before the fallback request.
+    await sleep(75000);
     metrics = basicMetrics;
     firstPage = await analyticsRequest(metrics, 0);
-    if (firstPage.__error) return {rows:[], metrics:[], error:firstPage.__error};
+    if (firstPage.__error) {
+      return {rows:[], metrics:[], error:firstPage.__error, complete:false};
+    }
   }
-  const data = [...(firstPage?.result?.data || [])];
-  let offset = 1000;
-  while ((firstPage?.result?.data || []).length === 1000 && offset < 50000) {
-    await sleep(65000);
-    const next = await analyticsRequest(metrics, offset);
-    if (next.__error) return {rows:data, metrics, error:next.__error};
-    const batch = next?.result?.data || [];
+
+  const data = [];
+  let page = firstPage;
+  let offset = 0;
+  let complete = false;
+
+  while (offset < 50000) {
+    const batch = page?.result?.data || [];
     data.push(...batch);
-    if (batch.length < 1000) break;
-    firstPage = next;
+    console.log(`Analytics page: offset=${offset}; rows=${batch.length}; accumulated=${data.length}`);
+
+    if (batch.length < 1000) {
+      complete = true;
+      break;
+    }
+
     offset += 1000;
+    // Public Ozon docs for analytics/data specify one request per minute per seller.
+    await sleep(75000);
+    page = await analyticsRequest(metrics, offset);
+    if (page.__error) {
+      return {rows:data, metrics, error:page.__error, complete:false};
+    }
   }
-  return {rows:data, metrics};
+
+  return {rows:data, metrics, complete};
 }
 
 function extractProductSkuCandidates(p) {
@@ -250,6 +333,7 @@ function buildMaps(products, stockRaw) {
   const articleBySku = new Map();
   const nameBySku = new Map();
   const productByArticle = new Map();
+
   for (const p of products) {
     const article = asStr(first(p.offer_id, p.offerId));
     const productId = asStr(first(p.product_id, p.id));
@@ -259,42 +343,75 @@ function buildMaps(products, stockRaw) {
       if (p.name) nameBySku.set(sku, asStr(p.name));
     }
   }
+
   for (const s of stockRaw) {
-    const sku = asStr(first(s.sku, s.fbo_sku, s.fbs_sku));
     const article = asStr(first(s.item_code, s.offer_id, s.offerId));
-    if (sku && article) articleBySku.set(sku, article);
-    if (sku && first(s.item_name, s.name)) nameBySku.set(sku, asStr(first(s.item_name, s.name)));
+    const directSku = asStr(first(s.sku, s.fbo_sku, s.fbs_sku));
+    const stockSkus = Array.isArray(s.stocks)
+      ? s.stocks.map(st => asStr(first(st.sku, st.fbo_sku, st.fbs_sku))).filter(Boolean)
+      : [];
+    const skus = new Set([directSku, ...stockSkus].filter(Boolean));
+
+    for (const sku of skus) {
+      if (article) articleBySku.set(sku, article);
+      if (first(s.item_name, s.name)) nameBySku.set(sku, asStr(first(s.item_name, s.name)));
+    }
   }
+
   return {articleBySku, nameBySku, productByArticle};
 }
 
 function normalizeStock(stockRaw, maps, priceByArticle) {
   const grouped = new Map();
+
   for (const r of stockRaw) {
-    const sku = asStr(first(r.sku, r.fbo_sku, r.fbs_sku));
+    const nestedSkus = Array.isArray(r.stocks)
+      ? r.stocks.map(st => asStr(first(st.sku, st.fbo_sku, st.fbs_sku))).filter(Boolean)
+      : [];
+    const sku = asStr(first(r.sku, r.fbo_sku, r.fbs_sku, nestedSkus[0]));
     const article = asStr(first(r.item_code, r.offer_id, r.offerId, maps.articleBySku.get(sku)));
     if (!sku && !article) continue;
-    const key = `${article}|${sku}`;
+
+    // Group by seller article. Ozon may return several stock blocks/SKUs for one
+    // seller offer; for replenishment planning the seller article is the stable key.
+    const key = article || `sku:${sku}`;
     const o = grouped.get(key) || {
-      article, sku, name:asStr(first(r.item_name, r.name, maps.nameBySku.get(sku))),
-      category:'', type:'', brand:'', productId:'', volume:null, currentPrice:null,
-      stockFbo:0, stockFbs:0, stockRealFbs:0
+      article,
+      sku,
+      name:asStr(first(r.item_name, r.name, maps.nameBySku.get(sku), maps.productByArticle.get(article)?.name)),
+      category:'', type:'', brand:'',
+      productId:asStr(first(r.product_id, maps.productByArticle.get(article)?.productId)),
+      volume:null, currentPrice:null,
+      stockFbo:0, stockFbs:0, stockRealFbs:0,
+      reservedFbo:0, reservedFbs:0
     };
+
     if ('free_to_sell_amount' in r) {
       o.stockFbo += asNum(r.free_to_sell_amount);
     } else if (Array.isArray(r.stocks)) {
       for (const st of r.stocks) {
-        const type = String(first(st.type, st.stock_type, st.warehouse_type, '')).toLowerCase();
+        const type = String(first(st.type, st.stock_type, st.warehouse_type, st.shipment_type, '')).toLowerCase();
         const present = asNum(first(st.present, st.stock, st.free_to_sell_amount));
-        if (type.includes('fbs')) o.stockFbs += present; else o.stockFbo += present;
+        const reserved = Math.max(0, asNum(first(st.reserved, st.reserved_amount), 0));
+        const available = Math.max(0, present - reserved);
+
+        if (type.includes('fbs') || type.includes('rfbs')) {
+          o.stockFbs += available;
+          o.reservedFbs += reserved;
+        } else {
+          o.stockFbo += available;
+          o.reservedFbo += reserved;
+        }
       }
     } else {
       o.stockFbo += asNum(first(r.present, r.stock, r.free_to_sell_amount));
     }
+
     const pr = priceByArticle.get(article);
     if (pr) o.currentPrice = getPriceValue(pr);
     grouped.set(key, o);
   }
+
   return [...grouped.values()];
 }
 
@@ -423,52 +540,97 @@ console.log('Auth OK');
 const errors = [];
 const products = await fetchProducts().catch(e => { errors.push(String(e)); return []; });
 console.log(`Products: ${products.length}`);
+
 const prices = await fetchPrices().catch(e => { errors.push(String(e)); return []; });
 console.log(`Prices: ${prices.length}`);
-const stockResult = await fetchStocks().catch(e => { errors.push(String(e)); return {rows:[],source:'error'}; });
-console.log(`Stocks raw: ${stockResult.rows.length}`);
+
+const stockResult = await fetchStocks().catch(e => {
+  errors.push(String(e));
+  return {rows:[], source:'error', complete:false, warehouseRows:[], warehouseError:String(e)};
+});
+console.log(`Stocks product rows: ${stockResult.rows.length}; source: ${stockResult.source}; warehouse diagnostic rows: ${stockResult.warehouseRows?.length || 0}`);
+if (stockResult.warehouseError) console.warn(`Warehouse stock diagnostic unavailable: ${stockResult.warehouseError}`);
 
 const maps = buildMaps(products, stockResult.rows);
 const priceByArticle = new Map(prices.map(p => [asStr(first(p.offer_id,p.offerId)), p]).filter(x => x[0]));
 const stockRows = normalizeStock(stockResult.rows, maps, priceByArticle);
 const priceRows = normalizePrices(prices, maps);
 
+const stockComplete = Boolean(
+  stockResult.complete &&
+  stockRows.length > 1000 &&
+  (!products.length || stockRows.length >= Math.floor(products.length * 0.70))
+);
+console.log(`Stocks normalized: ${stockRows.length}; complete=${stockComplete}`);
+if (!stockComplete) {
+  errors.push(`Stocks incomplete: normalized ${stockRows.length} rows for ${products.length} products; previous embedded stock snapshot will be kept.`);
+}
+
 const financeOps = await fetchFinance().catch(e => { errors.push(String(e)); return []; });
-console.log(`Finance operations: ${financeOps.length}`);
+const financeNetTotal = financeOps.reduce((s,o)=>s+asNum(o.amount),0);
+const financeItemSkus = new Set();
+let financeMultiItemOps = 0;
+let financeNoItemOps = 0;
+for (const op of financeOps) {
+  const items = Array.isArray(op.items) ? op.items : [];
+  if (items.length > 1) financeMultiItemOps++;
+  if (!items.length) financeNoItemOps++;
+  for (const it of items) if (it?.sku != null) financeItemSkus.add(asStr(it.sku));
+}
+const financeMappedSkus = [...financeItemSkus].filter(sku => maps.articleBySku.has(sku)).length;
+console.log(`Finance operations: ${financeOps.length}; net amount: ${financeNetTotal.toFixed(2)}; unique item SKU: ${financeItemSkus.size}; mapped SKU: ${financeMappedSkus}; multi-item ops: ${financeMultiItemOps}; no-item ops: ${financeNoItemOps}`);
 const financeRows = normalizeFinance(financeOps, maps);
 
-const analytics = await fetchAnalytics().catch(e => ({rows:[],metrics:[],error:String(e)}));
+const analytics = await fetchAnalytics().catch(e => ({rows:[],metrics:[],error:String(e),complete:false}));
 if (analytics.error) errors.push(analytics.error);
-console.log(`Analytics rows: ${analytics.rows.length}; metrics: ${analytics.metrics.join(', ')}`);
+console.log(`Analytics rows: ${analytics.rows.length}; complete=${Boolean(analytics.complete)}; metrics: ${analytics.metrics.join(', ')}`);
 const salesRows = normalizeAnalytics(analytics, maps);
+if (!analytics.complete) {
+  errors.push(`Analytics incomplete: received ${salesRows.length} rows. Previous embedded sales/analytics dataset will be kept instead of replacing it with a partial API result.`);
+}
 
 const generatedAt = new Date().toISOString();
 const datasets = [];
-if (salesRows.length) datasets.push({
+
+// Never replace a complete embedded dataset with a partial API page.
+if (analytics.complete && salesRows.length) datasets.push({
   id:`api-sales-${DATE_FROM}_${DATE_TO}`, apiAuto:true, type:'sales', label:'Продажи / аналитика Ozon API',
   sheetName:'Seller API / analytics/data', sourceName:'Ozon Seller API', start:DATE_FROM, end:DATE_TO, snapshot:null,
-  importedAt:generatedAt, capabilities:{sales:true,funnel:analytics.metrics.includes('hits_view'),api:true}, rows:salesRows
+  importedAt:generatedAt,
+  capabilities:{sales:true,funnel:analytics.metrics.includes('hits_view'),api:true,complete:true},
+  rows:salesRows
 });
-if (stockRows.length) datasets.push({
+
+if (stockComplete && stockRows.length) datasets.push({
   id:`api-stock-${DATE_TO}`, apiAuto:true, type:'stock', label:'Остатки Ozon API',
   sheetName:stockResult.source, sourceName:'Ozon Seller API', start:null,end:null,snapshot:DATE_TO,
-  importedAt:generatedAt, capabilities:{stock:true,prices:true,api:true}, rows:stockRows
+  importedAt:generatedAt,
+  capabilities:{stock:true,prices:true,api:true,complete:true},
+  rows:stockRows
 });
+
 if (priceRows.length) datasets.push({
   id:`api-price-${DATE_TO}`, apiAuto:true, type:'price', label:'Цены / комиссии Ozon API',
   sheetName:'product/info/prices', sourceName:'Ozon Seller API', start:null,end:null,snapshot:DATE_TO,
-  importedAt:generatedAt, capabilities:{prices:true,tariffEstimate:true,api:true}, rows:priceRows
+  importedAt:generatedAt, capabilities:{prices:true,tariffEstimate:true,api:true,complete:true}, rows:priceRows
 });
+
 if (financeRows.length) datasets.push({
   id:`api-finance-${DATE_FROM}_${DATE_TO}`, apiAuto:true, type:'finance', label:'Финансы Ozon API',
   sheetName:'finance/transaction/list', sourceName:'Ozon Seller API', start:DATE_FROM,end:DATE_TO,snapshot:null,
   importedAt:generatedAt,
-  capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],rawNetTotal:financeOps.reduce((s,o)=>s+asNum(o.amount),0)},
+  capabilities:{
+    finance:true,accrualReport:true,grossRevenue:true,api:true,
+    components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],
+    rawNetTotal:financeNetTotal,
+    multiItemOperations:financeMultiItemOps,
+    note: financeMultiItemOps ? 'Часть финансовых операций содержит несколько SKU; общая сумма точная, товарное распределение таких операций требует дополнительной детализации.' : ''
+  },
   rows:financeRows
 });
 
 const payload = {
-  version:1,
+  version:2,
   generatedAt,
   range:{from:DATE_FROM,to:DATE_TO},
   clientId:CLIENT_ID,
@@ -476,9 +638,18 @@ const payload = {
   diagnostics:{
     products:products.length,
     prices:prices.length,
+    stockProductRows:stockResult.rows.length,
+    stockWarehouseRows:stockResult.warehouseRows?.length || 0,
     stockRows:stockRows.length,
+    stockComplete,
     financeOperations:financeOps.length,
+    financeNetTotal,
+    financeUniqueItemSkus:financeItemSkus.size,
+    financeMappedSkus,
+    financeMultiItemOps,
+    financeNoItemOps,
     analyticsRows:salesRows.length,
+    analyticsComplete:Boolean(analytics.complete),
     analyticsMetrics:analytics.metrics,
     errors
   }
@@ -487,9 +658,12 @@ const payload = {
 await fs.mkdir(path.join(process.cwd(),'data'), {recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'), JSON.stringify(encryptJson(payload, PASSWORD)));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'), JSON.stringify({
-  ok:true, generatedAt, range:payload.range,
+  ok: errors.length === 0,
+  generatedAt,
+  range:payload.range,
   counts:payload.diagnostics,
   note:'This status file contains no API key and no detailed financial data.'
 }, null, 2));
+
 console.log('Encrypted dashboard data written to data/ozon-data.enc.json');
 if (errors.length) console.warn('Non-fatal sync warnings:', errors);
