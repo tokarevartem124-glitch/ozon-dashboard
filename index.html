@@ -207,9 +207,12 @@ const API_PW_REMEMBER='ozonDashboard.apiPassword.remember';
 let apiSyncStatus={available:false,loaded:false,loading:false,generatedAt:null,error:null};
 
 function b64bytes(s){const bin=atob(s);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return a}
+function normalizeDashboardPassword(v){return String(v??'').normalize('NFKC').trim()}
 async function decryptApiEnvelope(env,password){
   const enc=new TextEncoder();
-  const base=await crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']);
+  const normalizedPassword=normalizeDashboardPassword(password);
+  if(!normalizedPassword)throw new Error('Пустой DASHBOARD_PASSWORD');
+  const base=await crypto.subtle.importKey('raw',enc.encode(normalizedPassword),'PBKDF2',false,['deriveKey']);
   const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:b64bytes(env.salt),iterations:env.iterations||250000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['decrypt']);
   const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64bytes(env.iv),tagLength:128},key,b64bytes(env.data));
   return JSON.parse(new TextDecoder().decode(plain));
@@ -264,11 +267,11 @@ async function loadRemoteAutoData(force=false){
     if(!password){
       const ans=await apiPasswordDialog();
       if(!ans)return;
-      password=ans.password;remember=ans.remember;
+      password=normalizeDashboardPassword(ans.password);remember=ans.remember;
     }
     try{
       const payload=await decryptApiEnvelope(env,password);
-      sessionStorage.setItem(API_PW_SESSION,password);
+      password=normalizeDashboardPassword(password);sessionStorage.setItem(API_PW_SESSION,password);
       if(remember)localStorage.setItem(API_PW_REMEMBER,password);
       applyApiPayload(payload);
     }catch(e){
@@ -280,12 +283,13 @@ async function loadRemoteAutoData(force=false){
       const ans=await apiPasswordDialog();
       if(ans?.password){
         try{
-          const payload=await decryptApiEnvelope(env,ans.password);
-          sessionStorage.setItem(API_PW_SESSION,ans.password);
-          if(ans.remember)localStorage.setItem(API_PW_REMEMBER,ans.password);
+          const normalizedRetry=normalizeDashboardPassword(ans.password);
+          const payload=await decryptApiEnvelope(env,normalizedRetry);
+          sessionStorage.setItem(API_PW_SESSION,normalizedRetry);
+          if(ans.remember)localStorage.setItem(API_PW_REMEMBER,normalizedRetry);
           applyApiPayload(payload);
         }catch{
-          showMessage('Пароль снова не подошёл. Данные Ozon не загружены; закупочные цены сохранены.','error');
+          showMessage('Пароль не совпадает с текущим зашифрованным файлом. Проверьте DASHBOARD_PASSWORD в GitHub Secrets; пробелы по краям теперь автоматически игнорируются.','error');
         }
       }
     }
