@@ -2,8 +2,22 @@ name: "Ozon dashboard sync + deploy"
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Sync mode"
+        required: true
+        default: "fast"
+        type: choice
+        options:
+          - fast
+          - daily
+
   schedule:
+    # Быстрая синхронизация каждый час
     - cron: "17 * * * *"
+
+    # Полная аналитика один раз в сутки
+    - cron: "37 2 * * *"
 
 permissions:
   contents: read
@@ -11,12 +25,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
+  group: "ozon-pages-sync"
   cancel-in-progress: true
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: "${{ steps.deployment.outputs.page_url }}"
@@ -28,7 +43,19 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
+
+      - name: Decide sync mode
+        id: sync_mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "37 2 * * *" ]; then
+            echo "mode=daily" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=fast" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Fetch and encrypt Ozon data
         run: node ozon-sync.mjs
@@ -36,7 +63,11 @@ jobs:
           OZON_CLIENT_ID: "${{ secrets.OZON_CLIENT_ID }}"
           OZON_API_KEY: "${{ secrets.OZON_API_KEY }}"
           DASHBOARD_PASSWORD: "${{ secrets.DASHBOARD_PASSWORD }}"
-          OZON_HISTORY_DAYS: "120"
+          SYNC_MODE: "${{ steps.sync_mode.outputs.mode }}"
+          PREVIOUS_DATA_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/ozon-data.enc.json"
+          FINANCE_LOOKBACK_DAYS: "3"
+          ANALYTICS_MAX_CATCHUP_DAYS: "7"
+          ANALYTICS_PAGE_DELAY_MS: "65000"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
