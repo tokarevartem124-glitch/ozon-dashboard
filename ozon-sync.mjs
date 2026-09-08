@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 
   Modes:
     fast  - hourly: products, prices, stocks, only recent finance operations.
-    daily - once a day: everything from fast + only the NEW analytics date range.
+    daily - once a day: everything from fast + ONE top-traffic analytics snapshot for the new date range.
 
   State persistence:
     The previous encrypted payload is downloaded from the already deployed
@@ -477,31 +477,41 @@ function mergeFinanceRows(previousRows, freshRows) {
 /* ----------------------------- analytics ------------------------------ */
 const ANALYTICS_METRICS = ['revenue', 'ordered_units', 'delivered_units', 'returns', 'cancellations', 'hits_view', 'session_view_pdp', 'hits_tocart'];
 
-async function analyticsRequest(fromDate, toDate, offset) {
+async function analyticsRequest(fromDate, toDate) {
+  /*
+    Ozon limits /v1/analytics/data to one request per minute per seller account.
+    A full 10k-SKU pagination would therefore take 10+ minutes every day.
+
+    For the operational dashboard we intentionally make ONE analytics request:
+      - exact catalog totals are kept from result.totals;
+      - SKU detail is limited to the 1000 products with the most views,
+        which are the products where funnel diagnostics are actionable.
+
+    Revenue/profit remain sourced from Finance API, so analytics is used mainly
+    for funnel metrics and growth signals rather than accounting totals.
+  */
   return post('/v1/analytics/data', {
     date_from: fromDate,
     date_to: toDate,
     dimension: ['sku'],
     filters: [],
     metrics: ANALYTICS_METRICS,
-    sort: [{ key: 'revenue', order: 'DESC' }],
+    sort: [{ key: 'hits_view', order: 'DESC' }],
     limit: 1000,
-    offset
+    offset: 0
   }, { allowError: true, retries: 1, analytics: true });
 }
 
 async function fetchAnalyticsSegment(fromDate, toDate) {
-  const data = [];
-  for (let offset = 0, pageNo = 0; offset < 50000; offset += 1000, pageNo++) {
-    if (pageNo > 0) await sleep(ANALYTICS_PAGE_DELAY_MS);
-    const page = await analyticsRequest(fromDate, toDate, offset);
-    if (page.__error) return { rows: data, metrics: ANALYTICS_METRICS, complete: false, error: page.__error };
-    const batch = page?.result?.data || [];
-    data.push(...batch);
-    console.log(`Analytics delta page: ${fromDate}..${toDate}; offset=${offset}; rows=${batch.length}; accumulated=${data.length}`);
-    if (batch.length < 1000) return { rows: data, metrics: ANALYTICS_METRICS, complete: true };
+  const page = await analyticsRequest(fromDate, toDate);
+  if (page.__error) {
+    return { rows: [], metrics: ANALYTICS_METRICS, totals: [], complete: false, truncated: false, error: page.__error };
   }
-  return { rows: data, metrics: ANALYTICS_METRICS, complete: false, error: 'Analytics pagination safety limit reached' };
+  const rows = page?.result?.data || [];
+  const totals = page?.result?.totals || [];
+  const truncated = rows.length >= 1000;
+  console.log(`Analytics snapshot: ${fromDate}..${toDate}; skuRows=${rows.length}; topTrafficOnly=${truncated}; oneRequest=true`);
+  return { rows, metrics: ANALYTICS_METRICS, totals, complete: true, truncated };
 }
 
 function normalizeAnalyticsRows(rawRows, metrics, maps) {
@@ -579,7 +589,16 @@ async function updateAnalyticsSegments(segments, maps, warnings) {
   const rows = normalizeAnalyticsRows(result.rows, result.metrics, maps);
   return [...segments, {
     id: `api-${fromDate}_${toDate}`,
-    start: fromDate, end: toDate, source: 'Ozon Seller API incremental', rows
+    start: fromDate,
+    end: toDate,
+    source: 'Ozon Seller API daily top-traffic snapshot',
+    rows,
+    totals: result.totals || [],
+    metrics: result.metrics,
+    skuDetailTruncated: Boolean(result.truncated),
+    note: result.truncated
+      ? 'SKU-level funnel detail contains top 1000 products by views; catalog totals are preserved separately.'
+      : 'SKU-level funnel detail is complete for this period.'
   }];
 }
 
@@ -716,6 +735,8 @@ const payload = {
     analyticsSegments: analyticsSegments.length,
     analyticsCoverage: { from: salesStart, to: salesEnd },
     analyticsRows: salesRows.length,
+    analyticsLatestSkuDetailTruncated: Boolean(analyticsSegments.at(-1)?.skuDetailTruncated),
+    analyticsLatestTotals: analyticsSegments.at(-1)?.totals || null,
     warnings
   }
 };
