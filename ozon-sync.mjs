@@ -518,12 +518,45 @@ function uniqStrings(xs){return [...new Set((xs||[]).map(asStr).filter(Boolean))
 async function fetchFinancePostingAccruals(postingNumbers){
   const requested=uniqStrings(postingNumbers),all=[];
   const returned=new Set(),errors=[];
+
+  // The beta postings endpoint is substantially more rate-limited than the
+  // catalogue endpoints.  Generic 1-second retries create a 429 loop, so use a
+  // dedicated adaptive caller here.  Large requests reduce the number of API
+  // calls; 400/413 responses are split recursively.
+  let lastPostingRequestAt=0;
+  async function callPostings(batch){
+    const minGapMs=3500;
+    const since=Date.now()-lastPostingRequestAt;
+    if(since<minGapMs) await sleep(minGapMs-since);
+
+    for(let attempt=0;attempt<6;attempt++){
+      lastPostingRequestAt=Date.now();
+      const res=await fetch(BASE+'/v1/finance/accrual/postings',{
+        method:'POST',
+        headers:{'Client-Id':CLIENT_ID,'Api-Key':API_KEY,'Content-Type':'application/json','Accept':'application/json'},
+        body:JSON.stringify({posting_numbers:batch})
+      });
+      const text=await res.text();
+      let json={};try{json=text?JSON.parse(text):{}}catch{json={raw:text}}
+      if(res.ok)return json;
+      const msg=`/v1/finance/accrual/postings: HTTP ${res.status} ${JSON.stringify(json).slice(0,700)}`;
+      if(res.status===429){
+        const headerSec=Number(res.headers.get('retry-after'));
+        const fallback=[5000,10000,20000,35000,50000,65000][attempt]||65000;
+        const waitMs=Math.max(Number.isFinite(headerSec)&&headerSec>0?headerSec*1000:0,fallback);
+        console.warn(`${msg} — rate-limit wait ${Math.round(waitMs/1000)}s (${attempt+1}/6)`);
+        await sleep(waitMs);
+        continue;
+      }
+      return {__error:msg,__status:res.status};
+    }
+    return {__error:'/v1/finance/accrual/postings: HTTP 429 after adaptive retries',__status:429};
+  }
+
   async function fetchBatch(batch){
     if(!batch.length)return;
-    const r=await post('/v1/finance/accrual/postings',{posting_numbers:batch},{allowError:true,retries:3});
+    const r=await callPostings(batch);
     if(r.__error){
-      // If Ozon rejects a large batch, split it recursively. This keeps the
-      // integration tolerant to undocumented request-size limits.
       if(batch.length>1&&(r.__status===400||r.__status===413)){
         const mid=Math.ceil(batch.length/2);
         await fetchBatch(batch.slice(0,mid));
@@ -537,20 +570,16 @@ async function fetchFinancePostingAccruals(postingNumbers){
       const pn=asStr(x.posting_number);if(pn)returned.add(pn);
       all.push(x);
     }
-    // Keep some headroom against beta endpoint rate limits.
-    await sleep(180);
   }
-  // /v1/finance/accrual/postings accepts a LIST of posting_numbers. Use sizeable
-  // batches so a full historical rebuild does not make thousands of HTTP calls.
-  // If Ozon rejects the request size, fetchBatch() recursively halves the batch.
-  const batchSize=250;
+
+  // Start with a large batch. If Ozon documents/changes a request-size limit,
+  // the recursive splitter above automatically falls back to smaller batches.
+  const batchSize=1000;
   const totalBatches=Math.ceil(requested.length/batchSize);
   for(let i=0,b=0;i<requested.length;i+=batchSize){
     b++;
     await fetchBatch(requested.slice(i,i+batchSize));
-    if(b===1 || b===totalBatches || b%5===0){
-      console.log(`SKU accrual batch ${b}/${totalBatches}; requested=${Math.min(i+batchSize,requested.length)}/${requested.length}; returned postings=${returned.size}`);
-    }
+    console.log(`SKU accrual batch ${b}/${totalBatches}; requested=${Math.min(i+batchSize,requested.length)}/${requested.length}; returned postings=${returned.size}`);
   }
   return {postingAccruals:all,requested,returned:[...returned],errors};
 }
