@@ -816,8 +816,8 @@ function buildModel(){
   const financeNetAccrued=sum(finRows,r=>safe(r.rawAmount));
 
   // Direct SKU money layer projected from /v1/finance/accrual/by-day.
-  // sale_amount, bonus, coinvestment, sale commission, delivery accruals and item_fees are
-  // tied to SKU by Ozon. seller_price is diagnostic only. Non-item seller-level charges remain only in business P&L.
+  // sale_amount, sale commission, delivery accruals and item_fees are
+  // tied to SKU by Ozon. bonus/coinvestment are audit breakdown fields already included in sale_amount; seller_price is diagnostic only. Non-item seller-level charges remain only in business P&L.
   for(const ds of skuFinanceDs)for(const r of ds.rows){
     if(!filterDatedRow(r,p))continue;
     const o=ensure(r),f=o.finance;f.hasRows=true;f.exactRows++;
@@ -868,7 +868,7 @@ function buildModel(){
   /*
     Finance v5.5 policy:
       - business P&L is the exact /finance/accrual/by-day ledger;
-      - product economic gross = sale_amount + bonus + coinvestment from by-day;
+      - product economic gross = sale_amount from by-day (bonus and coinvestment are already included);
       - product net money is computed from direct SKU fields inside /finance/accrual/by-day
         (economic gross, sale commission, delivery and item_fees);
       - seller_price is shown only as a diagnostic field because it can be per-unit;
@@ -1076,7 +1076,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v5.7</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v5.8</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1276,7 +1276,7 @@ function productDetail(p){
     ['Товарная прибыль',fmtMoney(p.operatingProfit)]
   ];
   const qtyAudit=`Прямая SKU-атрибуция /finance/accrual/by-day: ${fmtNum(p.finance?.exactRows||0)} финансовых строк${p.financeExactComplete===false?' · товарная прибыль не показывается, пока сверка прямой SKU-атрибуции не пройдена':''}`;
-  return`<div class="detail-grid"><div><h4>Нитка прибыли</h4><div class="chain">${chain.map((x,i)=>`${i?'<span class="arrow">→</span>':''}<span>${escapeHtml(x[0])}: <b>${fmtMoney(x[1])}</b></span>`).join('')}</div>${p.missingProfit.length?`<div class="muted tiny" style="margin-top:8px">Не хватает: ${escapeHtml(p.missingProfit.join(', '))}</div>`:''}</div><div><h4>Мини-воронка</h4><div class="funnel-mini">${bars.map(([n,v])=>`<div class="fbar"><i style="width:${100*v/max}%"></i><span>${n}: ${fmtNum(v)}</span></div>`).join('')}</div></div><div><h4>Остаток и поставка</h4>${s?`<div class="metric-row"><span>Остаток</span><b>${fmtNum(s.stock)} шт.</b></div><div class="metric-row"><span>Скорость</span><b>${fmtNum(s.velocity,2)} шт./день</b></div><div class="metric-row"><span>Хватит</span><b>${s.daysToZero===Infinity?'нет продаж':fmtNum(s.daysToZero,1)+' дн.'}</b></div><div class="metric-row"><span>Рекомендация</span><b>${escapeHtml(s.recommendation)}</b></div>`:'<div class="empty">Нет отчёта остатков для товара.</div>'}</div></div><div class="card" style="margin-top:12px"><h4>Аудит товарной прибыли</h4><div class="muted tiny" style="margin-bottom:8px">${escapeHtml(qtyAudit)}. Для товарной экономики валовой доход берётся из прямых полей /finance/accrual/by-day: sale_amount + bonus + coinvestment. Это соответствует структуре старого отчёта Ozon: Выручка + Баллы за скидки + Программы партнёров. seller_price показывается только для диагностики и не используется как итоговая выручка. Деньги после Ozon = валовой доход минус прямая комиссия, доставка и item_fees. Количество для себестоимости — из слоя реализации.</div><div class="table-wrap"><table class="table" style="min-width:620px"><tbody>${auditRows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num"><b>${v}</b></td></tr>`).join('')}</tbody></table></div></div>`
+  return`<div class="detail-grid"><div><h4>Нитка прибыли</h4><div class="chain">${chain.map((x,i)=>`${i?'<span class="arrow">→</span>':''}<span>${escapeHtml(x[0])}: <b>${fmtMoney(x[1])}</b></span>`).join('')}</div>${p.missingProfit.length?`<div class="muted tiny" style="margin-top:8px">Не хватает: ${escapeHtml(p.missingProfit.join(', '))}</div>`:''}</div><div><h4>Мини-воронка</h4><div class="funnel-mini">${bars.map(([n,v])=>`<div class="fbar"><i style="width:${100*v/max}%"></i><span>${n}: ${fmtNum(v)}</span></div>`).join('')}</div></div><div><h4>Остаток и поставка</h4>${s?`<div class="metric-row"><span>Остаток</span><b>${fmtNum(s.stock)} шт.</b></div><div class="metric-row"><span>Скорость</span><b>${fmtNum(s.velocity,2)} шт./день</b></div><div class="metric-row"><span>Хватит</span><b>${s.daysToZero===Infinity?'нет продаж':fmtNum(s.daysToZero,1)+' дн.'}</b></div><div class="metric-row"><span>Рекомендация</span><b>${escapeHtml(s.recommendation)}</b></div>`:'<div class="empty">Нет отчёта остатков для товара.</div>'}</div></div><div class="card" style="margin-top:12px"><h4>Аудит товарной прибыли</h4><div class="muted tiny" style="margin-bottom:8px">${escapeHtml(qtyAudit)}. Для товарной экономики валовой доход берётся из /finance/accrual/by-day как sale_amount. Поля bonus и coinvestment показываются только для аудита: они уже входят в sale_amount и повторно не прибавляются. seller_price показывается только для диагностики и не используется как итоговая выручка. Деньги после Ozon = валовой доход минус прямая комиссия, доставка и item_fees. Количество для себестоимости — из слоя реализации.</div><div class="table-wrap"><table class="table" style="min-width:620px"><tbody>${auditRows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num"><b>${v}</b></td></tr>`).join('')}</tbody></table></div></div>`
 }
 function bindManualCosts(){$$('.manual-cost').forEach(el=>el.addEventListener('change',e=>{const v=num(e.target.value);if(v==null||v<0)delete state.manualCosts[e.target.dataset.key];else state.manualCosts[e.target.dataset.key]={value:v,updatedAt:new Date().toISOString()};persistState();renderAll()}))}
 function focusCost(key){activeTab='unit';$$('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab==='unit'));$$('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-unit'));const p=currentModel.products.find(x=>x.key===key);tableState.unit.search=p?.article||p?.sku||'';tableState.unit.page=1;renderUnit();setTimeout(()=>document.querySelector(`[data-product-key="${CSS.escape(key)}"] .manual-cost`)?.focus(),50)}
@@ -1333,7 +1333,7 @@ function renderSettings(){
     <div class="metric-row"><span>Сверка выручки SKU → business ledger</span><span class="${Math.abs(safe(m.reconciliation?.revenueDiff))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}</span></div>
     <div class="metric-row"><span>Business ledger reconcile delta</span><span class="${Math.abs(safe(q.financeReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.financeReconcileDelta)))}</span></div>
     <div class="metric-row"><span>Количество реализации</span><span>${m.quantityComplete?'<span class="positive">контроль пройден</span>':`<span class="warning">есть несопоставленные операции: ${fmtNum(q.unresolvedSaleOps)}</span>`}</span></div>
-    <div class="metric-row"><span>Источник товарной экономики</span><span>${escapeHtml(q.skuFinanceSource||'finance/accrual/by-day · sale_amount+bonus+coinvestment')}</span></div>
+    <div class="metric-row"><span>Источник товарной экономики</span><span>${escapeHtml(q.skuFinanceSource||'finance/accrual/by-day · sale_amount')}</span></div>
     <div class="metric-row"><span>Прямых SKU-строк Finance</span><span>${fmtNum(q.skuFinanceDirectRows??q.skuFinanceRowsPublished??0)}</span></div>
     <div class="metric-row"><span>Дельта выручки SKU → business ledger</span><span class="${Math.abs(safe(q.skuFinanceRevenueDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceRevenueDelta)))}</span></div>
     <div class="metric-row"><span>Дельта direct SKU net</span><span class="${Math.abs(safe(q.skuFinanceReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceReconcileDelta)))}</span></div>
