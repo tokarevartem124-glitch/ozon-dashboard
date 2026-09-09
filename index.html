@@ -920,7 +920,8 @@ function buildModel(){
     cogsCoverage,costRev,categories,stockStats,signals,campaigns:campaignRows,adsSpend:actualAdSpend,adsUnallocated,
     reconciliation:{revenueDiff:productRevenueReconciliation,netDiff:productNetReconciliation,grossResidual,netResidual},
     quality:{currentOzonArticles:currentOzonArticles.size,ozonCostKnown,ozonRrpKnown,ozonCostConflict,missingCostArticles,missingRrpCatalog,funnelSegmentsUsed,funnelSegmentsSkipped,
-      funnelTop1000:Boolean(diag.analyticsLatestSkuDetailTruncated),unresolvedSaleOps:diag.unresolvedSaleOps??null,returnsComplete:diag.returnsComplete??null},
+      funnelTop1000:Boolean(diag.analyticsLatestSkuDetailTruncated),unresolvedSaleOps:diag.unresolvedSaleOps??null,returnsComplete:diag.returnsComplete??null,
+      realizationCoverage:diag.realizationCoverage||null,realizationDailyPremiumAvailable:diag.realizationDailyPremiumAvailable??null},
     funnelDs,realizedDs,stockDs,priceDs,financeDs,adsDs,costDs,rrpDs,periodDays:p?daysInclusive(p.start,p.end):(businessPeriod?daysInclusive(businessPeriod.start,businessPeriod.end):null),period:p
   };
 }
@@ -946,8 +947,14 @@ function rebuildPeriodSelect(){
   if(minStart&&maxEnd){
     const clampRange=(a,b,label)=>{const s=a<minStart?minStart:a,e=b>maxEnd?maxEnd:b;if(s<=e)opts.push([`${s}|${e}`,label])};
     const today=maxEnd;
-    clampRange(addDays(today,-6),today,'Последние 7 дней');
-    clampRange(addDays(today,-29),today,'Последние 30 дней');
+    // Rolling periods are shown only when realization has official DAILY coverage for the whole interval.
+    // Closed historical months are sourced from the official monthly realization report and must not be
+    // silently prorated into an arbitrary 30-day window.
+    const realized=authoritativeDatasets('realized');
+    const dailyStart=realized.map(d=>d.capabilities?.dailyCoverageStart).filter(Boolean).sort()[0]||null;
+    const dailyEnd=realized.map(d=>d.capabilities?.dailyCoverageEnd).filter(Boolean).sort().at(-1)||null;
+    const last7Start=addDays(today,-6);
+    if(dailyStart&&dailyEnd&&last7Start>=dailyStart&&today<=dailyEnd)clampRange(last7Start,today,'Последние 7 дней');
     const curYm=today.slice(0,7),curB=monthBounds(curYm);clampRange(curB.start,curB.end,'Текущий месяц');
     const d=new Date(curB.start+'T00:00:00Z');d.setUTCMonth(d.getUTCMonth()-1);const prevYm=d.toISOString().slice(0,7),prevB=monthBounds(prevYm);clampRange(prevB.start,prevB.end,'Предыдущий месяц');
     for(const m of monthsInRange(minStart,maxEnd).reverse()){
@@ -971,7 +978,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v4.5</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v4.6</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -997,6 +1004,7 @@ function renderQuality(){
   $('#dataQuality').innerHTML=`<b>Контроль данных.</b> Ozon в расчётах — <b>только Seller API</b>; Excel Ozon не используется. 
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка найдена ${fmtPct(costCatalogPct)} · РРЦ найдена ${fmtPct(rrpCatalogPct)}.
     Финансовый ledger: выручка ${fmtMoney(m.financeGrossAccrued)} · после услуг Ozon ${fmtMoney(m.financeNetAccrued)}.
+    Реализация: ${q.realizationCoverage?.from||'нет'} — ${q.realizationCoverage?.to||'нет'}${q.realizationDailyPremiumAvailable===false?' · текущий месяц через резервный слой отправлений':' · закрытые месяцы из официального отчёта, текущий месяц по дням'}.
     ${q.funnelTop1000?'Воронка: детализация top-1000 SKU по трафику на daily-срез.':'Воронка: доступная детализация API.'}
     ${issues.length?`<span class="warning"> Требуют внимания: ${escapeHtml(issues.join('; '))}.</span>`:'<span class="positive"> Контрольные проверки пройдены.</span>'}`;
 }
