@@ -540,8 +540,18 @@ async function fetchFinancePostingAccruals(postingNumbers){
     // Keep some headroom against beta endpoint rate limits.
     await sleep(180);
   }
-  const batchSize=50;
-  for(let i=0;i<requested.length;i+=batchSize)await fetchBatch(requested.slice(i,i+batchSize));
+  // /v1/finance/accrual/postings accepts a LIST of posting_numbers. Use sizeable
+  // batches so a full historical rebuild does not make thousands of HTTP calls.
+  // If Ozon rejects the request size, fetchBatch() recursively halves the batch.
+  const batchSize=250;
+  const totalBatches=Math.ceil(requested.length/batchSize);
+  for(let i=0,b=0;i<requested.length;i+=batchSize){
+    b++;
+    await fetchBatch(requested.slice(i,i+batchSize));
+    if(b===1 || b===totalBatches || b%5===0){
+      console.log(`SKU accrual batch ${b}/${totalBatches}; requested=${Math.min(i+batchSize,requested.length)}/${requested.length}; returned postings=${returned.size}`);
+    }
+  }
   return {postingAccruals:all,requested,returned:[...returned],errors};
 }
 function normalizeFinancePostingAccruals(postingAccruals,maps,typeNames){
