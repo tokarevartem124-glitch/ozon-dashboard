@@ -753,7 +753,7 @@ function buildModel(){
         currentPrice:null,rrp:null,rrpSource:'missing',stock:null,volume:null,reportCost:null,reportCostColumn:null,costConflict:false,tariff:null,
         sales:{revenue:0,impressions:0,visits:0,carts:0,ordered:0,delivered:0,returns:0,cancellations:0},
         realized:{sold:0,returned:0,net:0,hasRows:false},
-        finance:{grossRevenue:0,rawNet:0,commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,hasRows:false,exactRows:0,accrualLines:0,postingQtyAudit:0,sellerPriceAudit:0},
+        finance:{grossRevenue:0,rawNet:0,commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,hasRows:false,exactRows:0,accrualLines:0,postingQtyAudit:0,sellerPriceAudit:0,sellerPriceRaw:0,saleAmount:0,bonus:0,coinvestment:0},
         ads:{spend:0,impressions:0,clicks:0,carts:0,orders:0,revenue:0,hasRows:false}};
       products.push(o);
     }
@@ -796,7 +796,7 @@ function buildModel(){
 
   // Business finance ledger from /v1/finance/accrual/by-day.
   // It is the source of truth for total revenue/net.  At SKU level we use it
-  // for seller_price revenue and business totals. The same by-day ledger also
+  // for economic gross revenue and business totals. The same by-day ledger also
   // carries direct SKU commission/delivery/item_fees; a separate skuFinance
   // dataset is just a projection of those direct SKU rows, not another API call.
   const unallocatedFinance={commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,grossRevenue:0,rawNet:0};
@@ -816,14 +816,15 @@ function buildModel(){
   const financeNetAccrued=sum(finRows,r=>safe(r.rawAmount));
 
   // Direct SKU money layer projected from /v1/finance/accrual/by-day.
-  // seller_price, sale commission, delivery accruals and item_fees are already
-  // tied to SKU by Ozon. Non-item seller-level charges remain only in business P&L.
+  // sale_amount, bonus, coinvestment, sale commission, delivery accruals and item_fees are
+  // tied to SKU by Ozon. seller_price is diagnostic only. Non-item seller-level charges remain only in business P&L.
   for(const ds of skuFinanceDs)for(const r of ds.rows){
     if(!filterDatedRow(r,p))continue;
     const o=ensure(r),f=o.finance;f.hasRows=true;f.exactRows++;
     f.rawNet+=safe(r.rawAmount);f.accrualLines+=safe(r.accrualLines);
     f.postingQtyAudit=Math.max(safe(f.postingQtyAudit),Math.abs(safe(r.postingQtyAudit)));
     f.sellerPriceAudit=Math.max(safe(f.sellerPriceAudit),Math.abs(safe(r.sellerPriceAudit)));
+    f.sellerPriceRaw+=safe(r.sellerPriceRaw);f.saleAmount+=safe(r.saleAmount);f.bonus+=safe(r.bonus);f.coinvestment+=safe(r.coinvestment);
     for(const k of ['commission','acquiring','logistics','storage','ads','taxes','fines','returns','other'])f[k]+=safe(r[k]);
   }
 
@@ -867,11 +868,12 @@ function buildModel(){
   /*
     Finance v5.5 policy:
       - business P&L is the exact /finance/accrual/by-day ledger;
-      - product revenue is Σ seller_price exactly as Ozon returns it in by-day;
+      - product economic gross = sale_amount + bonus + coinvestment from by-day;
       - product net money is computed from direct SKU fields inside /finance/accrual/by-day
-        (seller_price, sale commission, delivery and item_fees);
+        (economic gross, sale commission, delivery and item_fees);
+      - seller_price is shown only as a diagnostic field because it can be per-unit;
       - seller/non-item charges without SKU stay only in business P&L.
-    No catalogue-wide allocation and no seller_price × posting quantity.
+    No catalogue-wide allocation and no quantity inference inside finance.
   */
   const directGross=sum(products,x=>safe(x.finance.grossRevenue));
   const directNet=sum(products,x=>x.finance.hasRows?safe(x.finance.rawNet):0);
@@ -1074,7 +1076,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v5.5</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v5.6</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1256,7 +1258,11 @@ function productDetail(p){
     ['Реализовано, net шт.',p.units==null?'нет данных':fmtNum(p.units,0)],
     ['Закупка / шт.',fmtMoney(p.cost)],
     ['Себестоимость',fmtMoney(p.cogs)],
-    ['Finance by-day: Σ seller_price',fmtMoney(p.revenue)],
+    ['Finance by-day: Σ seller_price (диагностика)',fmtMoney(p.finance?.sellerPriceRaw)],
+    ['Выручка / sale_amount',fmtMoney(p.finance?.saleAmount)],
+    ['Баллы за скидки / bonus',fmtMoney(p.finance?.bonus)],
+    ['Соинвестирование / coinvestment',fmtMoney(p.finance?.coinvestment)],
+    ['Валовой доход до расходов Ozon',fmtMoney(p.revenue)],
     ['Точных SKU-начислений',fmtNum(p.finance?.accrualLines||0)],
     ['Комиссия Ozon',fmtMoney(p.components.commission.value)],
     ['Эквайринг',fmtMoney(p.components.acquiring.value)],
@@ -1270,7 +1276,7 @@ function productDetail(p){
     ['Товарная прибыль',fmtMoney(p.operatingProfit)]
   ];
   const qtyAudit=`Прямая SKU-атрибуция /finance/accrual/by-day: ${fmtNum(p.finance?.exactRows||0)} финансовых строк${p.financeExactComplete===false?' · товарная прибыль не показывается, пока сверка прямой SKU-атрибуции не пройдена':''}`;
-  return`<div class="detail-grid"><div><h4>Нитка прибыли</h4><div class="chain">${chain.map((x,i)=>`${i?'<span class="arrow">→</span>':''}<span>${escapeHtml(x[0])}: <b>${fmtMoney(x[1])}</b></span>`).join('')}</div>${p.missingProfit.length?`<div class="muted tiny" style="margin-top:8px">Не хватает: ${escapeHtml(p.missingProfit.join(', '))}</div>`:''}</div><div><h4>Мини-воронка</h4><div class="funnel-mini">${bars.map(([n,v])=>`<div class="fbar"><i style="width:${100*v/max}%"></i><span>${n}: ${fmtNum(v)}</span></div>`).join('')}</div></div><div><h4>Остаток и поставка</h4>${s?`<div class="metric-row"><span>Остаток</span><b>${fmtNum(s.stock)} шт.</b></div><div class="metric-row"><span>Скорость</span><b>${fmtNum(s.velocity,2)} шт./день</b></div><div class="metric-row"><span>Хватит</span><b>${s.daysToZero===Infinity?'нет продаж':fmtNum(s.daysToZero,1)+' дн.'}</b></div><div class="metric-row"><span>Рекомендация</span><b>${escapeHtml(s.recommendation)}</b></div>`:'<div class="empty">Нет отчёта остатков для товара.</div>'}</div></div><div class="card" style="margin-top:12px"><h4>Аудит товарной прибыли</h4><div class="muted tiny" style="margin-bottom:8px">${escapeHtml(qtyAudit)}. Выручка берётся как Σ seller_price из /finance/accrual/by-day без умножения на quantity. Деньги после Ozon по SKU — прямой seller_price минус прямая комиссия, доставка и item_fees из /finance/accrual/by-day. Количество для себестоимости — из слоя реализации.</div><div class="table-wrap"><table class="table" style="min-width:620px"><tbody>${auditRows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num"><b>${v}</b></td></tr>`).join('')}</tbody></table></div></div>`
+  return`<div class="detail-grid"><div><h4>Нитка прибыли</h4><div class="chain">${chain.map((x,i)=>`${i?'<span class="arrow">→</span>':''}<span>${escapeHtml(x[0])}: <b>${fmtMoney(x[1])}</b></span>`).join('')}</div>${p.missingProfit.length?`<div class="muted tiny" style="margin-top:8px">Не хватает: ${escapeHtml(p.missingProfit.join(', '))}</div>`:''}</div><div><h4>Мини-воронка</h4><div class="funnel-mini">${bars.map(([n,v])=>`<div class="fbar"><i style="width:${100*v/max}%"></i><span>${n}: ${fmtNum(v)}</span></div>`).join('')}</div></div><div><h4>Остаток и поставка</h4>${s?`<div class="metric-row"><span>Остаток</span><b>${fmtNum(s.stock)} шт.</b></div><div class="metric-row"><span>Скорость</span><b>${fmtNum(s.velocity,2)} шт./день</b></div><div class="metric-row"><span>Хватит</span><b>${s.daysToZero===Infinity?'нет продаж':fmtNum(s.daysToZero,1)+' дн.'}</b></div><div class="metric-row"><span>Рекомендация</span><b>${escapeHtml(s.recommendation)}</b></div>`:'<div class="empty">Нет отчёта остатков для товара.</div>'}</div></div><div class="card" style="margin-top:12px"><h4>Аудит товарной прибыли</h4><div class="muted tiny" style="margin-bottom:8px">${escapeHtml(qtyAudit)}. Для товарной экономики валовой доход берётся из прямых полей /finance/accrual/by-day: sale_amount + bonus + coinvestment. Это соответствует структуре старого отчёта Ozon: Выручка + Баллы за скидки + Программы партнёров. seller_price показывается только для диагностики и не используется как итоговая выручка. Деньги после Ozon = валовой доход минус прямая комиссия, доставка и item_fees. Количество для себестоимости — из слоя реализации.</div><div class="table-wrap"><table class="table" style="min-width:620px"><tbody>${auditRows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num"><b>${v}</b></td></tr>`).join('')}</tbody></table></div></div>`
 }
 function bindManualCosts(){$$('.manual-cost').forEach(el=>el.addEventListener('change',e=>{const v=num(e.target.value);if(v==null||v<0)delete state.manualCosts[e.target.dataset.key];else state.manualCosts[e.target.dataset.key]={value:v,updatedAt:new Date().toISOString()};persistState();renderAll()}))}
 function focusCost(key){activeTab='unit';$$('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab==='unit'));$$('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-unit'));const p=currentModel.products.find(x=>x.key===key);tableState.unit.search=p?.article||p?.sku||'';tableState.unit.page=1;renderUnit();setTimeout(()=>document.querySelector(`[data-product-key="${CSS.escape(key)}"] .manual-cost`)?.focus(),50)}
@@ -1327,7 +1333,7 @@ function renderSettings(){
     <div class="metric-row"><span>Сверка выручки SKU → business ledger</span><span class="${Math.abs(safe(m.reconciliation?.revenueDiff))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}</span></div>
     <div class="metric-row"><span>Business ledger reconcile delta</span><span class="${Math.abs(safe(q.financeReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.financeReconcileDelta)))}</span></div>
     <div class="metric-row"><span>Количество реализации</span><span>${m.quantityComplete?'<span class="positive">контроль пройден</span>':`<span class="warning">есть несопоставленные операции: ${fmtNum(q.unresolvedSaleOps)}</span>`}</span></div>
-    <div class="metric-row"><span>Источник товарной экономики</span><span>${escapeHtml(q.skuFinanceSource||'finance/accrual/by-day direct SKU')}</span></div>
+    <div class="metric-row"><span>Источник товарной экономики</span><span>${escapeHtml(q.skuFinanceSource||'finance/accrual/by-day · sale_amount+bonus+coinvestment')}</span></div>
     <div class="metric-row"><span>Прямых SKU-строк Finance</span><span>${fmtNum(q.skuFinanceDirectRows??q.skuFinanceRowsPublished??0)}</span></div>
     <div class="metric-row"><span>Дельта выручки SKU → business ledger</span><span class="${Math.abs(safe(q.skuFinanceRevenueDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceRevenueDelta)))}</span></div>
     <div class="metric-row"><span>Дельта direct SKU net</span><span class="${Math.abs(safe(q.skuFinanceReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceReconcileDelta)))}</span></div>
