@@ -145,8 +145,14 @@ function datasetIdentity(d){
   return [d.type,d.sourceName,d.sheetName,d.start||'',d.end||'',d.snapshot||''].join('|');
 }
 
+const defaultHiredLogistics = () => ({
+  '2026-06':{amount:32566,mode:'full',asOf:''},
+  '2026-07':{amount:44133,mode:'full',asOf:''},
+  '2026-08':{amount:38591,mode:'full',asOf:''},
+  '2026-09':{amount:10082,mode:'asof',asOf:'2026-09-08'}
+});
 const defaultState = () => ({
-  version:10,
+  version:11,
   datasets:makeEmbeddedDatasets(),
   disabledEmbedded:[],
   manualCosts:{},
@@ -163,7 +169,7 @@ const defaultState = () => ({
     drrHigh:15,
     repricerMonthly:21280,
     storeBonusMonthly:10000,
-    hiredLogisticsByMonth:{}
+    hiredLogisticsByMonth:defaultHiredLogistics()
   }
 });
 let state = loadState();
@@ -186,9 +192,14 @@ function loadState(){
     if(typeof mergedSettings.adsActive!=='boolean')mergedSettings.adsActive=false;
     mergedSettings.repricerMonthly=Number.isFinite(+mergedSettings.repricerMonthly)?+mergedSettings.repricerMonthly:21280;
     mergedSettings.storeBonusMonthly=Number.isFinite(+mergedSettings.storeBonusMonthly)?+mergedSettings.storeBonusMonthly:10000;
-    mergedSettings.hiredLogisticsByMonth=mergedSettings.hiredLogisticsByMonth||{};
+    const savedHired=mergedSettings.hiredLogisticsByMonth||{};
+    // One-time migration to v11: seed the known hired-logistics facts supplied by the user.
+    // After the state is saved as v11, deleted/edited months are respected and are not re-seeded.
+    mergedSettings.hiredLogisticsByMonth=(Number(parsed.version||0)<11)
+      ? {...defaultHiredLogistics(),...savedHired}
+      : savedHired;
     return {
-      ...base,...parsed,version:10,
+      ...base,...parsed,version:11,
       datasets:[...embedded,...custom],
       settings:mergedSettings
     };
@@ -197,7 +208,7 @@ function loadState(){
 function persistState(){
   try{
     const serializable={
-      ...state,version:10,
+      ...state,version:11,
       datasets:state.datasets.filter(d=>['cost','rrp'].includes(d.type)&&!d.embedded&&!d.apiAuto)
     };
     const json=JSON.stringify(serializable);
@@ -647,6 +658,24 @@ function externalExpensePeriod(selected,financeDs){
   const ends=financeDs.map(d=>d.end).filter(Boolean).sort();
   return starts.length&&ends.length?{start:starts[0],end:ends.at(-1)}:null;
 }
+function normalizeHiredLogisticsEntry(raw,ym){
+  if(raw===''||raw==null)return null;
+  // Backward compatibility: old versions stored a plain monthly number.
+  if(typeof raw==='number'||typeof raw==='string'){
+    const amount=num(raw);return Number.isFinite(amount)?{amount:Math.max(0,amount),mode:'full',asOf:''}:null;
+  }
+  if(typeof raw!=='object')return null;
+  const amount=num(raw.amount);
+  if(!Number.isFinite(amount))return null;
+  const mode=raw.mode==='asof'?'asof':'full';
+  let asOf=String(raw.asOf||'').slice(0,10);
+  if(mode==='asof'&&!/^\d{4}-\d{2}-\d{2}$/.test(asOf))asOf='';
+  return {amount:Math.max(0,amount),mode,asOf};
+}
+function overlapDays(aStart,aEnd,bStart,bEnd){
+  const start=aStart>bStart?aStart:bStart,end=aEnd<bEnd?aEnd:bEnd;
+  return start<=end?daysInclusive(start,end):0;
+}
 function calculateExternalExpenses(period){
   const repricerMonthly=Number.isFinite(+state.settings.repricerMonthly)?+state.settings.repricerMonthly:21280;
   const storeBonusMonthly=Number.isFinite(+state.settings.storeBonusMonthly)?+state.settings.storeBonusMonthly:10000;
@@ -656,12 +685,27 @@ function calculateExternalExpenses(period){
   const missingHired=[];
   const details=months.map(m=>{
     const rep=repricerMonthly*m.share, bonus=storeBonusMonthly*m.share;
-    const raw=hiredMap[m.ym];
-    const full=raw===''||raw==null?null:num(raw);
-    const hired=Number.isFinite(full)?full*m.share:null;
+    const entry=normalizeHiredLogisticsEntry(hiredMap[m.ym],m.ym);
+    let hired=null,issue='',application='';
+    if(entry?.mode==='full'){
+      hired=entry.amount*m.share;
+      application=m.share<.999?`из полного факта месяца применено ${fmtPct(m.share*100)}`:'факт за полный месяц';
+    }else if(entry?.mode==='asof'&&entry.asOf){
+      const b=monthBounds(m.ym),validAsOf=entry.asOf<b.start?b.start:(entry.asOf>b.end?b.end:entry.asOf);
+      const accruedDays=daysInclusive(b.start,validAsOf);
+      const knownOverlap=overlapDays(m.start,m.end,b.start,validAsOf);
+      hired=accruedDays>0?entry.amount*(knownOverlap/accruedDays):0;
+      application=`факт ${fmtMoney(entry.amount)} по ${dateLabel(validAsOf)}; в выбранный период учтено ${fmtMoney(hired)}`;
+      if(m.end>validAsOf){
+        issue=`${m.ym} (наёмная логистика актуальна только по ${dateLabel(validAsOf)})`;
+      }
+    }else{
+      issue=m.ym;
+    }
     repricer+=rep;storeBonus+=bonus;
-    if(hired==null)missingHired.push(m.ym); else hiredKnown+=hired;
-    return {...m,repricer:rep,storeBonus:bonus,hiredFull:full,hired};
+    if(hired!=null)hiredKnown+=hired;
+    if(issue)missingHired.push(issue);
+    return {...m,repricer:rep,storeBonus:bonus,hiredEntry:entry,hiredFull:entry?.amount??null,hired,application,issue};
   });
   return {
     period,months:details,repricerMonthly,storeBonusMonthly,
@@ -978,7 +1022,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v4.7</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v4.9</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -995,7 +1039,7 @@ function renderQuality(){
   if(!m.stockDs)issues.push('нет актуальных остатков');
   if(q.unresolvedSaleOps>0)issues.push(`не сопоставлено отправлений реализации: ${fmtNum(q.unresolvedSaleOps)}`);
   if(q.returnsComplete===false)issues.push('возвраты загружены не полностью');
-  if(m.externalExpenses?.missingHired?.length)issues.push(`не указана наёмная логистика: ${m.externalExpenses.missingHired.join(', ')}`);
+  if(m.externalExpenses?.missingHired?.length)issues.push(`наёмная логистика неполная: ${m.externalExpenses.missingHired.join(', ')}`);
   if(!m.rrpComplete)issues.push(`норматив РРЦ−10% предварительный: покрытие РРЦ по движениям ${fmtPct(m.rrpCoverageUnits)}`);
   const reconcileOk=Math.abs(safe(m.reconciliation?.revenueDiff))<1&&Math.abs(safe(m.reconciliation?.netDiff))<1;
   if(!reconcileOk)issues.push(`сверка SKU→ledger: выручка ${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}, net ${fmtMoney(Math.abs(safe(m.reconciliation?.netDiff)))}`);
@@ -1013,7 +1057,7 @@ function renderKpis(){
   const losses=m.operatingComplete.filter(x=>x.operatingProfit<0).length;
   const attention=m.stockStats.critical+losses;
   const ext=m.externalExpenses;
-  const extSub=ext?.period?`репрайсер ${fmtMoney(ext.repricer)} · премии ${fmtMoney(ext.storeBonus)} · наёмная логистика ${ext.missingHired.length?'не указана: '+ext.missingHired.join(', '):fmtMoney(ext.hiredKnown)}`:'нет финансового периода';
+  const extSub=ext?.period?`репрайсер ${fmtMoney(ext.repricer)} · премии ${fmtMoney(ext.storeBonus)} · наёмная логистика ${ext.missingHired.length?fmtMoney(ext.hiredKnown)+' · неполная: '+ext.missingHired.join(', '):fmtMoney(ext.hiredKnown)}`:'нет финансового периода';
   const normStatus=m.rrpDelta==null?'предварительно':m.rrpDelta>=0?'норматив выполнен':'норматив не выполнен';
   const normClass=m.rrpDelta==null?'warning':m.rrpDelta>=0?'positive':'negative';
   const cards=[
@@ -1024,7 +1068,7 @@ function renderKpis(){
     ['Норматив РРЦ −10%',m.rrpTarget!=null?fmtMoney(m.rrpTarget):fmtMoney(m.rrpTargetKnown),`Σ(РРЦ × реализованное количество) × 90% · покрытие ${fmtPct(m.rrpCoverageUnits)}`,m.rrpComplete?'':'warning'],
     ['Отклонение от норматива',m.rrpDelta!=null?fmtMoney(m.rrpDelta):'нет итоговой оценки',`${normStatus}${m.rrpAttainment!=null?' · выполнение '+fmtPct(m.rrpAttainment):''}`,normClass],
     ['Себестоимость',fmtMoney(m.totalCogs),`покрытие P&L по выручке ${fmtPct(m.cogsCoverage)} · каталог с закупкой ${fmtNum(q.ozonCostKnown)}/${fmtNum(q.currentOzonArticles)}`,''],
-    ['Прибыль до УСН',m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'нет итоговой оценки',ext?.missingHired.length?'нужно заполнить наёмную логистику':'после Ozon, внешних расходов и закупки',m.profitBeforeTax!=null?(m.profitBeforeTax>=0?'positive':'negative'):'warning'],
+    ['Прибыль до УСН',m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'нет итоговой оценки',ext?.missingHired.length?'наёмная логистика не покрывает весь период':'после Ozon, внешних расходов и закупки',m.profitBeforeTax!=null?(m.profitBeforeTax>=0?'positive':'negative'):'warning'],
     [`Оценка УСН ${fmtPct(m.taxRate)}`,m.estimatedTax!=null?fmtMoney(m.estimatedTax):'нет данных','управленческая оценка по положительной базе','warning'],
     ['Результат после УСН',m.businessNetProfit!=null?fmtMoney(m.businessNetProfit):'нет итоговой оценки',`маржа ${fmtPct(m.businessMargin)} · ROI ${fmtPct(m.businessRoi)}`,m.businessNetProfit!=null?(m.businessNetProfit>=0?'positive':'negative'):'warning'],
     ['Реклама',m.adsSpend!=null?fmtMoney(m.adsSpend):'нет данных',state.settings.adsActive?'реклама включена':'реклама сейчас отключена; исторические списания входят в Finance API',''],
@@ -1045,7 +1089,7 @@ function insightCards(m){
     ['Товарная экономика',m.operatingComplete.length?`${losses.length} SKU убыточны после услуг Ozon и закупочной стоимости; суммарный убыток ${fmtMoney(lossSum)}. Покрытие P&L ${fmtPct(m.cogsCoverage)} выручки.`:'Недостаточно данных для товарной экономики.'],
     ['Категории',best&&worst?`Лучшая маржа вклада у «${best.category}» — ${fmtPct(best.margin)}; худшая у «${worst.category}» — ${fmtPct(worst.margin)}.`:'Категории или товарная прибыль пока неполны.'],
     ['Остатки',m.stockDs?`${m.stockStats.critical} продающихся SKU закончатся менее чем через ${state.settings.criticalDays} дней; ещё ${m.stockStats.attention} — раньше ${state.settings.attentionDays} дней.`:'Нет актуальных остатков.'],
-    ['Внешние расходы',ext?.period?(ext.missingHired.length?`Репрайсер и премия учтены. Наёмная логистика не заполнена за ${ext.missingHired.join(', ')}.`:`Внешние расходы заполнены: ${fmtMoney(ext.total)}.`):'Нет периода для внешних расходов.'],
+    ['Внешние расходы',ext?.period?(ext.missingHired.length?`Репрайсер и премия учтены. Наёмная логистика неполная: ${ext.missingHired.join(', ')}.`:`Внешние расходы заполнены: ${fmtMoney(ext.total)}.`):'Нет периода для внешних расходов.'],
     ['Реклама',state.settings.adsActive?'Реклама отмечена как включённая.':'Реклама сейчас отключена; исторические расходы на продвижение остаются частью финансового ledger Ozon.'],
     ['Точки роста',m.signals.length?`Найдено ${m.signals.length} сигналов по доступной воронке. Ориентир потенциальной товарной прибыли ${fmtMoney(pot)}; это приоритизация, не гарантия.`:'Нет сигналов или недостаточно данных top-SKU воронки.'],
     ['Кандидаты на вывод',`${cLoss} SKU одновременно в группе C по выручке и убыточны.`]
@@ -1127,9 +1171,18 @@ function renderStockTable(){const st=tableState.stock;let rows=currentModel.stoc
 function renderSettings(){
   const s=state.settings,m=currentModel,q=m.quality||{},months=m.businessPeriod?monthsInRange(m.businessPeriod.start,m.businessPeriod.end):[];
   const hiredRows=months.length?months.map(x=>{
-    const v=(s.hiredLogisticsByMonth||{})[x.ym];
-    return `<tr><td>${new Date(x.ym+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'long',year:'numeric'})}</td><td><input class="cost-input hired-logistics" data-month="${x.ym}" type="number" min="0" step="1" placeholder="не указано" value="${v??''}"></td><td class="muted">${x.share<.999?'в период попадает '+fmtPct(x.share*100)+' месячного расхода':'полный месяц'}</td></tr>`;
-  }).join(''):'<tr><td colspan="3" class="muted">После загрузки Finance API здесь появятся месяцы выбранного периода.</td></tr>';
+    const e=normalizeHiredLogisticsEntry((s.hiredLogisticsByMonth||{})[x.ym],x.ym);
+    const mode=e?.mode||'full',amount=e?.amount??'',asOf=e?.asOf||'';
+    const effective=calculateExternalExpenses({start:x.start,end:x.end}).months[0];
+    const app=effective?.issue?`<span class="warning">${escapeHtml(effective.issue)}</span>`:(effective?.application||'не указано');
+    return `<tr>
+      <td>${new Date(x.ym+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'long',year:'numeric'})}</td>
+      <td><input class="cost-input hired-logistics-amount" data-month="${x.ym}" type="number" min="0" step="1" placeholder="не указано" value="${amount}"></td>
+      <td><select class="select hired-logistics-mode" data-month="${x.ym}"><option value="full" ${mode==='full'?'selected':''}>факт за месяц</option><option value="asof" ${mode==='asof'?'selected':''}>факт по дату</option></select></td>
+      <td><input class="input hired-logistics-date" data-month="${x.ym}" type="date" value="${asOf}" ${mode==='asof'?'':'disabled'}></td>
+      <td class="muted tiny">${app}</td>
+    </tr>`;
+  }).join(''):'<tr><td colspan="5" class="muted">После загрузки Finance API здесь появятся месяцы выбранного периода.</td></tr>';
   const missCost=(q.missingCostArticles||[]).slice(0,20),missRrp=(q.missingRrpCatalog||[]).slice(0,20);
   $('#tab-settings').innerHTML=`
   <div class="grid g2">
@@ -1146,8 +1199,8 @@ function renderSettings(){
   </div>
 
   <div class="card" style="margin-top:12px"><h3>Наёмная логистика — фактический расход по месяцам</h3>
-    <div class="muted tiny" style="margin-bottom:8px">Введите полный фактический расход месяца. Для неполного выбранного периода дашборд показывает пропорциональную управленческую оценку. Пустое поле означает «неизвестно», а не 0 ₽.</div>
-    <div class="table-wrap" style="max-height:360px"><table class="table" style="min-width:680px"><thead><tr><th>Месяц</th><th>Наёмная логистика, ₽</th><th>Применение</th></tr></thead><tbody>${hiredRows}</tbody></table></div>
+    <div class="muted tiny" style="margin-bottom:8px">Для закрытого месяца используйте «факт за месяц». Для текущего месяца — «факт по дату»: сумма учитывается целиком до указанной даты и не уменьшается повторно пропорционально календарю. Если API-период уйдёт дальше даты факта, итоговый P&L будет помечен как неполный.</div>
+    <div class="table-wrap" style="max-height:360px"><table class="table" style="min-width:980px"><thead><tr><th>Месяц</th><th>Сумма, ₽</th><th>Тип факта</th><th>Факт по дату</th><th>Как применено</th></tr></thead><tbody>${hiredRows}</tbody></table></div>
   </div>
 
   <div class="card" style="margin-top:12px"><h3>Контроль источников</h3>
@@ -1181,13 +1234,18 @@ function renderSettings(){
     persistState();renderAll();
   };
   ['criticalDays','attentionDays','taxRate','repricerMonthly','storeBonusMonthly','adsActive'].forEach(id=>$(`#${id}`)?.addEventListener('change',save));
-  $$('.hired-logistics').forEach(el=>el.addEventListener('change',e=>{
+  const saveHiredMonth=(ym)=>{
     state.settings.hiredLogisticsByMonth=state.settings.hiredLogisticsByMonth||{};
-    const raw=e.target.value.trim();
-    if(raw==='')delete state.settings.hiredLogisticsByMonth[e.target.dataset.month];
-    else state.settings.hiredLogisticsByMonth[e.target.dataset.month]=Math.max(0,num(raw)??0);
+    const amountEl=$(`.hired-logistics-amount[data-month="${ym}"]`),modeEl=$(`.hired-logistics-mode[data-month="${ym}"]`),dateEl=$(`.hired-logistics-date[data-month="${ym}"]`);
+    const raw=(amountEl?.value||'').trim();
+    if(raw==='')delete state.settings.hiredLogisticsByMonth[ym];
+    else{
+      const mode=modeEl?.value==='asof'?'asof':'full';
+      state.settings.hiredLogisticsByMonth[ym]={amount:Math.max(0,num(raw)??0),mode,asOf:mode==='asof'?(dateEl?.value||''):''};
+    }
     persistState();renderAll();
-  }));
+  };
+  $$('.hired-logistics-amount,.hired-logistics-mode,.hired-logistics-date').forEach(el=>el.addEventListener('change',e=>saveHiredMonth(e.target.dataset.month)));
   $('#clearAll')?.addEventListener('click',()=>{if(confirm('Сбросить локальные справочники, внешние расходы, планы и настройки? API-ключ GitHub не затрагивается.')){state=defaultState();persistState();rebuildPeriodSelect();renderAll()}});
 }
 
@@ -1198,7 +1256,7 @@ const chartDefaults={responsive:true,maintainAspectRatio:false,plugins:{legend:{
 function renderChartsForTab(tab){requestAnimationFrame(()=>{if(tab==='overview')renderOverviewCharts();if(tab==='ads')renderFunnelChart();if(tab==='stock')renderStockChart()})}
 function renderOverviewCharts(){
   const m=currentModel,ext=m.externalExpenses,note=$('#waterfallNote');
-  if(note)note.textContent=`Источник Ozon — Finance API. Нитка: выручка → услуги Ozon → внешние расходы → управленческий остаток → закупка → УСН. Норматив РРЦ−10% показан отдельным KPI и не вычитается из прибыли.${ext?.missingHired.length?' Наёмная логистика не заполнена: '+ext.missingHired.join(', ')+'.':''}`;
+  if(note)note.textContent=`Источник Ozon — Finance API. Нитка: выручка → услуги Ozon → внешние расходы → управленческий остаток → закупка → УСН. Норматив РРЦ−10% показан отдельным KPI и не вычитается из прибыли.${ext?.missingHired.length?' Наёмная логистика неполная: '+ext.missingHired.join(', ')+'.':''}`;
   if(!m.financeDs.length){
     $('#waterfallEmpty')?.classList.remove('hidden');if($('#waterfallEmpty'))$('#waterfallEmpty').textContent='Нет финансового ledger Ozon API.';destroyChart('waterfallChart');
   }else{
