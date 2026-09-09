@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (schema v4)
+  Ozon Seller Analytics — API-only sync (schema v4.6)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -47,6 +47,13 @@ const maxDateStr = (...x) => x.filter(Boolean).sort().at(-1) || null;
 const TODAY = isoDate(new Date());
 const YESTERDAY = addDays(TODAY,-1);
 const HISTORY_START = addDays(TODAY,-(HISTORY_DAYS-1));
+const ymd = s => { const [y,m,d]=String(s).slice(0,10).split('-').map(Number); return {y,m,d}; };
+const monthStart = s => `${String(s).slice(0,7)}-01`;
+const monthEnd = s => { const {y,m}=ymd(s); return isoDate(new Date(Date.UTC(y,m,0))); };
+const nextMonthStart = s => { const {y,m}=ymd(s); return isoDate(new Date(Date.UTC(y,m,1))); };
+const firstFullMonthStart = s => String(s).slice(8,10)==='01' ? s : nextMonthStart(s);
+const monthKey = s => String(s).slice(0,7);
+const dateRange = (fromDate,toDate) => { const out=[]; for(let d=fromDate; d<=toDate; d=addDays(d,1)) out.push(d); return out; };
 
 async function post(endpoint, body, {allowError=false,retries=3,analytics=false}={}) {
   for (let attempt=0; attempt<=retries; attempt++) {
@@ -271,49 +278,139 @@ function normalizeStock(stockRaw,maps,priceByArticle){
 }
 
 /* ------------------------------- finance ------------------------------ */
-async function fetchFinance(fromDate,toDate){
+/*
+  Ozon is migrating finance reads from /v3/finance/transaction/list to
+  /v1/finance/accrual/by-day.  The sync uses the new daily accrual ledger first
+  and keeps the old endpoint only as a temporary fallback.  A refresh window is
+  REPLACED by date, not merged by operation id, so migration between endpoint
+  formats cannot duplicate the same days.
+*/
+function money(v){
+  if(v&&typeof v==='object'&&'amount' in v)return asNum(v.amount,0);
+  return asNum(v,0);
+}
+let accrualTypeNamesCache=null;
+async function fetchAccrualTypeNames(){
+  if(accrualTypeNamesCache)return accrualTypeNamesCache;
+  const r=await post('/v1/finance/accrual/types',{}, {allowError:true,retries:2});
+  if(r.__error){accrualTypeNamesCache=new Map();return accrualTypeNamesCache}
+  const rows=r.accrual_types||r.types||r.result?.accrual_types||[];
+  accrualTypeNamesCache=new Map(rows.map(x=>[asNum(first(x.id,x.type_id),NaN),asStr(first(x.description,x.name))]).filter(x=>Number.isFinite(x[0])));
+  return accrualTypeNamesCache;
+}
+function classifyService(name){
+  const s=asStr(name).toLowerCase();
+  if(s.includes('эквайр')||s.includes('acquir'))return'acquiring';
+  if(s.includes('хранен')||s.includes('storage')||s.includes('placement'))return'storage';
+  if(s.includes('реклам')||s.includes('продвиж')||s.includes('advert')||s.includes('promotion')||s.includes('review'))return'ads';
+  if(s.includes('штраф')||s.includes('penalt'))return'fines';
+  if(s.includes('возврат')||s.includes('return')||s.includes('cancel'))return'returns';
+  if(s.includes('логист')||s.includes('достав')||s.includes('обработ')||s.includes('fulfillment')||s.includes('delivery')||s.includes('packing')||s.includes('crossdock'))return'logistics';
+  return'other';
+}
+async function fetchAccrualsDay(date){
+  const out=[];let lastId='';
+  for(let guard=0;guard<500;guard++){
+    const r=await post('/v1/finance/accrual/by-day',{date,last_id:lastId},{allowError:true,retries:3});
+    if(r.__error)throw new Error(r.__error);
+    const batch=Array.isArray(r.accruals)?r.accruals:[];out.push(...batch);
+    const next=asStr(r.last_id);
+    if(!batch.length||!next||next===lastId)break;
+    lastId=next;
+  }
+  return out;
+}
+function normalizeAccrualFinance(accruals,maps,typeNames){
+  const rows=[];
+  for(const acc of accruals||[]){
+    const products=acc?.posting?.products||[];
+    const feeGroups=acc?.item_fees?.fees||[];
+    const skus=[...new Set([...products.map(p=>asStr(p.sku)),...feeGroups.map(g=>asStr(g.sku))].filter(Boolean))];
+    const singleSku=skus.length===1?skus[0]:'';
+    const article=singleSku?asStr(maps.articleBySku.get(singleSku)):'';
+    let gross=0;
+    const comp={commission:0,acquiring:0,logistics:0,storage:0,ads:0,fines:0,returns:0,other:0};
+    for(const prod of products){
+      const comm=prod.commission||{};
+      gross+=money(comm.seller_price);
+      comp.commission+=-money(comm.sale_commission);
+      const delivery=prod.delivery||{};
+      let serviceSum=0,serviceCount=0;
+      for(const srv of delivery.services||[]){
+        if(srv?.accrued==null)continue;
+        const a=money(srv.accrued);serviceSum+=a;serviceCount++;
+        const name=typeNames.get(asNum(srv.type_id,NaN))||`type ${srv.type_id}`;
+        comp[classifyService(name)]+=-a;
+      }
+      if(!serviceCount){const a=money(delivery.total_accrued);if(a)comp.logistics+=-a}
+    }
+    for(const grp of feeGroups)for(const fee of grp.fees||[]){
+      const a=money(fee.accrued),name=typeNames.get(asNum(fee.type_id,NaN))||`type ${fee.type_id}`;
+      comp[classifyService(name)]+=-a;
+    }
+    const nif=acc.non_item_fee;
+    if(nif){const a=money(nif.accrued),name=typeNames.get(asNum(nif.type_id,NaN))||`type ${nif.type_id}`;comp[classifyService(name)]+=-a}
+    const amount=money(acc.total_amount);
+    const known=Object.values(comp).reduce((a,b)=>a+b,0);
+    comp.other+=gross-known-amount;
+    const date=asStr(acc.date).slice(0,10);
+    const stable=crypto.createHash('sha1').update(JSON.stringify(acc)).digest('hex').slice(0,16);
+    rows.push({
+      date,article,sku:singleSku,postingNumber:asStr(first(acc?.posting?.posting_number,acc.unit_number)),itemSkus:skus,
+      group:asStr(acc.accrued_category),operation:asStr(typeNames.get(asNum(acc.type_id,NaN))||`Accrual ${acc.type_id}`),
+      transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(acc.type_id)}:${stable}`,grossRevenue:gross||null,
+      soldQty:0,returnedQty:0,commission:comp.commission,acquiring:comp.acquiring,logistics:comp.logistics,storage:comp.storage,
+      ads:comp.ads,fines:comp.fines,returns:comp.returns,other:comp.other,rawAmount:amount,financeSource:'accrual/by-day'
+    });
+  }
+  return rows;
+}
+async function fetchFinanceAccrual(fromDate,toDate,maps){
+  const typeNames=await fetchAccrualTypeNames(),rows=[];
+  for(const d of dateRange(fromDate,toDate)){
+    const acc=await fetchAccrualsDay(d);rows.push(...normalizeAccrualFinance(acc,maps,typeNames));
+  }
+  return rows;
+}
+async function fetchFinanceLegacy(fromDate,toDate){
   const operations=[];
   for(const [from,to] of monthChunks(fromDate,toDate)){
     for(let page=1;page<1000;page++){
-      const r=await post('/v3/finance/transaction/list',{filter:{date:{from,to},operation_type:[],posting_number:'',transaction_type:'ALL'},page,page_size:1000});
+      const r=await post('/v3/finance/transaction/list',{filter:{date:{from,to},operation_type:[],posting_number:'',transaction_type:'ALL'},page,page_size:1000},{allowError:true,retries:2});
+      if(r.__error)throw new Error(r.__error);
       const result=r.result||{},batch=result.operations||[];operations.push(...batch);
       if(!batch.length||page>=asNum(result.page_count,page))break;
     }
   } return operations;
 }
-function classifyService(name){
-  const s=asStr(name).toLowerCase();
-  if(s.includes('эквайр')||s.includes('acquir'))return'acquiring';
-  if(s.includes('хранен')||s.includes('storage'))return'storage';
-  if(s.includes('реклам')||s.includes('продвиж')||s.includes('advert'))return'ads';
-  if(s.includes('штраф')||s.includes('penalt'))return'fines';
-  if(s.includes('возврат')||s.includes('return'))return'returns';
-  if(s.includes('логист')||s.includes('достав')||s.includes('обработ')||s.includes('fulfillment')||s.includes('delivery'))return'logistics';
-  return'other';
-}
-function normalizeFinance(ops,maps){
+function normalizeLegacyFinance(ops,maps){
   const rows=[];
   for(const op of ops){
     const items=Array.isArray(op.items)?op.items:[],single=items.length===1?items[0]:null,sku=asStr(single?.sku),article=asStr(maps.articleBySku.get(sku));
     const gross=asNum(op.accruals_for_sale,0),amount=asNum(op.amount,0);
     const comp={commission:Math.abs(asNum(op.sale_commission,0)),acquiring:0,logistics:Math.abs(asNum(op.delivery_charge,0)),storage:0,ads:0,fines:0,returns:Math.abs(asNum(op.return_delivery_charge,0)),other:0};
-    for(const s of op.services||[])comp[classifyService(s.name)]+=-asNum(s.price,0);
+    for(const srv of op.services||[])comp[classifyService(srv.name)]+=-asNum(srv.price,0);
     const known=Object.values(comp).reduce((a,b)=>a+b,0);comp.other+=gross-known-amount;
-    rows.push({
-      date:asStr(op.operation_date).slice(0,10),article,sku,postingNumber:asStr(op?.posting?.posting_number),itemSkus:items.map(it=>asStr(it?.sku)).filter(Boolean),
+    rows.push({date:asStr(op.operation_date).slice(0,10),article,sku,postingNumber:asStr(op?.posting?.posting_number),itemSkus:items.map(it=>asStr(it?.sku)).filter(Boolean),
       group:asStr(op.type),operation:asStr(first(op.operation_type_name,op.operation_type)),transactionId:asStr(op.operation_id),grossRevenue:gross||null,
-      soldQty:0,returnedQty:0,commission:comp.commission,acquiring:comp.acquiring,logistics:comp.logistics,storage:comp.storage,ads:comp.ads,fines:comp.fines,returns:comp.returns,other:comp.other,rawAmount:amount
-    });
+      soldQty:0,returnedQty:0,commission:comp.commission,acquiring:comp.acquiring,logistics:comp.logistics,storage:comp.storage,ads:comp.ads,fines:comp.fines,returns:comp.returns,other:comp.other,rawAmount:amount,financeSource:'transaction/list'});
   } return rows;
 }
-function mergeFinanceRows(previousRows,freshRows){
-  const freshIds=new Set(freshRows.map(r=>asStr(r.transactionId)).filter(Boolean)),kept=previousRows.filter(r=>!freshIds.has(asStr(r.transactionId)));
-  const seen=new Set(),out=[];
-  for(const r of [...kept,...freshRows]){
-    if(r.transactionId){out.push(r);continue}
-    const k=[r.date,r.postingNumber,r.article,r.sku,r.operation,r.rawAmount].join('|');if(!seen.has(k)){seen.add(k);out.push(r)}
+async function fetchFinanceNormalized(fromDate,toDate,maps){
+  try{
+    const rows=await fetchFinanceAccrual(fromDate,toDate,maps);
+    return {rows,source:'finance/accrual/by-day'};
+  }catch(e){
+    console.warn(`New finance/accrual API failed, trying legacy transaction/list: ${e}`);
+    const ops=await fetchFinanceLegacy(fromDate,toDate);
+    return {rows:normalizeLegacyFinance(ops,maps),source:'finance/transaction/list (legacy fallback)'};
   }
-  out.sort((a,b)=>asStr(a.date).localeCompare(asStr(b.date))||asStr(a.transactionId).localeCompare(asStr(b.transactionId)));return out;
+}
+function replaceFinanceWindow(previousRows,freshRows,fromDate,toDate){
+  const kept=(previousRows||[]).filter(r=>!r.date||r.date<fromDate||r.date>toDate);
+  const out=[...kept,...freshRows];
+  out.sort((a,b)=>asStr(a.date).localeCompare(asStr(b.date))||asStr(a.transactionId).localeCompare(asStr(b.transactionId)));
+  return out;
 }
 function financeTotals(rows){
   const components={commission:0,acquiring:0,logistics:0,storage:0,ads:0,fines:0,returns:0,other:0};let grossRevenue=0,netAfterOzon=0;
@@ -437,7 +534,7 @@ function mergeReturnRows(previousRows,freshRows){
   }
   return [...map.values()].sort((a,b)=>asStr(a.date).localeCompare(asStr(b.date))||asStr(a.returnId).localeCompare(asStr(b.returnId)));
 }
-function buildRealizedRows(financeRows,postingMap,returnRows,maps){
+function buildPostingFallbackRealizedRows(financeRows,postingMap,returnRows,maps){
   /*
     Realized quantity is anchored to Ozon API events:
       + positive sale accrual: exact product quantities from the matching FBO/FBS posting;
@@ -464,6 +561,101 @@ function buildRealizedRows(financeRows,postingMap,returnRows,maps){
     rows.push({date:r.date,article:r.article,sku:r.sku,name:r.name||'',soldQty:0,returnedQty:r.quantity,netQty:-r.quantity,postingNumber:r.postingNumber,source:`returns-${String(r.schema||'').toLowerCase()}`});
   }
   return {rows,diagnostics:{unresolvedSaleOps,returnRows:(returnRows||[]).length,returnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)}};
+}
+
+
+/* -------------------------- official realization ---------------------- */
+function realizationMonthBounds(ym){
+  const start=`${ym}-01`,end=monthEnd(start);return {start,end};
+}
+function closedMonthKeys(fromDate,toDate){
+  const out=[];let cur=firstFullMonthStart(fromDate),stop=monthStart(toDate);
+  while(cur<stop){out.push(monthKey(cur));cur=nextMonthStart(cur)}
+  return out;
+}
+function normalizeRealizationRows(rawRows,start,end,source,granularity){
+  const by=new Map();
+  for(const r of rawRows||[]){
+    const item=r.item||{},article=asStr(item.offer_id),sku=asStr(item.sku),name=asStr(item.name);
+    const sold=Math.max(0,asNum(r?.delivery_commission?.quantity,0));
+    const returned=Math.max(0,asNum(r?.return_commission?.quantity,0));
+    if(!article&&!sku)continue;
+    const key=[article,sku].join('|'),o=by.get(key)||{date:end,periodStart:start,periodEnd:end,article,sku,name,soldQty:0,returnedQty:0,netQty:0,source,granularity,official:true};
+    o.soldQty+=sold;o.returnedQty+=returned;o.netQty+=sold-returned;by.set(key,o);
+  }
+  return [...by.values()].filter(r=>r.soldQty||r.returnedQty);
+}
+async function fetchMonthlyRealization(ym){
+  const {y,m}=ymd(`${ym}-01`);
+  const r=await post('/v2/finance/realization',{month:m,year:y},{allowError:true,retries:2});
+  if(r.__error)throw new Error(r.__error);
+  const result=r.result||r,header=result.header||{},b=realizationMonthBounds(ym);
+  const start=asStr(header.start_date).slice(0,10)||b.start,end=asStr(header.stop_date).slice(0,10)||b.end;
+  return {key:`M:${ym}`,kind:'monthly',start,end,complete:true,official:true,source:'finance/realization',rows:normalizeRealizationRows(result.rows||[],start,end,'finance-realization-monthly','month')};
+}
+async function fetchDailyRealization(date){
+  const {y,m,d}=ymd(date);
+  const r=await post('/v1/finance/realization/by-day',{day:d,month:m,year:y},{allowError:true,retries:1});
+  if(r.__error){const e=new Error(r.__error);e.status=r.__status;throw e}
+  const rows=r.rows||r.result?.rows||[];
+  return {key:`D:${date}`,kind:'daily',start:date,end:date,complete:true,official:true,source:'finance/realization/by-day',rows:normalizeRealizationRows(rows,date,date,'finance-realization-by-day','day')};
+}
+function segmentMap(segments){return new Map((segments||[]).map(s=>[s.key,s]))}
+function stripMonthSegments(map,ym){
+  for(const [k,s] of [...map])if(monthKey(s.start)===ym&&monthKey(s.end)===ym)map.delete(k);
+}
+function realizationCoverage(segments){
+  const ss=[...(segments||[])].filter(s=>s.start&&s.end).sort((a,b)=>a.start.localeCompare(b.start)||a.end.localeCompare(b.end));
+  if(!ss.length)return {start:null,end:null,complete:false,gaps:[]};
+  let start=ss[0].start,end=ss[0].end,complete=ss[0].complete!==false;const gaps=[];
+  for(let i=1;i<ss.length;i++){
+    const s=ss[i],expected=addDays(end,1);
+    if(s.start>expected){gaps.push(`${expected}..${addDays(s.start,-1)}`);break}
+    if(s.end>end)end=s.end;complete=complete&&s.complete!==false;
+  }
+  return {start,end,complete:complete&&gaps.length===0,gaps};
+}
+async function updateRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings){
+  const map=segmentMap(previous?.history?.realizationSegments||[]);
+  const closed=closedMonthKeys(HISTORY_START,TODAY);
+  let monthlyLoaded=0,dailyLoaded=0,dailyPremiumAvailable=true,fallbackDiag={unresolvedSaleOps:0};
+  // Closed months: official monthly report is authoritative and replaces any provisional rows.
+  for(const ym of closed){
+    const key=`M:${ym}`,existing=map.get(key);
+    if(existing?.official)continue;
+    try{const seg=await fetchMonthlyRealization(ym);stripMonthSegments(map,ym);map.set(seg.key,seg);monthlyLoaded++}
+    catch(e){warnings.push(`Realization ${ym}: ${e}`)}
+  }
+  const currentStart=maxDateStr(monthStart(TODAY),HISTORY_START),currentEnd=YESTERDAY;
+  if(currentStart<=currentEnd){
+    const currentYm=monthKey(currentStart),needRefresh=SYNC_MODE==='daily'||![...map.values()].some(s=>s.start>=currentStart&&s.end<=currentEnd);
+    if(needRefresh){
+      // Premium daily realization: first choice for the open month. Refresh missing dates and last 3 days for corrections.
+      const dates=dateRange(currentStart,currentEnd),refreshCut=addDays(currentEnd,-2);
+      for(const date of dates){
+        const key=`D:${date}`;if(map.has(key)&&date<refreshCut)continue;
+        try{const seg=await fetchDailyRealization(date);map.set(key,seg);dailyLoaded++}
+        catch(e){
+          if(e.status===403){dailyPremiumAvailable=false;break}
+          warnings.push(`Realization by day ${date}: ${e}`);dailyPremiumAvailable=false;break;
+        }
+      }
+      if(!dailyPremiumAvailable){
+        // Fallback only for the currently open month. Closed months remain official monthly reports.
+        for(const [k,s] of [...map])if(s.kind==='daily'&&monthKey(s.start)===currentYm)map.delete(k);
+        const fRows=(financeRows||[]).filter(r=>r.date>=currentStart&&r.date<=currentEnd);
+        const fReturns=(returnRows||[]).filter(r=>r.date>=currentStart&&r.date<=currentEnd);
+        const fb=buildPostingFallbackRealizedRows(fRows,postingMap,fReturns,maps);fallbackDiag=fb.diagnostics;
+        map.set(`F:${currentYm}`,{key:`F:${currentYm}`,kind:'fallback',start:currentStart,end:currentEnd,complete:returnsComplete&&fb.diagnostics.unresolvedSaleOps===0,official:false,source:'posting+finance fallback',rows:fb.rows.filter(r=>r.date>=currentStart&&r.date<=currentEnd)});
+      }
+    }
+  }
+  // If an official monthly report exists, never keep daily/fallback rows for the same closed month.
+  for(const ym of closed)if(map.has(`M:${ym}`))for(const [k,s] of [...map])if(k!==`M:${ym}`&&monthKey(s.start)===ym&&monthKey(s.end)===ym)map.delete(k);
+  const segments=[...map.values()].filter(s=>s.end>=firstFullMonthStart(HISTORY_START)&&s.start<=YESTERDAY).sort((a,b)=>a.start.localeCompare(b.start)||a.key.localeCompare(b.key));
+  const coverage=realizationCoverage(segments);
+  const rows=segments.flatMap(s=>(s.rows||[]).map(r=>({...r,segmentKey:s.key,segmentSource:s.source,segmentOfficial:s.official!==false})));
+  return {segments,rows,coverage,diagnostics:{monthlyLoaded,dailyLoaded,dailyPremiumAvailable,fallbackUnresolvedSaleOps:fallbackDiag.unresolvedSaleOps||0}};
 }
 
 /* ------------------------------- analytics ---------------------------- */
@@ -527,15 +719,15 @@ if(!stockComplete)warnings.push(`Stock refresh incomplete ${freshStock.length}/$
 if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kept.');
 
 /* Finance API-only history */
-const prevFinanceRows=previousFinance?.rows||[];
+const prevFinanceRows=previous?.history?.financeRowsAll||previousFinance?.rows||[];
 const prevFinEnd=prevFinanceRows.map(r=>r.date).filter(Boolean).sort().at(-1)||null;
 const financeFrom=previous?maxDateStr(HISTORY_START,addDays(prevFinEnd||TODAY,-(FINANCE_LOOKBACK_DAYS-1))):HISTORY_START;
 console.log(`Finance API-only refresh ${financeFrom}..${TODAY}; previous rows=${prevFinanceRows.length}`);
-const financeOps=await fetchFinance(financeFrom,TODAY).catch(e=>{warnings.push(`Finance: ${e}`);return[]});
-const freshFinance=normalizeFinance(financeOps,maps);
-const financeRows=financeOps.length?mergeFinanceRows(prevFinanceRows,freshFinance):prevFinanceRows;
-const finTotals=financeTotals(financeRows);
-console.log(`Finance fresh operations: ${financeOps.length}; merged rows=${financeRows.length}; gross=${finTotals.grossRevenue.toFixed(2)}; net=${finTotals.netAfterOzon.toFixed(2)}`);
+let financeRefresh={rows:[],source:'none'};
+try{financeRefresh=await fetchFinanceNormalized(financeFrom,TODAY,maps)}catch(e){warnings.push(`Finance: ${e}`)}
+const financeRows=financeRefresh.rows.length?replaceFinanceWindow(prevFinanceRows,financeRefresh.rows,financeFrom,TODAY):prevFinanceRows;
+const finTotalsAll=financeTotals(financeRows);
+console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${financeRefresh.source}; merged rows=${financeRows.length}; gross(all)=${finTotalsAll.grossRevenue.toFixed(2)}; net(all)=${finTotalsAll.netAfterOzon.toFixed(2)}`);
 
 /* Posting product quantities — used for COGS units and the RRP−10% corporate norm */
 const postingFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):HISTORY_START;
@@ -552,9 +744,15 @@ try{freshFbsReturns=await fetchFbsReturns(returnFrom,TODAY)}catch(e){returnsComp
 try{freshFboReturns=await fetchFboReturns()}catch(e){returnsComplete=false;warnings.push(`FBO returns: ${e}`)}
 const freshReturnRows=normalizeReturnRows(freshFbsReturns,freshFboReturns,maps).filter(r=>r.date>=HISTORY_START&&r.date<=TODAY);
 const returnRows=returnsComplete?mergeReturnRows(previousReturnRows,freshReturnRows):previousReturnRows;
-const realized=buildRealizedRows(financeRows,postingMap,returnRows,maps);
-const realizedRange=datasetRange(realized.rows);
-console.log(`Posting map: ${Object.keys(postingMap).length}; returns=${returnRows.length}; returnedUnits=${realized.diagnostics.returnedUnits}; realized rows=${realized.rows.length}; unresolved sale ops=${realized.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}`);
+const realization=await updateRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings);
+const realizedRange={start:realization.coverage.start,end:realization.coverage.end};
+console.log(`Realization segments=${realization.segments.length}; rows=${realization.rows.length}; coverage=${realizedRange.start||'none'}..${realizedRange.end||'none'}; complete=${realization.coverage.complete}; monthlyLoaded=${realization.diagnostics.monthlyLoaded}; dailyLoaded=${realization.diagnostics.dailyLoaded}; dailyPremium=${realization.diagnostics.dailyPremiumAvailable}`);
+
+// Publish finance on exactly the same date range as quantity realization.  This prevents
+// the dashboard from mixing a newer finance day with an older quantity/RRP denominator.
+const financeRowsPublished=(realizedRange.start&&realizedRange.end)?financeRows.filter(r=>r.date>=realizedRange.start&&r.date<=realizedRange.end):financeRows;
+const finTotals=financeTotals(financeRowsPublished);
+console.log(`Aligned business period ${realizedRange.start||'finance-start'}..${realizedRange.end||'finance-end'}; finance rows published=${financeRowsPublished.length}; gross=${finTotals.grossRevenue.toFixed(2)}; net=${finTotals.netAfterOzon.toFixed(2)}`);
 
 /* Funnel analytics — one request only in daily mode */
 const analyticsSegments=await updateAnalyticsSegments(previous,maps,warnings);
@@ -563,25 +761,28 @@ const funnelRows=analyticsSegments.flatMap(seg=>(seg.rows||[]).map(r=>({...r,seg
 console.log(`Analytics segments=${analyticsSegments.length}; coverage=${salesStart||'none'}..${salesEnd||'none'}; aggregated SKU rows=${salesRows.length}; segment rows=${funnelRows.length}`);
 
 const generatedAt=new Date().toISOString(),datasets=[];
+const dailyRealizationSegments=realization.segments.filter(s=>s.kind==='daily'&&s.complete!==false);
+const dailyRealizationStart=dailyRealizationSegments.map(s=>s.start).filter(Boolean).sort()[0]||null;
+const dailyRealizationEnd=dailyRealizationSegments.map(s=>s.end).filter(Boolean).sort().at(-1)||null;
 if(funnelRows.length)datasets.push({id:`api-funnel-${salesStart}_${salesEnd}`,apiAuto:true,type:'funnel',label:'Воронка Ozon API',sheetName:'analytics/data',sourceName:'Ozon Seller API',start:salesStart,end:salesEnd,snapshot:null,importedAt:generatedAt,capabilities:{funnel:true,api:true,topTrafficDetail:true,periodSegmented:true,note:'Для SKU детализация до 1000 товаров с наибольшим трафиком на каждом сегменте.'},rows:funnelRows});
-if(realized.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Реализованное количество Ozon API',sheetName:'posting fbo/fbs + finance',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true},rows:realized.rows});
+if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Реализованное количество Ozon API',sheetName:'posting fbo/fbs + finance',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthly:true,dailyCurrent:true,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:dailyRealizationStart,dailyCoverageEnd:dailyRealizationEnd},rows:realization.rows});
 if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'stock',label:'Остатки Ozon API',sheetName:stockComplete?stockResult.source:(previousStock?.sheetName||'previous API snapshot'),sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{stock:true,prices:true,api:true,complete:stockComplete},rows:stockRows});
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
-if(financeRows.length){
-  const rr=datasetRange(financeRows);
-  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:'finance/transaction/list',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'Источник финансов — только Seller API.'},rows:financeRows});
+if(financeRowsPublished.length){
+  const rr=datasetRange(financeRowsPublished);
+  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'Источник финансов — только Seller API.'},rows:financeRowsPublished});
 }
 
 const payload={
   version:4,sourcePolicy:'ozon-api-only',generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
-  history:{analyticsSegments,postingMap,returnRows},
+  history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.segments,financeRowsAll:financeRows},
   diagnostics:{
     mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
-    financeRefreshFrom:financeFrom,financeFreshOperations:financeOps.length,financeRows:financeRows.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,
+    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},
     postingRefreshFrom:postingFrom,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
-    returnRefreshFrom:returnFrom,returnsComplete,fbsReturnsFresh:freshFbsReturns.length,fboReturnsFresh:freshFboReturns.length,returnRows:returnRows.length,returnedUnits:realized.diagnostics.returnedUnits,
-    realizedRows:realized.rows.length,unresolvedSaleOps:realized.diagnostics.unresolvedSaleOps,
+    returnRefreshFrom:returnFrom,returnsComplete:realization.coverage.complete,fbsReturnsFresh:freshFbsReturns.length,fboReturnsFresh:freshFboReturns.length,returnRows:returnRows.length,
+    realizedRows:realization.rows.length,unresolvedSaleOps:realization.coverage.complete?0:realization.diagnostics.fallbackUnresolvedSaleOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,
     analyticsSegments:analyticsSegments.length,analyticsCoverage:{from:salesStart,to:salesEnd},analyticsRows:salesRows.length,analyticsSegmentRows:funnelRows.length,analyticsLatestSkuDetailTruncated:Boolean(analyticsSegments.at(-1)?.skuDetailTruncated),
     warnings
   }
@@ -589,6 +790,6 @@ const payload={
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Realization v4.6 uses official monthly reports + daily current month when available.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
