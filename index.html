@@ -1076,7 +1076,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v5.6</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v5.7</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1460,14 +1460,35 @@ function drillValueForSort(p,key){
   if(key==='ozonCost')return productOzonCost(p);if(key==='rrpTarget')return productRrpTarget(p);if(key==='preExternalGap')return productPreExternalGap(p);if(key==='adsValue')return safe(p.components?.ads?.value);return p[key];
 }
 function sortDrillRows(rows,key,dir){return [...rows].sort((a,b)=>{let x=drillValueForSort(a,key),y=drillValueForSort(b,key);if(x==null)x=dir>0?Infinity:-Infinity;if(y==null)y=dir>0?Infinity:-Infinity;if(typeof x==='string')return dir*x.localeCompare(String(y),'ru');return dir*(safe(x)-safe(y))})}
-function renderDrillProductTable(def){
-  const cats=[...new Set(def.rows.map(p=>p.category).filter(Boolean))].sort();
-  let rows=def.rows.filter(p=>(!drillUI.search||norm(`${p.name} ${p.article} ${p.sku}`).includes(norm(drillUI.search)))&&(!drillUI.category||p.category===drillUI.category));
+function drillFilteredRows(def){
+  const q=norm(drillUI.search||'');
+  const numericQuery=/^\d+$/.test(q);
+  return def.rows.filter(p=>{
+    if(drillUI.category&&p.category!==drillUI.category)return false;
+    if(!q)return true;
+    const article=norm(p.article??''),sku=norm(p.sku??'');
+    if(numericQuery)return article===q||sku===q;
+    return norm(`${p.name??''} ${p.article??''} ${p.sku??''}`).includes(q);
+  });
+}
+function renderDrillProductResults(def){
+  let rows=drillFilteredRows(def);
   const sort=drillUI.sort||def.sort||'revenue',dir=drillUI.sort?drillUI.dir:(def.dir??-1);rows=sortDrillRows(rows,sort,dir);
   const pages=Math.max(1,Math.ceil(rows.length/drillUI.pageSize));drillUI.page=clamp(drillUI.page,1,pages);const pageRows=rows.slice((drillUI.page-1)*drillUI.pageSize,drillUI.page*drillUI.pageSize);
   const headers=def.columns.map(c=>`<th class="${c.cls||''}" data-drill-sort="${typeof c.key==='string'?c.key:''}" ${typeof c.key!=='string'?'style="cursor:default"':''}>${escapeHtml(c.label)}${sort===c.key?' '+(dir>0?'↑':'↓'):''}</th>`).join('');
   const body=pageRows.map(p=>`<tr>${def.columns.map(c=>{const v=c.fmt?c.fmt(p):(p[c.key]??'');return`<td class="${c.cls||''}">${c.html?v:escapeHtml(String(v))}</td>`}).join('')}</tr>`).join('');
-  return `<div class="drawer-tools"><input id="drillSearch" class="input" placeholder="Поиск по товару / артикулу" value="${escapeHtml(drillUI.search)}"><select id="drillCategory" class="select"><option value="">Все категории</option>${cats.map(c=>`<option ${drillUI.category===c?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select><span class="muted tiny" style="align-self:center">${fmtNum(rows.length)} строк</span></div><div class="table-wrap"><table class="table" style="min-width:1050px"><thead><tr>${headers}</tr></thead><tbody>${body||`<tr><td colspan="${def.columns.length}"><div class="empty">Нет строк под текущими фильтрами.</div></td></tr>`}</tbody></table></div><div class="pager"><span>${fmtNum(rows.length)} строк · страница ${drillUI.page} из ${pages}</span><div class="buttons"><button class="btn small" id="drillPrev">←</button><button class="btn small" id="drillNext">→</button></div></div>`;
+  return `<div class="table-wrap"><table class="table" style="min-width:1050px"><thead><tr>${headers}</tr></thead><tbody>${body||`<tr><td colspan="${def.columns.length}"><div class="empty">Нет строк под текущими фильтрами.</div></td></tr>`}</tbody></table></div><div class="pager"><span>${fmtNum(rows.length)} строк · страница ${drillUI.page} из ${pages}</span><div class="buttons"><button class="btn small" id="drillPrev">←</button><button class="btn small" id="drillNext">→</button></div></div>`;
+}
+function renderDrillProductTable(def){
+  const cats=[...new Set(def.rows.map(p=>p.category).filter(Boolean))].sort();
+  const rows=drillFilteredRows(def);
+  return `<div class="drawer-tools"><input id="drillSearch" class="input" placeholder="Поиск по товару / артикулу" value="${escapeHtml(drillUI.search)}" autocomplete="off"><select id="drillCategory" class="select"><option value="">Все категории</option>${cats.map(c=>`<option ${drillUI.category===c?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select><span id="drillRowCount" class="muted tiny" style="align-self:center">${fmtNum(rows.length)} строк</span></div><div id="drillResults">${renderDrillProductResults(def)}</div>`;
+}
+function refreshDrillProductResults(def){
+  const box=$('#drillResults');if(!box)return renderDrilldown();
+  box.innerHTML=renderDrillProductResults(def);
+  const count=$('#drillRowCount');if(count)count.textContent=`${fmtNum(drillFilteredRows(def).length)} строк`;
+  bindDrillResultControls(def);
 }
 function renderExternalDrill(def){
   const ext=currentModel.externalExpenses;return `${drillStatsHtml(def.stats)}${def.note?`<div class="drawer-note">${escapeHtml(def.note)}</div>`:''}<div class="table-wrap"><table class="table" style="min-width:920px"><thead><tr><th>Месяц</th><th class="num">Репрайсер</th><th class="num">Премии</th><th class="num">Наёмная логистика</th><th class="num">Итого</th><th>Как учтено</th></tr></thead><tbody>${(ext?.months||[]).map(x=>`<tr><td>${escapeHtml(x.ym)}</td><td class="num">${fmtMoney(x.repricer)}</td><td class="num">${fmtMoney(x.storeBonus)}</td><td class="num">${x.hired!=null?fmtMoney(x.hired):'<span class="warning">не указано</span>'}</td><td class="num">${fmtMoney(x.repricer+x.storeBonus+safe(x.hired))}</td><td class="name">${x.issue?`<span class="warning">${escapeHtml(x.issue)}</span>`:escapeHtml(x.application||'—')}</td></tr>`).join('')}</tbody></table></div><div style="margin-top:12px"><button class="btn" id="drillGoSettings">Изменить расходы в Настройках →</button></div>`;
@@ -1484,10 +1505,19 @@ function renderDrilldown(){
   let html='';if(def.kind==='external')html=renderExternalDrill(def);else if(def.kind==='categories')html=renderCategoriesDrill(def);else if(def.kind==='signals')html=renderSignalsDrill(def);else if(def.kind==='tax'||def.kind==='management'||def.kind==='business')html=renderBusinessDrill(def);else if(def.kind==='product')html=renderProductDrill(def);else html=`${drillStatsHtml(def.stats)}${def.note?`<div class="drawer-note">${escapeHtml(def.note)}</div>`:''}${renderDrillProductTable(def)}`;
   $('#drawerBody').innerHTML=html;bindDrillControls(def);
 }
+let drillSearchTimer=null;
+function bindDrillResultControls(def){
+  $$('[data-drill-sort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.drillSort;if(!k)return;drillUI.dir=drillUI.sort===k?-drillUI.dir:-1;drillUI.sort=k;refreshDrillProductResults(def)}));
+  $('#drillPrev')?.addEventListener('click',()=>{drillUI.page--;refreshDrillProductResults(def)});$('#drillNext')?.addEventListener('click',()=>{drillUI.page++;refreshDrillProductResults(def)});
+}
 function bindDrillControls(def){
-  $('#drillSearch')?.addEventListener('input',e=>{drillUI.search=e.target.value;drillUI.page=1;renderDrilldown()});$('#drillCategory')?.addEventListener('change',e=>{drillUI.category=e.target.value;drillUI.page=1;renderDrilldown()});
-  $$('[data-drill-sort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.drillSort;if(!k)return;drillUI.dir=drillUI.sort===k?-drillUI.dir:-1;drillUI.sort=k;renderDrilldown()}));
-  $('#drillPrev')?.addEventListener('click',()=>{drillUI.page--;renderDrilldown()});$('#drillNext')?.addEventListener('click',()=>{drillUI.page++;renderDrilldown()});
+  $('#drillSearch')?.addEventListener('input',e=>{
+    drillUI.search=e.target.value;drillUI.page=1;
+    clearTimeout(drillSearchTimer);
+    drillSearchTimer=setTimeout(()=>refreshDrillProductResults(def),120);
+  });
+  $('#drillCategory')?.addEventListener('change',e=>{drillUI.category=e.target.value;drillUI.page=1;refreshDrillProductResults(def)});
+  bindDrillResultControls(def);
   $('#drillGoSettings')?.addEventListener('click',()=>{closeDrilldown();activeTab='settings';$$('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab==='settings'));$$('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-settings'));renderSettings();window.scrollTo({top:document.querySelector('#tabs')?.offsetTop||0,behavior:'smooth'})});
 }
 function exportCurrentDrilldown(){
