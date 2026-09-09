@@ -842,27 +842,28 @@ function buildModel(){
   }
 
   const manual=state.manualCosts||{};
-  const directGrossWeight=sum(products,x=>Math.max(0,safe(x.finance.grossRevenue)));
-  const fallbackWeight=sum(products,x=>Math.max(0,safe(x.realized.net)*safe(x.currentPrice)));
-  const allocWeight=directGrossWeight||fallbackWeight||products.length;
 
-  // Allocate exact business ledger residual only for SKU/category analytics.
+  /*
+    Finance v5.1 policy:
+      - SKU economics uses ONLY amounts directly attributed to that SKU by Seller API;
+      - seller-level/non-item Ozon charges remain unallocated and affect ONLY business P&L;
+      - no catalogue-wide proportional allocation is allowed.
+    This prevents multi-SKU orders and common fees from creating fake losses on products.
+  */
   const directGross=sum(products,x=>safe(x.finance.grossRevenue));
   const directNet=sum(products,x=>safe(x.finance.rawNet));
-  const grossResidual=financeGrossAccrued-directGross;
-  const netResidual=financeNetAccrued-directNet;
+  const grossResidual=financeGrossAccrued-directGross; // normally ~0; kept for audit only
+  const netResidual=financeNetAccrued-directNet;       // common Ozon expenses/income without SKU
 
   for(const o of products){
     const m=manual[o.key]||manual[`A:${o.article}`]||manual[`S:${o.sku}`];
     o.cost=o.costConflict?null:(o.reportCost!=null?o.reportCost:(m&&Number.isFinite(+m.value)?+m.value:null));
     o.costSource=o.costConflict?'missing':(o.reportCost!=null?'report':(o.cost!=null?'manual':'missing'));
 
-    const w=directGrossWeight>0?Math.max(0,safe(o.finance.grossRevenue)):Math.max(0,safe(o.realized.net)*safe(o.currentPrice));
-    const share=allocWeight>0?w/allocWeight:(products.length?1/products.length:0);
-    o.revenue=safe(o.finance.grossRevenue)+grossResidual*share;
-    o.netAfterOzon=safe(o.finance.rawNet)+netResidual*share;
-    o.financeAllocationShare=share;
-    o.financeAllocated=Math.abs(grossResidual*share)>0.005||Math.abs(netResidual*share)>0.005;
+    o.revenue=safe(o.finance.grossRevenue);
+    o.netAfterOzon=safe(o.finance.rawNet);
+    o.financeAllocationShare=0;
+    o.financeAllocated=false;
 
     o.units=o.realized.hasRows?o.realized.net:null;
     if(o.units!=null&&Math.abs(o.units)<1e-9)o.units=0;
@@ -880,8 +881,7 @@ function buildModel(){
     o.components={};
     for(const k of compNames){
       const direct=safe(o.finance[k]);
-      const unalloc=safe(unallocatedFinance[k])*share;
-      o.components[k]={value:direct+unalloc,source:Math.abs(unalloc)>0.005?'allocated':'actual'};
+      o.components[k]={value:direct,source:'actual'};
     }
     o.components.taxes={value:null,source:'aggregate'};
     o.drr=o.revenue>0&&o.components.ads.value!=null?pct(o.components.ads.value,o.revenue):null;
@@ -966,12 +966,16 @@ function buildModel(){
     if(rr&&Number.isFinite(num(rr.rrp))&&num(rr.rrp)>0)ozonRrpKnown++;else if(missingRrpCatalog.length<100)missingRrpCatalog.push(a);
   }
 
+  // These are attribution gaps, not accounting errors:
+  // revenue gap should be ~0 because seller_price is SKU-level;
+  // net gap is expected and equals common Ozon operations without SKU.
   const productRevenueReconciliation=sum(products,x=>safe(x.revenue))-financeGrossAccrued;
   const productNetReconciliation=sum(products,x=>safe(x.netAfterOzon))-financeNetAccrued;
+  const unallocatedOzonNet=financeNetAccrued-sum(products,x=>safe(x.netAfterOzon));
   return{
     products,totalRevenue,totalCogs,complete:operatingComplete,completeRevenue:operatingRevenue,completeProfit:operatingProfit,
     operatingComplete,operatingRevenue,operatingProfit,
-    financeGrossAccrued,financeNetAccrued,unallocatedFinance,
+    financeGrossAccrued,financeNetAccrued,unallocatedFinance,unallocatedOzonNet,
     externalExpenses,managementRemainderKnown,managementRemainder,profitBeforeHiredLogistics,profitBeforeTax,
     estimatedTax,taxRate,businessNetProfit,businessMargin,businessRoi,businessPeriod,
     rrpBaseKnown,rrpTargetKnown,rrpTarget,rrpDelta,rrpAttainment,rrpCoverageUnits,rrpComplete,rrpGrossUnitsKnown,rrpGrossUnitsMissing,rrpNetUnits,missingRrpArticles,quantityComplete,
@@ -1036,7 +1040,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v5.0</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v5.1</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1055,13 +1059,14 @@ function renderQuality(){
   if(q.returnsComplete===false)issues.push('возвраты загружены не полностью');
   if(m.externalExpenses?.missingHired?.length)issues.push(`наёмная логистика неполная: ${m.externalExpenses.missingHired.join(', ')}`);
   if(!m.rrpComplete)issues.push(`норматив РРЦ−10% предварительный: покрытие РРЦ по движениям ${fmtPct(m.rrpCoverageUnits)}`);
-  const reconcileOk=Math.abs(safe(m.reconciliation?.revenueDiff))<1&&Math.abs(safe(m.reconciliation?.netDiff))<1;
-  if(!reconcileOk)issues.push(`сверка SKU→ledger: выручка ${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}, net ${fmtMoney(Math.abs(safe(m.reconciliation?.netDiff)))}`);
+  const revenueReconcileOk=Math.abs(safe(m.reconciliation?.revenueDiff))<1;
+  if(!revenueReconcileOk)issues.push(`сверка SKU→ledger по выручке: расхождение ${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}`);
   const costCatalogPct=q.currentOzonArticles?pct(q.ozonCostKnown,q.currentOzonArticles):null;
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
   $('#dataQuality').innerHTML=`<b>Контроль данных.</b> Ozon в расчётах — <b>только Seller API</b>; Excel Ozon не используется. 
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка найдена ${fmtPct(costCatalogPct)} · РРЦ найдена ${fmtPct(rrpCatalogPct)}.
     Финансовый ledger: выручка ${fmtMoney(m.financeGrossAccrued)} · после услуг Ozon ${fmtMoney(m.financeNetAccrued)}.
+    Общие операции Ozon без SKU: ${fmtMoney(m.unallocatedOzonNet)} — учтены в общем P&L, но не распределяются по товарам.
     Реализация: ${q.realizationCoverage?.from||'нет'} — ${q.realizationCoverage?.to||'нет'}${q.realizationDailyPremiumAvailable===false?' · текущий месяц через резервный слой отправлений':' · закрытые месяцы из официального отчёта, текущий месяц по дням'}.
     ${q.funnelTop1000?'Воронка: детализация top-1000 SKU по трафику на daily-срез.':'Воронка: доступная детализация API.'}
     ${issues.length?`<span class="warning"> Требуют внимания: ${escapeHtml(issues.join('; '))}.</span>`:'<span class="positive"> Контрольные проверки пройдены.</span>'}`;
@@ -1305,7 +1310,7 @@ function drillDefinition(type,payload={}){
   else if(type==='rrpTarget')Object.assign(def,{title:'Норматив РРЦ −10% — из чего складывается',rows:m.products.filter(p=>productRrpTarget(p)!=null&&Math.abs(safe(p.units))>.0001),columns:[...cols,number('units','Net, шт.'),money('rrp','РРЦ'),money(p=>p.rrp*p.units,'База РРЦ'),money(p=>productRrpTarget(p),'90% РРЦ')],sort:'units',stats:[{label:'База РРЦ',value:fmtMoney(m.rrpBaseKnown)},{label:'Норматив 90%',value:fmtMoney(m.rrpTarget??m.rrpTargetKnown)},{label:'Покрытие движений',value:fmtPct(m.rrpCoverageUnits)}],note:'Это детализация вклада SKU в общий норматив. Статус «выполнен/не выполнен» по отдельному товару намеренно не рассчитывается.'});
   else if(type==='rrpDelta')Object.assign(def,{title:'Почему отклонились от норматива РРЦ −10%',rows:m.products.filter(p=>productPreExternalGap(p)!=null&&Math.abs(safe(p.units))>.0001),columns:[...cols,number('units','Net, шт.'),money(p=>productRrpTarget(p),'Вклад в норматив'),money('netAfterOzon','После Ozon'),money(p=>productPreExternalGap(p),'Вклад в разрыв до внешних расходов')],sort:'preExternalGap',dir:1,stats:[{label:'Управленческий остаток',value:fmtMoney(m.managementRemainder??m.managementRemainderKnown)},{label:'Норматив',value:fmtMoney(m.rrpTarget??m.rrpTargetKnown)},{label:'Отклонение',value:m.rrpDelta!=null?fmtMoney(m.rrpDelta):'предварительно',cls:m.rrpDelta!=null?(m.rrpDelta>=0?'positive':'negative'):'warning'},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)}],note:'Колонка «вклад в разрыв» нужна только для объяснения общего результата: После Ozon − 90% РРЦ. Это НЕ индивидуальный норматив SKU. Из общей суммы дополнительно вычитаются внешние расходы бизнеса.'});
   else if(type==='cogs')Object.assign(def,{title:'Себестоимость реализованных товаров',rows:m.products.filter(p=>p.cogs!=null&&Math.abs(p.cogs)>.005),columns:[...cols,number('units','Net, шт.'),money('cost','Закупка / шт.'),money('cogs','Себестоимость'),money('revenue','Выручка')],sort:'cogs',stats:[{label:'Себестоимость',value:fmtMoney(m.totalCogs)},{label:'Покрытие P&L',value:fmtPct(m.cogsCoverage)},{label:'SKU с закупкой в каталоге',value:`${fmtNum(m.quality?.ozonCostKnown)} / ${fmtNum(m.quality?.currentOzonArticles)}`} ]});
-  else if(type==='profitBeforeTax')Object.assign(def,{title:'Прибыль до УСН — товарные источники',rows:m.operatingComplete,columns:[...cols,money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cogs','Себестоимость'),money('operatingProfit','Товарный вклад'),percent('operatingMargin','Маржа')],sort:'operatingProfit',stats:[{label:'Товарный результат до внешних расходов',value:fmtMoney(m.financeNetAccrued-m.totalCogs)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Прибыль до УСН',value:m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'неполно',cls:m.profitBeforeTax!=null?(m.profitBeforeTax>=0?'positive':'negative'):'warning'}],note:'Внешние расходы не распределяются по SKU. Таблица показывает товарный вклад после Ozon и закупки; внешний расход вычитается агрегированно.'});
+  else if(type==='profitBeforeTax')Object.assign(def,{title:'Прибыль до УСН — товарные источники',rows:m.operatingComplete,columns:[...cols,money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cogs','Себестоимость'),money('operatingProfit','Товарный вклад'),percent('operatingMargin','Маржа')],sort:'operatingProfit',stats:[{label:'Товарный результат до внешних расходов',value:fmtMoney(m.financeNetAccrued-m.totalCogs)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Прибыль до УСН',value:m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'неполно',cls:m.profitBeforeTax!=null?(m.profitBeforeTax>=0?'positive':'negative'):'warning'}],note:'Внешние расходы не распределяются по SKU. Таблица показывает товарный вклад после только тех расходов Ozon, которые Seller API напрямую привязал к SKU, и закупки. Общие операции Ozon без SKU и внешние расходы учитываются только в общем P&L и не искажают прибыль отдельных товаров.'});
   else if(type==='tax')Object.assign(def,{title:'Оценка УСН — расчёт',kind:'tax',stats:[{label:'База до УСН',value:m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'нет данных'},{label:'Ставка',value:fmtPct(m.taxRate)},{label:'Оценка УСН',value:m.estimatedTax!=null?fmtMoney(m.estimatedTax):'нет данных',cls:'warning'},{label:'После УСН',value:m.businessNetProfit!=null?fmtMoney(m.businessNetProfit):'нет данных',cls:m.businessNetProfit!=null?(m.businessNetProfit>=0?'positive':'negative'):''}],note:'Это управленческая оценка УСН «доходы − расходы». Она не заменяет налоговый расчёт/декларацию и не распределяется на SKU.'});
   else if(type==='businessNet')Object.assign(def,{title:'Результат бизнеса после УСН',kind:'business',stats:[{label:'После услуг Ozon',value:fmtMoney(m.financeNetAccrued)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Себестоимость',value:fmtMoney(m.totalCogs)},{label:'УСН',value:fmtMoney(m.estimatedTax)},{label:'Итог',value:fmtMoney(m.businessNetProfit),cls:m.businessNetProfit>=0?'positive':'negative'},{label:'Маржа',value:fmtPct(m.businessMargin)},{label:'ROI',value:fmtPct(m.businessRoi)}]});
   else if(type==='ads')Object.assign(def,{title:'Продвижение / реклама',rows:m.products.filter(p=>Math.abs(safe(p.components?.ads?.value))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>p.components?.ads?.value,'Продвижение'),percent('drr','ДРР')],sort:'adsValue',stats:[{label:'Расход',value:fmtMoney(m.adsSpend)},{label:'Статус',value:state.settings.adsActive?'включена':'отключена'},{label:'Источник',value:'Finance API'}],note:state.settings.adsActive?'':'Реклама сейчас отключена. Здесь отображаются исторические списания на продвижение, если они присутствуют в выбранном финансовом периоде.'});
@@ -1324,7 +1329,7 @@ function drillDefinition(type,payload={}){
   else if(type==='growth')Object.assign(def,{title:'Точки роста по воронке',kind:'signals',stats:[{label:'Сигналов',value:fmtNum(m.signals.length)},{label:'Потенциал',value:fmtMoney(sum(m.signals,x=>x.potential))},{label:'Покрытие',value:m.quality?.funnelTop1000?'top-1000 SKU':'доступная воронка'}],note:'Потенциал — ориентир для приоритизации на основе медианных конверсий и товарной прибыли, не гарантированный финансовый результат.'});
   else if(type==='exitCandidates'){
     const rows=m.products.filter(x=>x.abcRevenue==='C'&&x.operatingProfit!=null&&x.operatingProfit<0);
-    Object.assign(def,{title:'Кандидаты на вывод из ассортимента',rows,columns:[...cols,money('revenue','Выручка'),money('operatingProfit','Товарная прибыль'),percent('operatingMargin','Маржа'),{key:'abcRevenue',label:'ABC выручка',fmt:p=>escapeHtml(p.abcRevenue),html:true},number('stock','Остаток')],sort:'operatingProfit',dir:1,stats:[{label:'Кандидатов',value:fmtNum(rows.length)},{label:'Суммарный убыток',value:fmtMoney(-sum(rows,x=>x.operatingProfit)),cls:'negative'}],note:'Критерий: группа C по выручке и отрицательная товарная прибыль. Это список для проверки, а не автоматическое решение о выводе.'});
+    Object.assign(def,{title:'Кандидаты на вывод из ассортимента',rows,columns:[...cols,money('revenue','Выручка'),money('operatingProfit','Товарная прибыль'),percent('operatingMargin','Маржа'),{key:'abcRevenue',label:'ABC выручка',fmt:p=>escapeHtml(p.abcRevenue),html:true},number('stock','Остаток')],sort:'operatingProfit',dir:1,stats:[{label:'Кандидатов',value:fmtNum(rows.length)},{label:'Суммарный убыток',value:fmtMoney(-sum(rows,x=>x.operatingProfit)),cls:'negative'}],note:'Критерий: группа C по выручке и отрицательный прямой товарный вклад. Общие расходы Ozon без SKU сюда не распределяются. Это список для проверки, а не автоматическое решение о выводе.'});
   }
   else if(type==='product'){
     const p=m.products.find(x=>x.key===payload.key);Object.assign(def,{title:p?`${p.article||p.sku} · ${p.name}`:'Товар не найден',kind:'product',product:p,stats:p?[{label:'Выручка',value:fmtMoney(p.revenue)},{label:'Net, шт.',value:p.units!=null?fmtNum(p.units):'нет данных'},{label:'Товарная прибыль',value:fmtMoney(p.operatingProfit),cls:p.operatingProfit!=null?(p.operatingProfit>=0?'positive':'negative'):''},{label:'Маржа',value:fmtPct(p.operatingMargin)},{label:'ROI',value:fmtPct(p.operatingRoi)},{label:'РРЦ',value:fmtMoney(p.rrp)},{label:'Закупка / шт.',value:fmtMoney(p.cost)},{label:'После Ozon',value:fmtMoney(p.netAfterOzon)}]:[]});
