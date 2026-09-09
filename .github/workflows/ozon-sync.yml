@@ -12,9 +12,6 @@ on:
           - fast
           - daily
 
-  # Any change to the dashboard/sync code is immediately published together
-  # with a fresh encrypted API snapshot. This prevents a plain branch deploy
-  # from publishing index.html without /data/ozon-data.enc.json.
   push:
     branches:
       - main
@@ -24,9 +21,7 @@ on:
       - ".github/workflows/ozon-sync.yml"
 
   schedule:
-    # Fast refresh every hour.
     - cron: "17 * * * *"
-    # Daily funnel/analytics refresh once per day.
     - cron: "37 2 * * *"
 
 permissions:
@@ -34,14 +29,15 @@ permissions:
   pages: write
   id-token: write
 
+# IMPORTANT: never cancel a running rebuild. A scheduled hourly refresh may start
+# while a full SKU-finance backfill is still running; it must wait in the queue.
 concurrency:
   group: "ozon-pages-sync"
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     environment:
       name: github-pages
       url: "${{ steps.deployment.outputs.page_url }}"
