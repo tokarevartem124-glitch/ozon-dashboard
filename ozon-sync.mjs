@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (schema v5.2 quantity-aware finance attribution)
+  Ozon Seller Analytics — API-only sync (schema v5.4 exact SKU accrual attribution)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -300,6 +300,7 @@ async function fetchAccrualTypeNames(){
 }
 function classifyService(name){
   const s=asStr(name).toLowerCase();
+  if(s.includes('комисс')||s.includes('commission')||s.includes('вознагражден'))return'commission';
   if(s.includes('эквайр')||s.includes('acquir'))return'acquiring';
   if(s.includes('хранен')||s.includes('storage')||s.includes('placement'))return'storage';
   if(s.includes('реклам')||s.includes('продвиж')||s.includes('advert')||s.includes('promotion')||s.includes('review'))return'ads';
@@ -323,25 +324,16 @@ async function fetchAccrualsDay(date){
 function emptyFinanceComponents(){
   return {commission:0,acquiring:0,logistics:0,storage:0,ads:0,fines:0,returns:0,other:0};
 }
-function postingQtyForSku(postingMap,postingNumber,sku,maps){
-  const posting=postingMap?.[postingNumber];
-  if(!posting?.products?.length)return null;
-  const article=asStr(maps.articleBySku.get(asStr(sku)));
-  const matches=posting.products.filter(p=>asStr(p.sku)===asStr(sku)||(article&&asStr(p.article)===article));
-  if(!matches.length)return null;
-  const q=matches.reduce((s,p)=>s+Math.max(0,asNum(p.quantity,0)),0);
-  return q>0?q:null;
-}
 function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
   /*
-    Grain after v5.1:
-      - one row per directly attributable SKU inside an accrual;
-      - plus, only when necessary, one UNALLOCATED row for seller-level/non-item
-        charges or a residual required to reconcile to acc.total_amount.
+    Business ledger from /v1/finance/accrual/by-day.
 
-    This is intentionally different from the old "singleSku only" logic.
-    Multi-SKU postings must NEVER be dumped into a global pool and later
-    distributed across the whole catalogue: that distorts product profitability.
+    IMPORTANT (v5.4): commission.seller_price in this endpoint is already the
+    sales amount to sum at SKU level.  Do NOT multiply it by posting quantity.
+    Ozon's new finance reference implementation reconciles old accruals_for_sale
+    as Σ posting.products[].commission.seller_price.  Quantity is handled by the
+    separate realization layer for COGS/RRP, while exact product net accruals are
+    fetched from /v1/finance/accrual/postings below.
   */
   const rows=[];
   for(const acc of accruals||[]){
@@ -350,7 +342,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
     const date=asStr(acc.date).slice(0,10);
     const postingNumber=asStr(first(acc?.posting?.posting_number,acc.unit_number));
     const stable=crypto.createHash('sha1').update(JSON.stringify(acc)).digest('hex').slice(0,16);
-    const operation=asStr(typeNames.get(asNum(acc.type_id,NaN))||`Accrual ${acc.type_id}`);
+    const operation=asStr(typeNames.get(asNum(first(acc.accrual_id,acc.type_id),NaN))||`Accrual ${first(acc.accrual_id,acc.type_id)}`);
     const group=asStr(acc.accrued_category);
     const bySku=new Map();
 
@@ -365,108 +357,95 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         itemSkus:[sku],
         group,
         operation,
-        transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(acc.type_id)}:${stable}:sku:${sku}`,
+        transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:sku:${sku}`,
         grossRevenue:0,
-        sellerPricePerInstanceSum:0,sellerPriceExtendedSum:0,sellerQtyResolvedRows:0,sellerQtyUnresolvedRows:0,
         soldQty:0,returnedQty:0,
         ...emptyFinanceComponents(),
         rawAmount:0,
         financeSource:'accrual/by-day',
         financeAttribution:'direct_sku',
-        parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(acc.type_id)}:${stable}`
+        parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}`
       });
       return bySku.get(sku);
     };
 
-    // Posting product economics are already SKU-level in the new API.
     for(const prod of products){
       const sku=asStr(prod?.sku),row=ensureSku(sku);
       if(!row)continue;
       const comm=prod?.commission||{};
-      /*
-        Ozon accrual/by-day exposes commission.seller_price as PRICE PER INSTANCE,
-        while sale_commission / delivery / item_fees are already accrued for the
-        whole posting product line.  Therefore seller_price must be multiplied by
-        the posting quantity.  Without this, multi-unit postings understate revenue
-        but keep full Ozon costs, creating fake product losses.
-      */
-      const sellerUnitPrice=money(comm.seller_price);
-      const postingQty=postingQtyForSku(postingMap,postingNumber,sku,maps);
-      const sellerExtended=postingQty!=null?sellerUnitPrice*postingQty:sellerUnitPrice;
-      row.grossRevenue+=sellerExtended;
-      row.sellerPricePerInstanceSum+=sellerUnitPrice;
-      row.sellerPriceExtendedSum+=sellerExtended;
-      if(postingQty!=null)row.sellerQtyResolvedRows++;else row.sellerQtyUnresolvedRows++;
+      row.grossRevenue+=money(comm.seller_price);
       row.commission+=-money(comm.sale_commission);
 
       const delivery=prod?.delivery||{};
-      let serviceSum=0,serviceCount=0;
+      let serviceCount=0;
       for(const srv of delivery.services||[]){
         if(srv?.accrued==null)continue;
-        const a=money(srv.accrued);serviceSum+=a;serviceCount++;
-        const name=typeNames.get(asNum(srv.type_id,NaN))||`type ${srv.type_id}`;
+        const a=money(srv.accrued);serviceCount++;
+        const tid=asNum(first(srv.accrual_id,srv.type_id),NaN);
+        const name=typeNames.get(tid)||`type ${tid}`;
         row[classifyService(name)]+=-a;
       }
-      // Some responses expose only delivery.total_accrued.
       if(!serviceCount){
         const a=money(delivery.total_accrued);
         if(a)row.logistics+=-a;
       }
     }
 
-    // item_fees are explicitly grouped by SKU — keep them on that SKU.
     for(const grp of feeGroups){
       const row=ensureSku(grp?.sku);
       if(!row)continue;
       for(const fee of grp.fees||[]){
         const a=money(fee.accrued);
-        const name=typeNames.get(asNum(fee.type_id,NaN))||`type ${fee.type_id}`;
+        const tid=asNum(first(fee.accrual_id,fee.type_id),NaN);
+        const name=typeNames.get(tid)||`type ${tid}`;
         row[classifyService(name)]+=-a;
       }
     }
 
-    // Seller-level fee has no SKU by definition.
     const unallocated={
       date,article:'',sku:'',postingNumber,
       itemSkus:[...bySku.keys()],
       group,operation,
-      transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(acc.type_id)}:${stable}:unallocated`,
+      transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:unallocated`,
       grossRevenue:0,soldQty:0,returnedQty:0,
       ...emptyFinanceComponents(),
       rawAmount:0,financeSource:'accrual/by-day',
       financeAttribution:'unallocated',
-      parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(acc.type_id)}:${stable}`
+      parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}`
     };
     let hasUnallocated=false;
     const nif=acc.non_item_fee;
     if(nif){
       const a=money(nif.accrued);
-      const name=typeNames.get(asNum(nif.type_id,NaN))||`type ${nif.type_id}`;
+      const tid=asNum(first(nif.accrual_id,nif.type_id),NaN);
+      const name=typeNames.get(tid)||`type ${tid}`;
+      unallocated[classifyService(name)]+=-a;
+      hasUnallocated=true;
+    }
+    // container_fees (introduced in July 2026) are seller/container-level.
+    for(const fee of acc?.container_fees?.fees||[]){
+      const a=money(fee.accrued);
+      const tid=asNum(first(fee.accrual_id,fee.type_id),NaN);
+      const name=typeNames.get(tid)||`type ${tid}`;
       unallocated[classifyService(name)]+=-a;
       hasUnallocated=true;
     }
 
-    // First derive the net amount that is directly attributable to each SKU.
     const compKeys=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
     for(const row of bySku.values()){
-      const costs=compKeys.reduce((s,k)=>s+asNum(row[k],0),0);
+      const costs=compKeys.reduce((sum,k)=>sum+asNum(row[k],0),0);
       row.rawAmount=asNum(row.grossRevenue,0)-costs;
     }
     {
-      const costs=compKeys.reduce((s,k)=>s+asNum(unallocated[k],0),0);
+      const costs=compKeys.reduce((sum,k)=>sum+asNum(unallocated[k],0),0);
       unallocated.rawAmount=-costs;
     }
 
-    /*
-      Reconcile every parent accrual exactly to total_amount.
-      Any residual is NOT spread over products.  It remains seller-level
-      "other" so business P&L is exact while SKU economics stays factual.
-    */
     const amount=money(acc.total_amount);
-    const currentNet=[...bySku.values()].reduce((s,r)=>s+asNum(r.rawAmount,0),0)+asNum(unallocated.rawAmount,0);
+    const currentNet=[...bySku.values()].reduce((sum,r)=>sum+asNum(r.rawAmount,0),0)+asNum(unallocated.rawAmount,0);
     const delta=amount-currentNet;
     if(Math.abs(delta)>0.005){
-      unallocated.other-=delta;     // raw = gross - components, so this adds delta to raw.
+      unallocated.other-=delta;
       unallocated.rawAmount+=delta;
       hasUnallocated=true;
     }
@@ -475,10 +454,11 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       if(Math.abs(row.grossRevenue)<0.0005)row.grossRevenue=null;
       rows.push(row);
     }
-    if(hasUnallocated || Math.abs(unallocated.rawAmount)>0.005)rows.push(unallocated);
+    if(hasUnallocated||Math.abs(unallocated.rawAmount)>0.005)rows.push(unallocated);
   }
   return rows;
 }
+
 async function fetchFinanceAccrual(fromDate,toDate,maps,postingMap){
   const typeNames=await fetchAccrualTypeNames(),rows=[];
   for(const d of dateRange(fromDate,toDate)){
@@ -530,6 +510,94 @@ function financeTotals(rows){
   const components={commission:0,acquiring:0,logistics:0,storage:0,ads:0,fines:0,returns:0,other:0};let grossRevenue=0,netAfterOzon=0;
   for(const r of rows||[]){grossRevenue+=asNum(r.grossRevenue,0);netAfterOzon+=asNum(r.rawAmount,0);for(const k of Object.keys(components))components[k]+=asNum(r[k],0)}
   return {grossRevenue,netAfterOzon,components};
+}
+
+
+/* ---------------------- exact SKU finance by posting --------------------- */
+function uniqStrings(xs){return [...new Set((xs||[]).map(asStr).filter(Boolean))]}
+async function fetchFinancePostingAccruals(postingNumbers){
+  const requested=uniqStrings(postingNumbers),all=[];
+  const returned=new Set(),errors=[];
+  async function fetchBatch(batch){
+    if(!batch.length)return;
+    const r=await post('/v1/finance/accrual/postings',{posting_numbers:batch},{allowError:true,retries:3});
+    if(r.__error){
+      // If Ozon rejects a large batch, split it recursively. This keeps the
+      // integration tolerant to undocumented request-size limits.
+      if(batch.length>1&&(r.__status===400||r.__status===413)){
+        const mid=Math.ceil(batch.length/2);
+        await fetchBatch(batch.slice(0,mid));
+        await fetchBatch(batch.slice(mid));
+        return;
+      }
+      errors.push(r.__error);return;
+    }
+    const rows=r.posting_accruals||r.result?.posting_accruals||[];
+    for(const x of rows){
+      const pn=asStr(x.posting_number);if(pn)returned.add(pn);
+      all.push(x);
+    }
+    // Keep some headroom against beta endpoint rate limits.
+    await sleep(180);
+  }
+  const batchSize=50;
+  for(let i=0;i<requested.length;i+=batchSize)await fetchBatch(requested.slice(i,i+batchSize));
+  return {postingAccruals:all,requested,returned:[...returned],errors};
+}
+function normalizeFinancePostingAccruals(postingAccruals,maps,typeNames){
+  /*
+    /v1/finance/accrual/postings is the authoritative SKU-level money layer.
+    Every accrual already contains SKU, quantity, type_id and accrued amount.
+    We sum accrued amounts directly; no catalogue-wide allocation and no join to
+    FBO/FBS posting lists is required. seller_price is retained only for audit.
+  */
+  const grouped=new Map();
+  for(const pa of postingAccruals||[]){
+    const postingNumber=asStr(pa?.posting_number);
+    for(const a of pa?.accruals||[]){
+      const sku=asStr(a?.sku);if(!sku)continue;
+      const date=asStr(a?.accrual_date).slice(0,10);if(!date)continue;
+      const article=asStr(maps.articleBySku.get(sku));
+      const typeId=asNum(first(a.accrual_id,a.type_id),NaN);
+      const typeName=asStr(typeNames.get(typeId)||`type ${typeId}`);
+      const amount=money(a.accrued),qty=asNum(a.quantity,0),sellerPrice=money(a.seller_price);
+      const key=[date,postingNumber,sku].join('|');
+      const row=grouped.get(key)||{
+        date,article,sku,postingNumber,itemSkus:[sku],group:'POSTING',operation:'Finance accrual/postings',
+        transactionId:`posting-accrual:${date}:${postingNumber}:${sku}`,
+        grossRevenue:0,sellerPriceAudit:0,postingQtyAudit:0,soldQty:0,returnedQty:0,
+        ...emptyFinanceComponents(),rawAmount:0,financeSource:'finance/accrual/postings',financeAttribution:'exact_sku_posting',accrualLines:0
+      };
+      row.rawAmount+=amount;row.accrualLines++;
+      // seller_price/quantity repeat across fee lines in some responses. Keep the
+      // largest absolute values for audit only; do not add/multiply them into money.
+      if(Math.abs(sellerPrice)>Math.abs(row.sellerPriceAudit))row.sellerPriceAudit=sellerPrice;
+      if(Math.abs(qty)>Math.abs(row.postingQtyAudit))row.postingQtyAudit=qty;
+      if(amount<0){
+        const kind=classifyService(typeName);
+        row[kind]+=Math.abs(amount);
+      }else if(amount>0){
+        // Positive reversals/compensations reduce the matching cost bucket only
+        // when the type clearly belongs to one; otherwise rawAmount remains exact
+        // and the positive amount is kept as other income, not a fake expense.
+        const kind=classifyService(typeName);
+        if(kind!=='other')row[kind]-=amount;
+      }
+      grouped.set(key,row);
+    }
+  }
+  return [...grouped.values()].sort((a,b)=>asStr(a.date).localeCompare(asStr(b.date))||asStr(a.postingNumber).localeCompare(asStr(b.postingNumber))||asStr(a.sku).localeCompare(asStr(b.sku)));
+}
+function mergeSkuFinanceRefresh(previousRows,freshRows,fromDate,toDate){
+  // Refresh only postings for which Ozon actually returned accrual rows.
+  // If a fresh posting temporarily has no accruals yet, keep the cached row instead
+  // of erasing a previously valid history window.
+  const refreshedPostings=new Set((freshRows||[]).map(r=>asStr(r.postingNumber)).filter(Boolean));
+  const kept=(previousRows||[]).filter(r=>{
+    if(!r.date||r.date<fromDate||r.date>toDate)return true;
+    return !refreshedPostings.has(asStr(r.postingNumber));
+  });
+  return [...kept,...(freshRows||[])].sort((a,b)=>asStr(a.date).localeCompare(asStr(b.date))||asStr(a.transactionId).localeCompare(asStr(b.transactionId)));
 }
 
 /* ------------------------------- postings ----------------------------- */
@@ -817,32 +885,43 @@ const priceRows=freshPrice.length?freshPrice:(previousPrice?.rows||[]);
 if(!stockComplete)warnings.push(`Stock refresh incomplete ${freshStock.length}/${products.length}; previous API stock kept.`);
 if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kept.');
 
-/* Posting product quantities — MUST be available before Finance normalization.
-   accrual/by-day seller_price is per instance, so the posting quantity is needed
-   to extend it to full SKU revenue.  On the v5.2 upgrade refresh posting history
-   from HISTORY_START once; later runs keep the normal rolling lookback. */
-const financeAttributionUpgrade=previous?.financeAttributionVersion!==3;
-const postingFrom=financeAttributionUpgrade?HISTORY_START:(previous?maxDateStr(HISTORY_START,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):HISTORY_START);
-console.log(`Posting quantity refresh ${postingFrom}..${TODAY}; attributionUpgrade=${financeAttributionUpgrade}`);
+/* Posting lists are kept only for the open-month realization fallback.
+   They are NOT used to infer finance quantities anymore. */
+const financeAttributionUpgrade=previous?.financeAttributionVersion!==4;
+const postingFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):HISTORY_START;
+console.log(`Posting fallback refresh ${postingFrom}..${TODAY}; attributionUpgrade=${financeAttributionUpgrade}`);
 let freshFbo=[],freshFbs=[];
 try{freshFbo=await fetchFboPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBO postings: ${e}`)}
 try{freshFbs=await fetchFbsPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBS postings: ${e}`)}
 const postingMap=mergePostingMaps(previousPostingMap,normalizePostingMap([...freshFbo,...freshFbs]));
 console.log(`Posting map entries=${Object.keys(postingMap).length}; fresh FBO=${freshFbo.length}; fresh FBS=${freshFbs.length}`);
 
-/* Finance API-only history */
+/* Exact business ledger from /finance/accrual/by-day. */
 const prevFinanceRows=previous?.history?.financeRowsAll||previousFinance?.rows||[];
 const prevFinEnd=prevFinanceRows.map(r=>r.date).filter(Boolean).sort().at(-1)||null;
-// v5.2 fixes seller_price quantity extension; force one full history rebuild.
+// v5.4 removes the incorrect seller_price × posting quantity rule; rebuild once.
 const financeFrom=financeAttributionUpgrade?HISTORY_START:(previous?maxDateStr(HISTORY_START,addDays(prevFinEnd||TODAY,-(FINANCE_LOOKBACK_DAYS-1))):HISTORY_START);
 console.log(`Finance API-only refresh ${financeFrom}..${TODAY}; previous rows=${prevFinanceRows.length}; attributionUpgrade=${financeAttributionUpgrade}`);
 let financeRefresh={rows:[],source:'none'};
 try{financeRefresh=await fetchFinanceNormalized(financeFrom,TODAY,maps,postingMap)}catch(e){warnings.push(`Finance: ${e}`)}
 const financeRows=financeRefresh.rows.length?replaceFinanceWindow(prevFinanceRows,financeRefresh.rows,financeFrom,TODAY):prevFinanceRows;
 const finTotalsAll=financeTotals(financeRows);
-const qtyResolvedFinanceRows=financeRows.filter(r=>asNum(r.sellerQtyResolvedRows,0)>0).length;
-const qtyUnresolvedFinanceRows=financeRows.filter(r=>asNum(r.sellerQtyUnresolvedRows,0)>0).length;
-console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${financeRefresh.source}; merged rows=${financeRows.length}; gross(all)=${finTotalsAll.grossRevenue.toFixed(2)}; net(all)=${finTotalsAll.netAfterOzon.toFixed(2)}; sellerQty resolvedRows=${qtyResolvedFinanceRows}; unresolvedRows=${qtyUnresolvedFinanceRows}`);
+console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${financeRefresh.source}; merged rows=${financeRows.length}; gross(all)=${finTotalsAll.grossRevenue.toFixed(2)}; net(all)=${finTotalsAll.netAfterOzon.toFixed(2)}`);
+
+/* Exact SKU-level accruals.  Unlike posting-list joins, this endpoint already
+   returns posting_number + SKU + quantity + accrued amount in one response. */
+const prevSkuFinanceRows=previous?.history?.skuFinanceRowsAll||[];
+const skuFinanceFrom=financeAttributionUpgrade?HISTORY_START:maxDateStr(HISTORY_START,addDays(TODAY,-Math.max(FINANCE_LOOKBACK_DAYS,7)));
+const postingNumbersForSku=uniqStrings(financeRows.filter(r=>r.date>=skuFinanceFrom&&r.date<=TODAY&&r.postingNumber&&(r.sku||r.article||(r.itemSkus||[]).length)).map(r=>r.postingNumber));
+console.log(`SKU finance posting refresh ${skuFinanceFrom}..${TODAY}; requested postings=${postingNumbersForSku.length}`);
+let postingAccrualFetch={postingAccruals:[],requested:postingNumbersForSku,returned:[],errors:[]};
+try{postingAccrualFetch=await fetchFinancePostingAccruals(postingNumbersForSku)}catch(e){warnings.push(`Finance postings: ${e}`)}
+const accrualTypeNames=await fetchAccrualTypeNames();
+const freshSkuFinanceRows=normalizeFinancePostingAccruals(postingAccrualFetch.postingAccruals,maps,accrualTypeNames).filter(r=>r.date>=HISTORY_START&&r.date<=TODAY);
+const skuFinanceRows=freshSkuFinanceRows.length?mergeSkuFinanceRefresh(prevSkuFinanceRows,freshSkuFinanceRows,skuFinanceFrom,TODAY):prevSkuFinanceRows;
+const returnedPostingSet=new Set(postingAccrualFetch.returned||[]);
+const missingPostingNumbers=postingNumbersForSku.filter(x=>!returnedPostingSet.has(x));
+console.log(`SKU finance accruals: returned postings=${returnedPostingSet.size}/${postingNumbersForSku.length}; fresh rows=${freshSkuFinanceRows.length}; merged rows=${skuFinanceRows.length}; missing postings=${missingPostingNumbers.length}`);
 
 /* Exact return quantities */
 const returnFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):HISTORY_START;
@@ -854,18 +933,26 @@ const realization=await updateRealizationSegments(previous,maps,financeRows,post
 const realizedRange={start:realization.coverage.start,end:realization.coverage.end};
 console.log(`Realization segments=${realization.segments.length}; rows=${realization.rows.length}; coverage=${realizedRange.start||'none'}..${realizedRange.end||'none'}; complete=${realization.coverage.complete}; monthlyLoaded=${realization.diagnostics.monthlyLoaded}; dailyLoaded=${realization.diagnostics.dailyLoaded}; dailyPremium=${realization.diagnostics.dailyPremiumAvailable}`);
 
-// Publish finance on exactly the same date range as quantity realization.  This prevents
-// the dashboard from mixing a newer finance day with an older quantity/RRP denominator.
+// Publish finance and exact SKU accruals on exactly the same date range as quantity realization.
 const financeRowsPublished=(realizedRange.start&&realizedRange.end)?financeRows.filter(r=>r.date>=realizedRange.start&&r.date<=realizedRange.end):financeRows;
+const skuFinanceRowsPublished=(realizedRange.start&&realizedRange.end)?skuFinanceRows.filter(r=>r.date>=realizedRange.start&&r.date<=realizedRange.end):skuFinanceRows;
 const finTotals=financeTotals(financeRowsPublished);
 const financeDirectRows=financeRowsPublished.filter(r=>r.financeAttribution==='direct_sku'||r.article||r.sku);
 const financeUnallocatedRows=financeRowsPublished.filter(r=>!(r.article||r.sku));
-const financeDirectGross=financeDirectRows.reduce((s,r)=>s+asNum(r.grossRevenue,0),0);
-const financeDirectNet=financeDirectRows.reduce((s,r)=>s+asNum(r.rawAmount,0),0);
-const financeUnallocatedNet=financeUnallocatedRows.reduce((s,r)=>s+asNum(r.rawAmount,0),0);
+const financeDirectGross=financeDirectRows.reduce((sum,r)=>sum+asNum(r.grossRevenue,0),0);
+const financeDirectNet=financeDirectRows.reduce((sum,r)=>sum+asNum(r.rawAmount,0),0);
+const financeUnallocatedNet=financeUnallocatedRows.reduce((sum,r)=>sum+asNum(r.rawAmount,0),0);
 const financeReconcileDelta=finTotals.netAfterOzon-(financeDirectNet+financeUnallocatedNet);
+const skuFinanceNet=skuFinanceRowsPublished.reduce((sum,r)=>sum+asNum(r.rawAmount,0),0);
+const skuFinanceReconcileDelta=financeDirectNet-skuFinanceNet;
+const publishedPostingNumbersForSku=uniqStrings(financeRowsPublished.filter(r=>r.postingNumber&&(r.sku||r.article||(r.itemSkus||[]).length)).map(r=>r.postingNumber));
+const exactPostingSet=new Set(skuFinanceRowsPublished.map(r=>asStr(r.postingNumber)).filter(Boolean));
+const missingPublishedPostings=publishedPostingNumbersForSku.filter(x=>!exactPostingSet.has(x));
+const skuFinanceCoverageComplete=publishedPostingNumbersForSku.length>0&&missingPublishedPostings.length===0;
+if(missingPublishedPostings.length)warnings.push(`Exact SKU finance incomplete: ${missingPublishedPostings.length}/${publishedPostingNumbersForSku.length} postings have no accrual/postings rows in published period.`);
 console.log(`Aligned business period ${realizedRange.start||'finance-start'}..${realizedRange.end||'finance-end'}; finance rows published=${financeRowsPublished.length}; gross=${finTotals.grossRevenue.toFixed(2)}; net=${finTotals.netAfterOzon.toFixed(2)}`);
-console.log(`Finance attribution v2: direct SKU rows=${financeDirectRows.length}; unallocated rows=${financeUnallocatedRows.length}; direct gross=${financeDirectGross.toFixed(2)}; direct net=${financeDirectNet.toFixed(2)}; unallocated net=${financeUnallocatedNet.toFixed(2)}; reconcile delta=${financeReconcileDelta.toFixed(6)}`);
+console.log(`Finance ledger: direct SKU rows=${financeDirectRows.length}; unallocated rows=${financeUnallocatedRows.length}; direct gross=${financeDirectGross.toFixed(2)}; direct net=${financeDirectNet.toFixed(2)}; unallocated net=${financeUnallocatedNet.toFixed(2)}; ledger delta=${financeReconcileDelta.toFixed(6)}`);
+console.log(`Exact SKU accruals: postings=${exactPostingSet.size}/${publishedPostingNumbersForSku.length}; missing=${missingPublishedPostings.length}; rows=${skuFinanceRowsPublished.length}; net=${skuFinanceNet.toFixed(2)}; vs by-day direct delta=${skuFinanceReconcileDelta.toFixed(6)}; coverageComplete=${skuFinanceCoverageComplete}`);
 
 /* Funnel analytics — one request only in daily mode */
 const analyticsSegments=await updateAnalyticsSegments(previous,maps,warnings);
@@ -883,16 +970,21 @@ if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'st
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
   const rr=datasetRange(financeRowsPublished);
-  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'Источник финансов — только Seller API. seller_price умножается на количество из posting; multi-SKU начисления разбиты по SKU; общие non-item расходы не распределяются по товарам.'},rows:financeRowsPublished});
+  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'Общий P&L: Seller API /v1/finance/accrual/by-day. seller_price суммируется как отдает Ozon, без умножения на quantity.'},rows:financeRowsPublished});
+}
+if(skuFinanceRowsPublished.length){
+  const rr=datasetRange(skuFinanceRowsPublished);
+  datasets.push({id:`api-sku-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'skuFinance',label:'Товарные начисления Ozon API',sheetName:'finance/accrual/postings',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{skuFinance:true,api:true,exactPostingSku:true,coverageComplete:skuFinanceCoverageComplete,note:'Товарный финансовый вклад считается по /v1/finance/accrual/postings: SKU, quantity и accrued уже связаны Ozon напрямую. Никакого распределения общих расходов по каталогу.'},rows:skuFinanceRowsPublished});
 }
 
 const payload={
-  version:4,sourcePolicy:'ozon-api-only',financeAttributionVersion:3,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
-  history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.segments,financeRowsAll:financeRows},
+  version:4,sourcePolicy:'ozon-api-only',financeAttributionVersion:4,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
+  history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.segments,financeRowsAll:financeRows,skuFinanceRowsAll:skuFinanceRows},
   diagnostics:{
     mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
-    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:3,financeAttributionUpgrade,financeSellerQtyResolvedRows:qtyResolvedFinanceRows,financeSellerQtyUnresolvedRows:qtyUnresolvedFinanceRows,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
+    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:4,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
+    skuFinanceRefreshFrom,skuFinanceRequestedPostings:publishedPostingNumbersForSku.length,skuFinanceReturnedPostings:exactPostingSet.size,skuFinanceMissingPostings:missingPublishedPostings.length,skuFinanceFreshRows:freshSkuFinanceRows.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceNet,skuFinanceReconcileDelta,skuFinanceCoverageComplete,skuFinanceRefreshRequested:postingNumbersForSku.length,skuFinanceRefreshReturned:returnedPostingSet.size,skuFinanceRefreshMissing:missingPostingNumbers.length,
     postingRefreshFrom:postingFrom,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
     returnRefreshFrom:returnFrom,returnsApiComplete:returnsComplete,returnsComplete:realization.coverage.complete,returnsFresh:freshReturnRows.length,fbsReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBS').length,fboReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBO').length,returnRows:returnRows.length,
     realizedRows:realization.rows.length,unresolvedSaleOps:realization.coverage.complete?0:realization.diagnostics.fallbackUnresolvedSaleOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,
@@ -903,6 +995,6 @@ const payload={
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Realization v4.6 uses official monthly reports + daily current month when available.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses exact /v1/finance/accrual/postings attribution.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
