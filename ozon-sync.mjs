@@ -427,7 +427,7 @@ async function fetchFboPostings(fromDate,toDate){
       const r=await post('/v3/posting/fbo/list',{
         cursor,
         filter:{posting_number:[],order_number:[],since:from,to,status:[]},
-        limit:1000,sort_dir:'asc',translit:false,
+        limit:100,sort_dir:'asc',translit:false,
         with:{analytics_data:false,financial_data:false,legal_info:false}
       },{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
@@ -451,7 +451,7 @@ async function fetchFbsPostings(fromDate,toDate){
           order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
           order_id:0,since:from,to,status:[],provider_ids:[],warehouse_ids:[]
         },
-        limit:1000,cursor,
+        limit:100,cursor,
         with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
       },{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
@@ -477,52 +477,38 @@ function normalizePostingMap(postings){
 function mergePostingMaps(prevMap,freshMap){
   return {...(prevMap||{}),...(freshMap||{})};
 }
-async function fetchFbsReturns(fromDate,toDate){
+async function fetchUnifiedReturns(fromDate,toDate){
+  // Current Ozon endpoint for both FBO and FBS returns.  The legacy
+  // /v3/returns/company/fbo and /v3/returns/company/fbs methods are obsolete.
+  // /v1/returns/list allows at most 500 rows per page and cursoring by last_id.
   const out=[];let lastId=0;
-  for(let guard=0;guard<1000;guard++){
-    const r=await post('/v3/returns/company/fbs',{
-      filter:{
-        accepted_from_customer_moment:{time_from:`${fromDate}T00:00:00Z`,time_to:`${toDate}T23:59:59Z`},
-        last_free_waiting_day:{},order_id:0,posting_number:[],product_name:'',product_offer_id:'',status:''
-      },
-      limit:1000,last_id:lastId
+  for(let guard=0;guard<2000;guard++){
+    const r=await post('/v1/returns/list',{
+      filter:{logistic_return_date:{time_from:`${fromDate}T00:00:00Z`,time_to:`${toDate}T23:59:59Z`}},
+      limit:500,last_id:lastId
     },{allowError:true,retries:2});
     if(r.__error)throw new Error(r.__error);
     const batch=Array.isArray(r.returns)?r.returns:[];out.push(...batch);
-    const next=asNum(r.last_id,0);
-    if(!batch.length||batch.length<1000||!next||next===lastId)break;
+    if(!r.has_next||!batch.length)break;
+    const next=Math.max(...batch.map(x=>asNum(x.id,0)),0);
+    if(!next||next===lastId)break;
     lastId=next;
   }
   return out;
 }
-async function fetchFboReturns(){
-  // v3 FBO return method has no date filter; last_id is used for pagination.
-  // The response is item-level (one return id + one SKU), so each row represents one returned unit.
-  const out=[];let lastId=0;
-  for(let guard=0;guard<1000;guard++){
-    const r=await post('/v3/returns/company/fbo',{filter:{posting_number:'',status:[]},last_id:lastId,limit:1000},{allowError:true,retries:2});
-    if(r.__error)throw new Error(r.__error);
-    const batch=Array.isArray(r.returns)?r.returns:[];out.push(...batch);
-    const next=asNum(r.last_id,0);
-    if(!batch.length||batch.length<1000||!next||next===lastId)break;
-    lastId=next;
-  }
-  return out;
-}
-function normalizeReturnRows(fbs,fbo,maps){
+function normalizeReturnRows(unified,maps){
   const rows=[];
-  for(const r of fbs||[]){
-    const sku=asStr(r.sku),article=asStr(first(r.product_offer_id,maps.articleBySku.get(sku)));
-    const date=asStr(first(r.accepted_from_customer_moment,r.return_date,r.returned_to_seller_date_time)).slice(0,10);
-    const q=Math.max(0,asNum(r.quantity,0));
+  for(const r of unified||[]){
+    const p=r.product||{},sku=asStr(p.sku),article=asStr(first(p.offer_id,maps.articleBySku.get(sku)));
+    const date=asStr(first(r?.logistic?.return_date,r?.logistic?.final_moment,r?.logistic?.technical_return_moment,r?.visual?.change_moment)).slice(0,10);
+    const q=Math.max(0,asNum(p.quantity,0));
     if(!date||q<=0||(!article&&!sku))continue;
-    rows.push({returnId:`fbs:${asStr(r.id)}`,date,article,sku,name:asStr(r.product_name),quantity:q,postingNumber:asStr(r.posting_number),schema:'FBS',reason:asStr(r.return_reason_name)});
-  }
-  for(const r of fbo||[]){
-    const sku=asStr(r.sku),article=asStr(maps.articleBySku.get(sku));
-    const date=asStr(first(r.accepted_from_customer_moment,r.returned_to_ozon_moment)).slice(0,10);
-    if(!date||(!article&&!sku))continue;
-    rows.push({returnId:`fbo:${asStr(r.id)}`,date,article,sku,name:maps.nameBySku.get(sku)||'',quantity:1,postingNumber:asStr(r.posting_number),schema:'FBO',reason:asStr(r.return_reason_name)});
+    const schemaRaw=asStr(r.schema).toUpperCase();
+    const schema=schemaRaw.includes('FBS')?'FBS':schemaRaw.includes('FBO')?'FBO':schemaRaw||'UNKNOWN';
+    rows.push({
+      returnId:`return:${asStr(r.id)}`,date,article,sku,name:asStr(first(p.name,maps.nameBySku.get(sku))),quantity:q,
+      postingNumber:asStr(r.posting_number),schema,reason:asStr(r.return_reason_name)
+    });
   }
   return rows;
 }
@@ -538,8 +524,7 @@ function buildPostingFallbackRealizedRows(financeRows,postingMap,returnRows,maps
   /*
     Realized quantity is anchored to Ozon API events:
       + positive sale accrual: exact product quantities from the matching FBO/FBS posting;
-      - returns: exact FBS quantity from /v3/returns/company/fbs; FBO response is item-level,
-        therefore one return row = one returned unit.
+      - returns: exact FBO/FBS quantity from the current /v1/returns/list endpoint.
 
     If a sale posting cannot be resolved or a returns endpoint fails, diagnostics mark the
     quantity layer incomplete. The dashboard then labels the RRP−10% norm as provisional
@@ -739,10 +724,9 @@ const postingMap=mergePostingMaps(previousPostingMap,normalizePostingMap([...fre
 
 /* Exact return quantities */
 const returnFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):HISTORY_START;
-let freshFbsReturns=[],freshFboReturns=[],returnsComplete=true;
-try{freshFbsReturns=await fetchFbsReturns(returnFrom,TODAY)}catch(e){returnsComplete=false;warnings.push(`FBS returns: ${e}`)}
-try{freshFboReturns=await fetchFboReturns()}catch(e){returnsComplete=false;warnings.push(`FBO returns: ${e}`)}
-const freshReturnRows=normalizeReturnRows(freshFbsReturns,freshFboReturns,maps).filter(r=>r.date>=HISTORY_START&&r.date<=TODAY);
+let freshReturns=[],returnsComplete=true;
+try{freshReturns=await fetchUnifiedReturns(returnFrom,TODAY)}catch(e){returnsComplete=false;warnings.push(`Returns: ${e}`)}
+const freshReturnRows=normalizeReturnRows(freshReturns,maps).filter(r=>r.date>=HISTORY_START&&r.date<=TODAY);
 const returnRows=returnsComplete?mergeReturnRows(previousReturnRows,freshReturnRows):previousReturnRows;
 const realization=await updateRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings);
 const realizedRange={start:realization.coverage.start,end:realization.coverage.end};
