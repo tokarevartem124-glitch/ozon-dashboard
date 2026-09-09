@@ -328,11 +328,13 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
   /*
     Business ledger from /v1/finance/accrual/by-day.
 
-    IMPORTANT (v5.4): commission.seller_price in this endpoint is already the
-    sales amount to sum at SKU level.  Do NOT multiply it by posting quantity.
-    Ozon's new finance reference implementation reconciles old accruals_for_sale
-    as Σ posting.products[].commission.seller_price.  Quantity is handled by the
-    separate realization layer for COGS/RRP, and the same rows are also projected into the product-finance dataset.
+    IMPORTANT (v5.6): seller_price alone is NOT sufficient for SKU economics
+    when a product line contains quantity > 1 and/or Ozon discount compensation.
+    For the seller's economic gross we use the explicit positive posting fields:
+      sale_amount + bonus + coinvestment.
+    This reproduces the old Ozon finance report structure (Выручка + Баллы за скидки
+    + Программы партнёров).  seller_price is retained only for audit/fallback.
+    Quantity remains a separate realization layer for COGS/RRP.
     /v1/finance/accrual/postings is deliberately not used for bulk history.
   */
   const rows=[];
@@ -359,6 +361,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         operation,
         transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:sku:${sku}`,
         grossRevenue:0,
+        sellerPriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,
         soldQty:0,returnedQty:0,
         ...emptyFinanceComponents(),
         rawAmount:0,
@@ -373,7 +376,16 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       const sku=asStr(prod?.sku),row=ensureSku(sku);
       if(!row)continue;
       const comm=prod?.commission||{};
-      row.grossRevenue+=money(comm.seller_price);
+      const sellerPrice=money(comm.seller_price);
+      const saleAmount=money(comm.sale_amount);
+      const bonus=money(comm.bonus);
+      const coinvestment=money(comm.coinvestment);
+      row.sellerPriceRaw+=sellerPrice;
+      row.saleAmount+=saleAmount;
+      row.bonus+=bonus;
+      row.coinvestment+=coinvestment;
+      const economicGross=saleAmount+bonus+coinvestment;
+      row.grossRevenue+=Math.abs(economicGross)>0.0005?economicGross:sellerPrice;
       row.commission+=-money(comm.sale_commission);
 
       const delivery=prod?.delivery||{};
@@ -407,7 +419,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       itemSkus:[...bySku.keys()],
       group,operation,
       transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:unallocated`,
-      grossRevenue:0,soldQty:0,returnedQty:0,
+      grossRevenue:0,sellerPriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,soldQty:0,returnedQty:0,
       ...emptyFinanceComponents(),
       rawAmount:0,financeSource:'accrual/by-day',
       financeAttribution:'unallocated',
@@ -804,7 +816,7 @@ if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kep
 
 /* Posting lists are kept only for the open-month realization fallback.
    They are NOT used to infer finance quantities anymore. */
-const financeAttributionUpgrade=previous?.financeAttributionVersion!==5;
+const financeAttributionUpgrade=previous?.financeAttributionVersion!==6;
 const postingFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):HISTORY_START;
 console.log(`Posting fallback refresh ${postingFrom}..${TODAY}; attributionUpgrade=${financeAttributionUpgrade}`);
 let freshFbo=[],freshFbs=[];
@@ -826,13 +838,13 @@ const finTotalsAll=financeTotals(financeRows);
 console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${financeRefresh.source}; merged rows=${financeRows.length}; gross(all)=${finTotalsAll.grossRevenue.toFixed(2)}; net(all)=${finTotalsAll.netAfterOzon.toFixed(2)}`);
 
 /* Direct SKU economics from the SAME /v1/finance/accrual/by-day ledger.
-   The by-day payload already contains SKU-specific seller_price, sale commission,
-   delivery accruals and item_fees. This is the recommended bulk source.
+   The by-day payload already contains SKU-specific sale_amount/bonus/coinvestment,
+   sale commission, delivery accruals and item_fees. This is the recommended bulk source.
    /v1/finance/accrual/postings is intentionally NOT used for full-history sync
    because Ozon rate-limits it heavily and it is better suited for spot checks. */
 const skuFinanceFrom=financeFrom;
 const skuFinanceRows=financeRows.filter(r=>r.financeAttribution==='direct_sku'&&(r.sku||r.article));
-console.log(`SKU finance by-day direct: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; no postings endpoint used`);
+console.log(`SKU finance by-day direct v5.6: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount+bonus+coinvestment; no postings endpoint used`);
 
 /* Exact return quantities */
 const returnFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):HISTORY_START;
@@ -865,6 +877,13 @@ const skuFinanceCoverageComplete=Math.abs(skuFinanceReconcileDelta)<0.01&&Math.a
 console.log(`Aligned business period ${realizedRange.start||'finance-start'}..${realizedRange.end||'finance-end'}; finance rows published=${financeRowsPublished.length}; gross=${finTotals.grossRevenue.toFixed(2)}; net=${finTotals.netAfterOzon.toFixed(2)}`);
 console.log(`Finance ledger: direct SKU rows=${financeDirectRows.length}; unallocated rows=${financeUnallocatedRows.length}; direct gross=${financeDirectGross.toFixed(2)}; direct net=${financeDirectNet.toFixed(2)}; unallocated net=${financeUnallocatedNet.toFixed(2)}; ledger delta=${financeReconcileDelta.toFixed(6)}`);
 console.log(`SKU by-day direct: rows=${skuFinanceRowsPublished.length}; gross=${skuFinanceGross.toFixed(2)}; net=${skuFinanceNet.toFixed(2)}; revenue delta=${skuFinanceRevenueDelta.toFixed(6)}; direct-net delta=${skuFinanceReconcileDelta.toFixed(6)}; coverageComplete=${skuFinanceCoverageComplete}`);
+{
+  const audit5657=skuFinanceRowsPublished.filter(r=>String(r.article)==='5657');
+  if(audit5657.length){
+    const sm=k=>audit5657.reduce((a,r)=>a+asNum(r[k],0),0);
+    console.log(`SKU 5657 finance audit: rows=${audit5657.length}; seller_price=${sm('sellerPriceRaw').toFixed(2)}; sale_amount=${sm('saleAmount').toFixed(2)}; bonus=${sm('bonus').toFixed(2)}; coinvestment=${sm('coinvestment').toFixed(2)}; economic_gross=${sm('grossRevenue').toFixed(2)}; commission=${sm('commission').toFixed(2)}; logistics=${sm('logistics').toFixed(2)}; acquiring=${sm('acquiring').toFixed(2)}; direct_net=${sm('rawAmount').toFixed(2)}`);
+  }
+}
 
 /* Funnel analytics — one request only in daily mode */
 const analyticsSegments=await updateAnalyticsSegments(previous,maps,warnings);
@@ -882,20 +901,20 @@ if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'st
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
   const rr=datasetRange(financeRowsPublished);
-  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'Общий P&L: Seller API /v1/finance/accrual/by-day. seller_price суммируется как отдает Ozon, без умножения на quantity.'},rows:financeRowsPublished});
+  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'Общий P&L: Seller API /v1/finance/accrual/by-day. Валовой доход по товару = sale_amount + bonus + coinvestment; seller_price используется только как диагностический fallback.'},rows:financeRowsPublished});
 }
 if(skuFinanceRowsPublished.length){
   const rr=datasetRange(skuFinanceRowsPublished);
-  datasets.push({id:`api-sku-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'skuFinance',label:'Товарные начисления Ozon API',sheetName:'finance/accrual/by-day · direct SKU',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{skuFinance:true,api:true,directSkuByDay:true,coverageComplete:skuFinanceCoverageComplete,note:'Товарный финансовый вклад считается напрямую из /v1/finance/accrual/by-day: seller_price, комиссия, доставка и item_fees уже привязаны Ozon к SKU. Общие non-item расходы остаются только в P&L бизнеса.'},rows:skuFinanceRowsPublished});
+  datasets.push({id:`api-sku-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'skuFinance',label:'Товарные начисления Ozon API',sheetName:'finance/accrual/by-day · direct SKU',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{skuFinance:true,api:true,directSkuByDay:true,coverageComplete:skuFinanceCoverageComplete,note:'Товарный финансовый вклад считается напрямую из /v1/finance/accrual/by-day: sale_amount + bonus + coinvestment минус прямая комиссия, доставка и item_fees. seller_price хранится только для аудита. Общие non-item расходы остаются только в P&L бизнеса.'},rows:skuFinanceRowsPublished});
 }
 
 const payload={
-  version:4,sourcePolicy:'ozon-api-only',financeAttributionVersion:5,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
+  version:4,sourcePolicy:'ozon-api-only',financeAttributionVersion:6,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
   history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.segments,financeRowsAll:financeRows,skuFinanceRowsAll:skuFinanceRows},
   diagnostics:{
     mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
-    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:5,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
+    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:6,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
     postingRefreshFrom:postingFrom,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
     returnRefreshFrom:returnFrom,returnsApiComplete:returnsComplete,returnsComplete:realization.coverage.complete,returnsFresh:freshReturnRows.length,fbsReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBS').length,fboReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBO').length,returnRows:returnRows.length,
