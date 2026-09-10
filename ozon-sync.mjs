@@ -406,6 +406,19 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         }
         if(qty!=null){row.soldQty+=qty;row.financeQtyResolved++}
         else row.financeQtyUnresolved++;
+      } else if(saleAmount<-0.0005){
+        // v6.5: a negative sale_amount is the monetary reversal of a realized SKU line.
+        // For returns, the shipment quantity is NOT safe (a posting can contain 2 sold
+        // units while only 1 is returned). Infer the reversed unit count from the same
+        // finance unit-price ratio and validate it against official monthly realization.
+        let qty=null;
+        for(const unit of [Math.abs(sellerPrice),Math.abs(salePrice)]){
+          if(unit<=0.0005)continue;
+          const rawQty=Math.abs(saleAmount)/unit,rounded=Math.round(rawQty);
+          if(rounded>0&&Math.abs(rawQty-rounded)<=0.01){qty=rounded;break}
+        }
+        if(qty!=null){row.returnedQty+=qty;row.financeQtyResolved++}
+        else row.financeQtyUnresolved++;
       }
       row.commission+=-money(comm.sale_commission);
 
@@ -673,64 +686,81 @@ function mergeReturnRows(previousRows,freshRows){
 }
 function buildPostingFallbackRealizedRows(financeRows,postingMap,returnRows,maps){
   /*
-    v6.4 daily realized quantity priority:
-      1) explicit product quantity from the matching FBO/FBS posting;
-      2) finance sale_amount / seller_price only when the posting is unavailable;
-      3) returns from the unified returns API.
+    v6.5 daily realized quantity:
+      SALES   -> explicit FBO/FBS posting quantity first; Finance ratio only as fallback.
+      RETURNS -> negative Finance sale_amount / unit price.
 
-    The realization date stays equal to the Finance accrual date, but quantity is
-    taken from the operational posting whenever possible. This avoids treating
-    seller_price as a unit price for multi-unit posting lines.
+    IMPORTANT: /v1/returns/list is a logistics-return feed, not a one-to-one realization
+    feed. Counting every row there as a realized return overcounted June-August heavily
+    (e.g. 123 logistics return units vs 8 official realization returns in June). It is
+    retained in history/audit, but is no longer subtracted from realized quantity.
   */
   const rows=[];
-  let unresolvedSaleOps=0,financeQtyRows=0,postingQtyRows=0;
+  let unresolvedSaleOps=0,unresolvedReturnOps=0,financeQtyRows=0,postingQtyRows=0,financeReturnRows=0;
   const seenPostingQty=new Set();
+  const seenFinanceReturn=new Set();
   const unresolvedExamples=[];
+  const unresolvedReturnExamples=[];
+
   for(const f of financeRows||[]){
     const sale=asNum(first(f.saleAmount,f.grossRevenue),0),date=f.date;
-    if(!date||sale<=0.00001)continue;
+    if(!date||Math.abs(sale)<=0.00001)continue;
     const article=asStr(first(f.article,maps.articleBySku.get(asStr(f.sku)))),sku=asStr(f.sku);
     const pn=asStr(f.postingNumber),posting=pn?postingMap[pn]:null;
 
-    // Preferred path: postings carry an explicit product quantity. Count a given
-    // posting+SKU once on the Finance accrual date even if several accrual rows
-    // refer to the same sale line.
-    if(posting?.products?.length){
-      const matches=posting.products.filter(p=>(sku&&asStr(p.sku)===sku)||(article&&asStr(p.article)===article));
-      if(matches.length){
-        const key=[date,pn,sku||article].join('|');
-        if(!seenPostingQty.has(key)){
-          seenPostingQty.add(key);
-          let pushed=false;
-          for(const p of matches){
-            const a=asStr(first(article,p.article,maps.articleBySku.get(p.sku))),q=Math.max(0,asNum(p.quantity,0));
-            if((!a&&!p.sku)||q<=0)continue;
-            rows.push({date,article:a,sku:asStr(first(sku,p.sku)),name:p.name||'',soldQty:q,returnedQty:0,netQty:q,postingNumber:pn,source:'posting-quantity'});
-            postingQtyRows++;pushed=true;
-          }
-          if(pushed)continue;
-        } else {
-          continue;
+    if(sale>0){
+      // Sales: count posting+SKU once even if several accrual rows refer to it.
+      if(posting?.products?.length){
+        const matches=posting.products.filter(p=>(sku&&asStr(p.sku)===sku)||(article&&asStr(p.article)===article));
+        if(matches.length){
+          const key=[date,pn,sku||article].join('|');
+          if(!seenPostingQty.has(key)){
+            seenPostingQty.add(key);
+            let pushed=false;
+            for(const p of matches){
+              const a=asStr(first(article,p.article,maps.articleBySku.get(p.sku))),q=Math.max(0,asNum(p.quantity,0));
+              if((!a&&!p.sku)||q<=0)continue;
+              rows.push({date,article:a,sku:asStr(first(sku,p.sku)),name:p.name||'',soldQty:q,returnedQty:0,netQty:q,postingNumber:pn,source:'posting-quantity'});
+              postingQtyRows++;pushed=true;
+            }
+            if(pushed)continue;
+          } else continue;
         }
       }
-    }
-
-    // Secondary fallback: keep the Finance ratio only when no usable posting
-    // quantity was found. It is not assumed to be authoritative for multi-unit rows.
-    const directQty=Math.max(0,asNum(f.soldQty,0));
-    if(directQty>0&&(article||sku)){
-      rows.push({date,article,sku,name:asStr(first(maps.nameBySku.get(sku),'')),soldQty:directQty,returnedQty:0,netQty:directQty,postingNumber:pn,source:'finance-ratio-fallback'});
-      financeQtyRows++;
+      const directQty=Math.max(0,asNum(f.soldQty,0));
+      if(directQty>0&&(article||sku)){
+        rows.push({date,article,sku,name:asStr(first(maps.nameBySku.get(sku),'')),soldQty:directQty,returnedQty:0,netQty:directQty,postingNumber:pn,source:'finance-ratio-fallback'});
+        financeQtyRows++;continue;
+      }
+      unresolvedSaleOps++;
+      if(unresolvedExamples.length<20)unresolvedExamples.push({date,postingNumber:pn,sku,article,saleAmount:sale});
       continue;
     }
 
-    unresolvedSaleOps++;
-    if(unresolvedExamples.length<20)unresolvedExamples.push({date,postingNumber:pn,sku,article,saleAmount:sale});
+    // Returns/reversals: never use total shipment quantity. Use the quantity inferred
+    // from the negative finance line, which represents the actual reversed amount.
+    const q=Math.max(0,asNum(f.returnedQty,0));
+    if(q>0&&(article||sku)){
+      // A finance accrual object can yield more than one normalized row; transactionId
+      // keeps genuinely distinct reversal rows while preventing accidental duplicates.
+      const key=asStr(f.transactionId)||[date,pn,sku||article,sale].join('|');
+      if(!seenFinanceReturn.has(key)){
+        seenFinanceReturn.add(key);
+        rows.push({date,article,sku,name:asStr(first(maps.nameBySku.get(sku),'')),soldQty:0,returnedQty:q,netQty:-q,postingNumber:pn,source:'finance-return-quantity'});
+        financeReturnRows++;
+      }
+    }else{
+      unresolvedReturnOps++;
+      if(unresolvedReturnExamples.length<20)unresolvedReturnExamples.push({date,postingNumber:pn,sku,article,saleAmount:sale,sellerPrice:asNum(f.sellerPriceRaw,0),salePrice:asNum(f.salePriceRaw,0)});
+    }
   }
-  for(const r of returnRows||[]){
-    rows.push({date:r.date,article:r.article,sku:r.sku,name:r.name||'',soldQty:0,returnedQty:r.quantity,netQty:-r.quantity,postingNumber:r.postingNumber,source:`returns-${String(r.schema||'').toLowerCase()}`});
-  }
-  return {rows,diagnostics:{unresolvedSaleOps,financeQtyRows,postingQtyRows,unresolvedExamples,returnRows:(returnRows||[]).length,returnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)}};
+
+  return {rows,diagnostics:{
+    unresolvedSaleOps,unresolvedReturnOps,financeQtyRows,postingQtyRows,financeReturnRows,
+    unresolvedExamples,unresolvedReturnExamples,
+    logisticsReturnRows:(returnRows||[]).length,
+    logisticsReturnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)
+  }};
 }
 
 function aggregateRealizedBySku(rows,start,end){
@@ -873,21 +903,23 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   rows.sort((a,b)=>a.date.localeCompare(b.date)||asStr(a.article).localeCompare(asStr(b.article))||asStr(a.sku).localeCompare(asStr(b.sku)));
 
   const monthlyValidation=validateDailyAgainstMonthly(rows,official.segments);
-  const complete=returnsComplete&&reconstructed.diagnostics.unresolvedSaleOps===0&&monthlyValidation.ok;
+  const complete=returnsComplete&&reconstructed.diagnostics.unresolvedSaleOps===0&&reconstructed.diagnostics.unresolvedReturnOps===0&&monthlyValidation.ok;
   if(!monthlyValidation.ok){
     const bad=monthlyValidation.months.filter(x=>!x.ok).map(x=>`${x.month}: net Δ ${x.netDelta}, SKU |Δ| ${x.absSkuDelta}`).join('; ');
     warnings.push(`Daily quantity monthly reconciliation failed: ${bad||'no official closed month available'}`);
   }
   if(reconstructed.diagnostics.unresolvedSaleOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedSaleOps} sale postings could not be resolved to product quantities.`);
-  console.log(`Daily quantity layer v6.4 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
+  if(reconstructed.diagnostics.unresolvedReturnOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedReturnOps} negative finance rows could not be resolved to return quantities.`);
+  console.log(`Daily quantity layer v6.5 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingQtyRows=${reconstructed.diagnostics.postingQtyRows||0}; financeReturnRows=${reconstructed.diagnostics.financeReturnRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; unresolvedReturnRows=${reconstructed.diagnostics.unresolvedReturnOps||0}; logisticsReturnRowsAudit=${reconstructed.diagnostics.logisticsReturnRows||0}; returnsApiComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
   for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: sold=${m.dailySold}/${m.officialSold} (Δ${m.soldDelta}); returns=${m.dailyReturned}/${m.officialReturned} (Δ${m.returnDelta}); net=${m.dailyNet}/${m.officialNet} (Δ${m.netDelta}); absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
   if(reconstructed.diagnostics.unresolvedExamples?.length)console.log('Unresolved sale examples:',JSON.stringify(reconstructed.diagnostics.unresolvedExamples));
+  if(reconstructed.diagnostics.unresolvedReturnExamples?.length)console.log('Unresolved return examples:',JSON.stringify(reconstructed.diagnostics.unresolvedReturnExamples));
   return {
     rows,
     segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day quantity + historical posting fallback + returns; official daily override',rows}],
     officialSegments:official.segments,
     coverage:{start:BUSINESS_START,end:targetEnd,complete,gaps:[]},
-    diagnostics:{monthlyLoaded:official.diagnostics.monthlyLoaded,dailyLoaded:official.diagnostics.dailyLoaded,dailyPremiumAvailable:official.diagnostics.dailyPremiumAvailable,fallbackUnresolvedSaleOps:reconstructed.diagnostics.unresolvedSaleOps,financeQtyRows:reconstructed.diagnostics.financeQtyRows||0,postingQtyRows:reconstructed.diagnostics.postingQtyRows||0,monthlyValidation}
+    diagnostics:{monthlyLoaded:official.diagnostics.monthlyLoaded,dailyLoaded:official.diagnostics.dailyLoaded,dailyPremiumAvailable:official.diagnostics.dailyPremiumAvailable,fallbackUnresolvedSaleOps:reconstructed.diagnostics.unresolvedSaleOps,fallbackUnresolvedReturnOps:reconstructed.diagnostics.unresolvedReturnOps||0,financeQtyRows:reconstructed.diagnostics.financeQtyRows||0,postingQtyRows:reconstructed.diagnostics.postingQtyRows||0,financeReturnRows:reconstructed.diagnostics.financeReturnRows||0,monthlyValidation}
   };
 }
 
