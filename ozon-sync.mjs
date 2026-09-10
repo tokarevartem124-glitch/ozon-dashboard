@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (schema v5.5 direct SKU finance from by-day)
+  Ozon Seller Analytics — API-only sync (schema v6.0 arbitrary daily business periods)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -31,6 +31,8 @@ const FINANCE_LOOKBACK_DAYS = Math.max(1, Number(process.env.FINANCE_LOOKBACK_DA
 const POSTING_LOOKBACK_DAYS = Math.max(7, Number(process.env.POSTING_LOOKBACK_DAYS || 35));
 const RETURN_LOOKBACK_DAYS = Math.max(7, Number(process.env.RETURN_LOOKBACK_DAYS || 35));
 const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
+const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
+const DAILY_QTY_VERSION = 1;
 const ANALYTICS_MAX_CATCHUP_DAYS = Math.max(1, Number(process.env.ANALYTICS_MAX_CATCHUP_DAYS || 7));
 
 if (!CLIENT_ID || !API_KEY) throw new Error('Missing OZON_CLIENT_ID or OZON_API_KEY');
@@ -46,7 +48,10 @@ const minDateStr = (...x) => x.filter(Boolean).sort()[0] || null;
 const maxDateStr = (...x) => x.filter(Boolean).sort().at(-1) || null;
 const TODAY = isoDate(new Date());
 const YESTERDAY = addDays(TODAY,-1);
-const HISTORY_START = addDays(TODAY,-(HISTORY_DAYS-1));
+// The dashboard must retain every day from the business baseline, even after the rolling lookback moves forward.
+const HISTORY_START = minDateStr(BUSINESS_START, addDays(TODAY,-(HISTORY_DAYS-1)));
+const rfc3339Start = d => `${String(d).slice(0,10)}T00:00:00.000Z`;
+const rfc3339End = d => `${String(d).slice(0,10)}T23:59:59.999Z`;
 const ymd = s => { const [y,m,d]=String(s).slice(0,10).split('-').map(Number); return {y,m,d}; };
 const monthStart = s => `${String(s).slice(0,7)}-01`;
 const monthEnd = s => { const {y,m}=ymd(s); return isoDate(new Date(Date.UTC(y,m,0))); };
@@ -535,8 +540,8 @@ async function fetchFboPostings(fromDate,toDate){
     for(let guard=0;guard<1000;guard++){
       const r=await post('/v3/posting/fbo/list',{
         cursor,
-        filter:{posting_number:[],order_number:[],since:from,to,status:[]},
-        limit:100,sort_dir:'asc',translit:false,
+        filter:{posting_number:[],order_number:[],since:rfc3339Start(from),to:rfc3339End(to),status:[]},
+        limit:1000,sort_dir:'asc',translit:false,
         with:{analytics_data:false,financial_data:false,legal_info:false}
       },{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
@@ -545,7 +550,7 @@ async function fetchFboPostings(fromDate,toDate){
       const next=asStr(first(r.cursor,r?.result?.cursor));
       const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
       if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;
+      cursor=next;await sleep(400);
     }
   } return [...byNumber.values()];
 }
@@ -558,9 +563,9 @@ async function fetchFbsPostings(fromDate,toDate){
         sort_dir:'asc',
         filter:{
           order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
-          order_id:0,since:from,to,status:[],provider_ids:[],warehouse_ids:[]
+          order_id:0,since:rfc3339Start(from),to:rfc3339End(to),status:[],provider_ids:[],warehouse_ids:[]
         },
-        limit:100,cursor,
+        limit:1000,cursor,
         with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
       },{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
@@ -569,7 +574,7 @@ async function fetchFbsPostings(fromDate,toDate){
       const next=asStr(first(r.cursor,r?.result?.cursor));
       const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
       if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;
+      cursor=next;await sleep(400);
     }
   } return [...byNumber.values()];
 }
@@ -578,8 +583,13 @@ function normalizePostingMap(postings){
   for(const p of postings||[]){
     const num=asStr(p.posting_number);if(!num)continue;
     out[num]={
-      postingNumber:num,status:asStr(p.status),createdAt:asStr(first(p.created_at,p.in_process_at,p.shipment_date,p.delivering_date)),
-      products:(p.products||[]).map(x=>({article:asStr(x.offer_id),sku:asStr(x.sku),name:asStr(x.name),quantity:Math.max(0,asNum(x.quantity,0)),price:asNum(x.price,NaN)})).filter(x=>x.article||x.sku)
+      postingNumber:num,status:asStr(first(p.status,p.status_alias)),createdAt:asStr(first(p.created_at,p.in_process_at,p.delivering_date,p.shipment_date)),
+      products:(p.products||[]).map(x=>({
+        article:asStr(first(x.offer_id,x.product_offer_id)),
+        sku:asStr(first(x.sku,x.product_id)),
+        name:asStr(first(x.name,x.product_name)),
+        quantity:Math.max(0,asNum(x.quantity,0)),price:asNum(x.price,NaN)
+      })).filter(x=>x.article||x.sku)
     };
   } return out;
 }
@@ -658,6 +668,30 @@ function buildPostingFallbackRealizedRows(financeRows,postingMap,returnRows,maps
 }
 
 
+function aggregateRealizedBySku(rows,start,end){
+  const by=new Map();
+  for(const r of rows||[]){
+    if(start&&r.date<start)continue;if(end&&r.date>end)continue;
+    const k=[asStr(r.article),asStr(r.sku)].join('|');
+    const o=by.get(k)||{article:asStr(r.article),sku:asStr(r.sku),soldQty:0,returnedQty:0,netQty:0};
+    o.soldQty+=asNum(r.soldQty,0);o.returnedQty+=asNum(r.returnedQty,0);o.netQty+=asNum(r.netQty,0);by.set(k,o);
+  }
+  return by;
+}
+function validateDailyAgainstMonthly(dailyRows,officialSegments){
+  const months=[];let totalAbsSkuDelta=0,totalNetDelta=0,ok=true;
+  for(const seg of (officialSegments||[]).filter(s=>s.kind==='monthly'&&s.official!==false)){
+    const a=aggregateRealizedBySku(dailyRows,seg.start,seg.end),b=aggregateRealizedBySku(seg.rows||[]);
+    const keys=new Set([...a.keys(),...b.keys()]);let absSkuDelta=0;
+    for(const k of keys)absSkuDelta+=Math.abs(asNum(a.get(k)?.netQty,0)-asNum(b.get(k)?.netQty,0));
+    const dailyNet=[...a.values()].reduce((z,r)=>z+r.netQty,0),officialNet=[...b.values()].reduce((z,r)=>z+r.netQty,0);
+    const netDelta=dailyNet-officialNet;totalAbsSkuDelta+=absSkuDelta;totalNetDelta+=netDelta;
+    const monthOk=Math.abs(netDelta)<0.001&&absSkuDelta<0.001;ok=ok&&monthOk;
+    months.push({month:monthKey(seg.start),dailyNet,officialNet,netDelta,absSkuDelta,ok:monthOk});
+  }
+  return {ok:months.length>0&&ok,months,totalAbsSkuDelta,totalNetDelta};
+}
+
 /* -------------------------- official realization ---------------------- */
 function realizationMonthBounds(ym){
   const start=`${ym}-01`,end=monthEnd(start);return {start,end};
@@ -709,7 +743,7 @@ function realizationCoverage(segments){
   }
   return {start,end,complete:complete&&gaps.length===0,gaps};
 }
-async function updateRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings){
+async function updateOfficialRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings){
   const map=segmentMap(previous?.history?.realizationSegments||[]);
   const closed=closedMonthKeys(HISTORY_START,TODAY);
   let monthlyLoaded=0,dailyLoaded=0,dailyPremiumAvailable=true,fallbackDiag={unresolvedSaleOps:0};
@@ -750,6 +784,42 @@ async function updateRealizationSegments(previous,maps,financeRows,postingMap,re
   const coverage=realizationCoverage(segments);
   const rows=segments.flatMap(s=>(s.rows||[]).map(r=>({...r,segmentKey:s.key,segmentSource:s.source,segmentOfficial:s.official!==false})));
   return {segments,rows,coverage,diagnostics:{monthlyLoaded,dailyLoaded,dailyPremiumAvailable,fallbackUnresolvedSaleOps:fallbackDiag.unresolvedSaleOps||0}};
+}
+
+async function buildDailyBusinessRealization(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings){
+  // Keep official monthly reports (and current-month official daily rows where available) only as a control layer.
+  const official=await updateOfficialRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings);
+  const targetEnd=YESTERDAY;
+  const financeSlice=(financeRows||[]).filter(r=>r.date>=BUSINESS_START&&r.date<=targetEnd);
+  const returnSlice=(returnRows||[]).filter(r=>r.date>=BUSINESS_START&&r.date<=targetEnd);
+  const reconstructed=buildPostingFallbackRealizedRows(financeSlice,postingMap,returnSlice,maps);
+  let rows=(reconstructed.rows||[]).filter(r=>r.date>=BUSINESS_START&&r.date<=targetEnd);
+
+  // Where Premium daily realization is available, it is the authoritative quantity source for that day.
+  const officialDaily=(official.segments||[]).filter(s=>s.kind==='daily'&&s.official!==false&&s.start>=BUSINESS_START&&s.end<=targetEnd);
+  const officialDates=new Set(officialDaily.map(s=>s.start));
+  if(officialDates.size){
+    rows=rows.filter(r=>!officialDates.has(r.date));
+    for(const seg of officialDaily)for(const r of seg.rows||[])rows.push({...r,date:seg.start,periodStart:seg.start,periodEnd:seg.end,source:'finance-realization-by-day',granularity:'day',official:true});
+  }
+  rows.sort((a,b)=>a.date.localeCompare(b.date)||asStr(a.article).localeCompare(asStr(b.article))||asStr(a.sku).localeCompare(asStr(b.sku)));
+
+  const monthlyValidation=validateDailyAgainstMonthly(rows,official.segments);
+  const complete=returnsComplete&&reconstructed.diagnostics.unresolvedSaleOps===0&&monthlyValidation.ok;
+  if(!monthlyValidation.ok){
+    const bad=monthlyValidation.months.filter(x=>!x.ok).map(x=>`${x.month}: net Δ ${x.netDelta}, SKU |Δ| ${x.absSkuDelta}`).join('; ');
+    warnings.push(`Daily quantity monthly reconciliation failed: ${bad||'no official closed month available'}`);
+  }
+  if(reconstructed.diagnostics.unresolvedSaleOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedSaleOps} sale postings could not be resolved to product quantities.`);
+  console.log(`Daily quantity layer ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; unresolvedSalePostings=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
+  for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: dailyNet=${m.dailyNet}; officialNet=${m.officialNet}; netDelta=${m.netDelta}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
+  return {
+    rows,
+    segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day + posting quantities + returns; official daily override',rows}],
+    officialSegments:official.segments,
+    coverage:{start:BUSINESS_START,end:targetEnd,complete,gaps:[]},
+    diagnostics:{monthlyLoaded:official.diagnostics.monthlyLoaded,dailyLoaded:official.diagnostics.dailyLoaded,dailyPremiumAvailable:official.diagnostics.dailyPremiumAvailable,fallbackUnresolvedSaleOps:reconstructed.diagnostics.unresolvedSaleOps,monthlyValidation}
+  };
 }
 
 /* ------------------------------- analytics ---------------------------- */
@@ -812,11 +882,13 @@ const priceRows=freshPrice.length?freshPrice:(previousPrice?.rows||[]);
 if(!stockComplete)warnings.push(`Stock refresh incomplete ${freshStock.length}/${products.length}; previous API stock kept.`);
 if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kept.');
 
-/* Posting lists are kept only for the open-month realization fallback.
-   They are NOT used to infer finance quantities anymore. */
+/* Daily quantity layer uses posting product quantities, keyed to the exact Finance by-day sale date.
+   v6 performs a one-time full posting backfill; later runs refresh only the recent window. */
 const financeAttributionUpgrade=previous?.financeAttributionVersion!==7;
-const postingFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):HISTORY_START;
-console.log(`Posting fallback refresh ${postingFrom}..${TODAY}; attributionUpgrade=${financeAttributionUpgrade}`);
+const dailyQuantityUpgrade=previous?.diagnostics?.dailyQuantityVersion!==DAILY_QTY_VERSION;
+const postingBackfillStart=addDays(BUSINESS_START,-45);
+const postingFrom=dailyQuantityUpgrade?postingBackfillStart:(previous?maxDateStr(postingBackfillStart,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):postingBackfillStart);
+console.log(`Posting quantity refresh ${postingFrom}..${TODAY}; dailyQuantityUpgrade=${dailyQuantityUpgrade}`);
 let freshFbo=[],freshFbs=[];
 try{freshFbo=await fetchFboPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBO postings: ${e}`)}
 try{freshFbs=await fetchFbsPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBS postings: ${e}`)}
@@ -842,17 +914,17 @@ console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${finance
    because Ozon rate-limits it heavily and it is better suited for spot checks. */
 const skuFinanceFrom=financeFrom;
 const skuFinanceRows=financeRows.filter(r=>r.financeAttribution==='direct_sku'&&(r.sku||r.article));
-console.log(`SKU finance by-day direct v5.8: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
+console.log(`SKU finance by-day direct v6.0: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
 
-/* Exact return quantities */
-const returnFrom=previous?maxDateStr(HISTORY_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):HISTORY_START;
+/* Exact return quantities. v6 backfills from the business baseline once, then refreshes recent returns. */
+const returnFrom=dailyQuantityUpgrade?BUSINESS_START:(previous?maxDateStr(BUSINESS_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):BUSINESS_START);
 let freshReturns=[],returnsComplete=true;
 try{freshReturns=await fetchUnifiedReturns(returnFrom,TODAY)}catch(e){returnsComplete=false;warnings.push(`Returns: ${e}`)}
-const freshReturnRows=normalizeReturnRows(freshReturns,maps).filter(r=>r.date>=HISTORY_START&&r.date<=TODAY);
+const freshReturnRows=normalizeReturnRows(freshReturns,maps).filter(r=>r.date>=BUSINESS_START&&r.date<=TODAY);
 const returnRows=returnsComplete?mergeReturnRows(previousReturnRows,freshReturnRows):previousReturnRows;
-const realization=await updateRealizationSegments(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings);
+const realization=await buildDailyBusinessRealization(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings);
 const realizedRange={start:realization.coverage.start,end:realization.coverage.end};
-console.log(`Realization segments=${realization.segments.length}; rows=${realization.rows.length}; coverage=${realizedRange.start||'none'}..${realizedRange.end||'none'}; complete=${realization.coverage.complete}; monthlyLoaded=${realization.diagnostics.monthlyLoaded}; dailyLoaded=${realization.diagnostics.dailyLoaded}; dailyPremium=${realization.diagnostics.dailyPremiumAvailable}`);
+console.log(`Daily realization rows=${realization.rows.length}; coverage=${realizedRange.start||'none'}..${realizedRange.end||'none'}; complete=${realization.coverage.complete}; monthlyLoaded=${realization.diagnostics.monthlyLoaded}; dailyOfficialLoaded=${realization.diagnostics.dailyLoaded}; dailyPremium=${realization.diagnostics.dailyPremiumAvailable}`);
 
 // Publish finance and exact SKU accruals on exactly the same date range as quantity realization.
 const financeRowsPublished=(realizedRange.start&&realizedRange.end)?financeRows.filter(r=>r.date>=realizedRange.start&&r.date<=realizedRange.end):financeRows;
@@ -894,7 +966,7 @@ const dailyRealizationSegments=realization.segments.filter(s=>s.kind==='daily'&&
 const dailyRealizationStart=dailyRealizationSegments.map(s=>s.start).filter(Boolean).sort()[0]||null;
 const dailyRealizationEnd=dailyRealizationSegments.map(s=>s.end).filter(Boolean).sort().at(-1)||null;
 if(funnelRows.length)datasets.push({id:`api-funnel-${salesStart}_${salesEnd}`,apiAuto:true,type:'funnel',label:'Воронка Ozon API',sheetName:'analytics/data',sourceName:'Ozon Seller API',start:salesStart,end:salesEnd,snapshot:null,importedAt:generatedAt,capabilities:{funnel:true,api:true,topTrafficDetail:true,periodSegmented:true,note:'Для SKU детализация до 1000 товаров с наибольшим трафиком на каждом сегменте.'},rows:funnelRows});
-if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Реализованное количество Ozon API',sheetName:'posting fbo/fbs + finance',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthly:true,dailyCurrent:true,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:dailyRealizationStart,dailyCoverageEnd:dailyRealizationEnd},rows:realization.rows});
+if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Реализованное количество Ozon API',sheetName:'daily quantity: finance by-day + posting quantities + returns',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthlyValidation:true,dailyArbitrary:true,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
 if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'stock',label:'Остатки Ozon API',sheetName:stockComplete?stockResult.source:(previousStock?.sheetName||'previous API snapshot'),sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{stock:true,prices:true,api:true,complete:stockComplete},rows:stockRows});
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
@@ -906,17 +978,19 @@ if(skuFinanceRowsPublished.length){
   datasets.push({id:`api-sku-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'skuFinance',label:'Товарные начисления Ozon API',sheetName:'finance/accrual/by-day · direct SKU',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{skuFinance:true,api:true,directSkuByDay:true,coverageComplete:skuFinanceCoverageComplete,note:'Товарный финансовый вклад считается напрямую из /v1/finance/accrual/by-day: sale_amount минус прямая комиссия, доставка и item_fees. bonus и coinvestment уже включены в sale_amount и хранятся только для аудита; seller_price хранится только для аудита. Общие non-item расходы остаются только в P&L бизнеса.'},rows:skuFinanceRowsPublished});
 }
 
+const persistedDailyQuantityVersion=realization.coverage.complete?DAILY_QTY_VERSION:(previous?.diagnostics?.dailyQuantityVersion||0);
+
 const payload={
   version:4,sourcePolicy:'ozon-api-only',financeAttributionVersion:7,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
-  history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.segments,financeRowsAll:financeRows,skuFinanceRowsAll:skuFinanceRows},
+  history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.officialSegments,financeRowsAll:financeRows,skuFinanceRowsAll:skuFinanceRows},
   diagnostics:{
-    mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,
+    mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,businessStart:BUSINESS_START,dailyQuantityVersion:persistedDailyQuantityVersion,dailyQuantityUpgrade,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
     financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:7,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
     postingRefreshFrom:postingFrom,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
     returnRefreshFrom:returnFrom,returnsApiComplete:returnsComplete,returnsComplete:realization.coverage.complete,returnsFresh:freshReturnRows.length,fbsReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBS').length,fboReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBO').length,returnRows:returnRows.length,
-    realizedRows:realization.rows.length,unresolvedSaleOps:realization.coverage.complete?0:realization.diagnostics.fallbackUnresolvedSaleOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,
+    realizedRows:realization.rows.length,unresolvedSaleOps:realization.diagnostics.fallbackUnresolvedSaleOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,dailyQuantityMonthlyValidation:realization.diagnostics.monthlyValidation,
     analyticsSegments:analyticsSegments.length,analyticsCoverage:{from:salesStart,to:salesEnd},analyticsRows:salesRows.length,analyticsSegmentRows:funnelRows.length,analyticsLatestSkuDetailTruncated:Boolean(analyticsSegments.at(-1)?.skuDetailTruncated),
     warnings
   }
@@ -924,6 +998,6 @@ const payload={
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day; /accrual/postings is not used for bulk sync.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. Daily quantities from 2026-06-01 are reconstructed from Finance sale dates + FBO/FBS posting quantities + returns and reconciled to official monthly realization.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
