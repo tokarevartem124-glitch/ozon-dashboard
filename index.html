@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v8.5-unmatched-return-diagnostics-2026-09-10";
+    window.__OZON_DASHBOARD_BUILD__ = "v8.6-proven-preperiod-returns-2026-09-10";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — API-only v8.5</title>
+  <title>Ozon Seller Analytics — API-only v8.6</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v8.5</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v8.6</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -1146,7 +1146,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v8.5</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v8.6</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1181,7 +1181,7 @@ function renderQuality(){
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
   const exactDelivery=q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage);
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v8.5.</b> Ozon — <b>только Seller API</b>. 
+  $('#dataQuality').innerHTML=`<b>Контроль данных v8.6.</b> Ozon — <b>только Seller API</b>. 
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
     <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — только фактически доставленные за выбранный период заказы; будущие возвраты ретроспективно уменьшают исходную доставку.
     <b>Расходы Ozon:</b> ${fmtMoney(m.financeOzonExpenses)} — по датам начислений Finance API; после Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
