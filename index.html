@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v8.7-canonical-order-dates-2026-09-10";
+    window.__OZON_DASHBOARD_BUILD__ = "v8.8-delivered-revenue-2026-09-10";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — API-only v8.7</title>
+  <title>Ozon Seller Analytics — API-only v8.8</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v8.7</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v8.8</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -393,8 +393,17 @@ function fmtMoney(v){return Number.isFinite(v)?new Intl.NumberFormat('ru-RU',{st
 function fmtNum(v,d=0){return Number.isFinite(v)?new Intl.NumberFormat('ru-RU',{maximumFractionDigits:d,minimumFractionDigits:d}).format(v):'нет данных'}
 function fmtPct(v,d=1){return Number.isFinite(v)?fmtNum(v,d)+'%':'нет данных'}
 function isoDate(d){if(!d)return null; const x=new Date(d); if(isNaN(x))return null; return x.toISOString().slice(0,10)}
-function parseRuDate(s){const m=String(s||'').match(/(\d{2})\.(\d{2})\.(\d{4})/);return m?`${m[3]}-${m[2]}-${m[1]}`:null}
-function dateLabel(iso){if(!iso)return 'дата не определена'; return new Date(iso+'T12:00:00').toLocaleDateString('ru-RU')}
+function parseRuDate(s){const m=String(s||'').match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);return m?`${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`:null}
+function canonicalDate(v){
+  if(v==null||v==='')return null;
+  if(v instanceof Date&&!isNaN(v))return isoDate(v);
+  const s=String(v).trim();
+  let m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if(m)return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+  const ru=parseRuDate(s);if(ru)return ru;
+  const x=new Date(s);return isNaN(x)?null:isoDate(x);
+}
+function dateLabel(v){const iso=canonicalDate(v);if(!iso)return '—';return new Date(iso+'T12:00:00').toLocaleDateString('ru-RU')}
 function rangeLabel(ds){return ds.start&&ds.end?`${dateLabel(ds.start)} — ${dateLabel(ds.end)}`:ds.snapshot?`срез ${dateLabel(ds.snapshot)}`:'без периода'}
 function daysInclusive(a,b){if(!a||!b)return null;return Math.max(1,Math.round((new Date(b)-new Date(a))/86400000)+1)}
 const addDays = window.addDays;
@@ -785,8 +794,8 @@ function buildModel(){
   function addOrderEvent(o,r,withQty=false){
     const postingNumber=String(r.postingNumber||'').trim(),orderNumber=String(r.orderNumber||'').trim();
     if(!postingNumber&&!orderNumber)return;
-    const deliveryDate=withQty?String(r.deliveryDate||r.date||'').slice(0,10):'';
-    const orderDate=String(r.orderDate||'').slice(0,10),financeDate=!withQty?String(r.date||'').slice(0,10):'';
+    const deliveryDate=withQty?(canonicalDate(r.deliveryDate||r.date)||''):'';
+    const orderDate=canonicalDate(r.orderDate)||'',financeDate=!withQty?(canonicalDate(r.date)||''):'';
     let e=null,key='';
     // A Finance row is an expense event on its own accrual date. It may enrich an
     // already-present delivered order, but must never overwrite/create a fake delivery date.
@@ -1146,7 +1155,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v8.7</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v8.8</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1181,7 +1190,7 @@ function renderQuality(){
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
   const exactDelivery=q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage);
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v8.7.</b> Ozon — <b>только Seller API</b>. 
+  $('#dataQuality').innerHTML=`<b>Контроль данных v8.8.</b> Ozon — <b>только Seller API</b>. 
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
     <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — только фактически доставленные за выбранный период заказы; будущие возвраты ретроспективно уменьшают исходную доставку.
     <b>Расходы Ozon:</b> ${fmtMoney(m.financeOzonExpenses)} — по датам начислений Finance API; после Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
@@ -1563,7 +1572,7 @@ function drillDefinition(type,payload={}){
   const number=(key,label,d=0)=>({key,label,fmt:p=>fmtNum(typeof key==='function'?key(p):p[key],d),cls:'num'});
   const percent=(key,label)=>({key,label,fmt:p=>fmtPct(typeof key==='function'?key(p):p[key]),cls:'num'});
   let def={type,title:'Детализация',subtitle:`Период: ${drillPeriodText()}`,kind:'products',rows:[],columns:cols,sort:'revenue',dir:-1,note:'',stats:[]};
-  if(type==='revenue')Object.assign(def,{title:'Выручка Ozon — товары',rows:m.products.filter(p=>Math.abs(safe(p.revenue))>.005),columns:[...cols,number('units','Реализовано, шт.'),money('revenue','Выручка'),percent('revenueShare','Доля')],sort:'revenue',stats:[{label:'Выручка',value:fmtMoney(m.totalRevenue)},{label:'SKU с выручкой',value:fmtNum(m.products.filter(p=>p.revenue>0).length)},{label:'Период',value:drillPeriodText()}]});
+  if(type==='revenue')Object.assign(def,{title:'Выручка Ozon — фактически доставленные товары',rows:m.products.filter(p=>Math.abs(safe(p.revenue))>.005),columns:[...cols,number('units','Реализовано, шт.'),money('revenue','Выручка'),percent('revenueShare','Доля')],sort:'revenue',stats:[{label:'Выручка доставок',value:fmtMoney(m.totalRevenue)},{label:'SKU с выручкой',value:fmtNum(m.products.filter(p=>p.revenue>0).length)},{label:'Доставлено net, шт.',value:fmtNum(sum(m.products,p=>Math.max(0,safe(p.units))),0)},{label:'Заказов / отправлений',value:fmtNum(new Set((m.orderRows||[]).filter(r=>safe(r.revenue)>0).map(r=>r.orderNumber||r.postingNumber).filter(Boolean)).size)},{label:'Период доставки',value:drillPeriodText()}]});
   else if(type==='ozonNet')Object.assign(def,{title:'После услуг Ozon — расшифровка по товарам',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Выручка доставок',value:fmtMoney(m.totalRevenue)},{label:'Расходы Ozon по Finance-дате',value:fmtMoney(m.financeOzonExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Операции без SKU не распределяются по товарам и учитываются только в общем P&L. Товарная экономика использует только прямые SKU-начисления.'});
   else if(type==='external')Object.assign(def,{title:'Внешние расходы вне Ozon',kind:'external',stats:[{label:'Всего',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),cls:ext?.complete?'':'warning'},{label:'Репрайсер',value:fmtMoney(ext?.repricer)},{label:'Премии магазинам',value:fmtMoney(ext?.storeBonus)},{label:'Наёмная логистика',value:fmtMoney(ext?.hiredKnown)}],note:'Это расходы бизнеса, которых нет в кабинете Ozon. Они не распределяются на SKU и учитываются только на уровне общего P&L.'});
   else if(type==='management')Object.assign(def,{title:'Управленческий остаток — состав',kind:'management',stats:[{label:'После Ozon',value:fmtMoney(m.afterOzon)},{label:'Внешние расходы',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown)},{label:'Управленческий остаток',value:m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),cls:ext?.complete?'positive':'warning'}],note:'Управленческий остаток = выручка фактически доставленных и не возвращённых товаров − расходы Ozon, начисленные Finance API в выбранном периоде − внешние операционные расходы. Закупка и УСН здесь ещё не вычтены.'});
