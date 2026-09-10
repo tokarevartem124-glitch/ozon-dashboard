@@ -555,42 +555,58 @@ async function fetchPostingPages(endpoint,bodyFactory,fromDate,toDate,label){
   const byNumber=new Map();
   let totalPages=0;
   for(const [from,to] of monthChunks(fromDate,toDate)){
-    let cursor='',pages=0;
+    let cursor='',pages=0,chunkRows=0;
     for(let guard=0;guard<5000;guard++){
-      const r=await post(endpoint,bodyFactory(from,to,cursor),{allowError:true,retries:2});
+      const body=bodyFactory(from,to,cursor);
+      const r=await post(endpoint,body,{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
-      const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
-      pages++;totalPages++;
+      const root=(r?.result&&typeof r.result==='object')?r.result:r;
+      const batch=Array.isArray(root?.postings)?root.postings:[];
+      pages++;totalPages++;chunkRows+=batch.length;
       for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
 
-      const next=asStr(first(r.cursor,r?.result?.cursor));
-      const hasNextRaw=first(r.has_next,r?.result?.has_next);
+      // Diagnostic only: if a supposedly historical interval is empty, print the
+      // actual response shape. This lets us distinguish an API filter issue from
+      // a parser/pagination issue without exposing order/product data.
+      if(pages===1&&batch.length===0){
+        console.log(`${label} empty first page ${from.slice(0,10)}..${to.slice(0,10)}; responseKeys=${Object.keys(r||{}).join(',')}; rootKeys=${Object.keys(root||{}).join(',')}; cursorPresent=${Boolean(root?.cursor)}; hasNext=${String(root?.has_next)}`);
+      }
+
+      const next=asStr(root?.cursor);
+      const hasNextRaw=root?.has_next;
       const hasNext=hasNextRaw===undefined||hasNextRaw===null ? batch.length===100 : Boolean(hasNextRaw);
       if(!batch.length||!next||next===cursor||!hasNext)break;
       cursor=next;
       await sleep(700);
     }
-    console.log(`${label} postings chunk ${from.slice(0,10)}..${to.slice(0,10)}: pages=${pages}; cumulative unique=${byNumber.size}`);
+    console.log(`${label} postings chunk ${from.slice(0,10)}..${to.slice(0,10)}: pages=${pages}; rows=${chunkRows}; cumulative unique=${byNumber.size}`);
   }
   console.log(`${label} postings complete ${fromDate}..${toDate}: pages=${totalPages}; unique=${byNumber.size}`);
   return [...byNumber.values()];
 }
 async function fetchFboPostings(fromDate,toDate){
+  // Keep the request minimal. Optional empty arrays (posting_number/order_number/status)
+  // are intentionally omitted: some live API revisions treat an explicitly empty
+  // filter differently from an absent filter and can return an empty set.
   return fetchPostingPages('/v3/posting/fbo/list',(from,to,cursor)=>({
     cursor,
-    filter:{posting_number:[],order_number:[],since:rfc3339Start(from),to:rfc3339End(to),status:[]},
-    limit:100,sort_dir:'asc',translit:false,
+    filter:{since:rfc3339Start(from),to:rfc3339End(to)},
+    limit:100,
+    sort_dir:'asc',
+    translit:false,
     with:{analytics_data:false,financial_data:false,legal_info:false}
   }),fromDate,toDate,'FBO');
 }
 async function fetchFbsPostings(fromDate,toDate){
+  // Same rule for FBS v4: only the required date window is sent in filter.
+  // Do not send order_id:0, empty status/provider/warehouse arrays or an empty
+  // last_changed_status_date object during historical backfill.
   return fetchPostingPages('/v4/posting/fbs/list',(from,to,cursor)=>({
     sort_dir:'asc',
-    filter:{
-      order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
-      order_id:0,since:rfc3339Start(from),to:rfc3339End(to),status:[],provider_ids:[],warehouse_ids:[]
-    },
-    limit:100,cursor,
+    filter:{since:rfc3339Start(from),to:rfc3339End(to)},
+    limit:100,
+    cursor,
+    translit:false,
     with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
   }),fromDate,toDate,'FBS');
 }
@@ -855,7 +871,7 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
     warnings.push(`Daily quantity monthly reconciliation failed: ${bad||'no official closed month available'}`);
   }
   if(reconstructed.diagnostics.unresolvedSaleOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedSaleOps} sale postings could not be resolved to product quantities.`);
-  console.log(`Daily quantity layer v6.2 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
+  console.log(`Daily quantity layer v6.3 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
   for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: dailyNet=${m.dailyNet}; officialNet=${m.officialNet}; netDelta=${m.netDelta}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
   return {
     rows,
@@ -926,7 +942,7 @@ const priceRows=freshPrice.length?freshPrice:(previousPrice?.rows||[]);
 if(!stockComplete)warnings.push(`Stock refresh incomplete ${freshStock.length}/${products.length}; previous API stock kept.`);
 if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kept.');
 
-/* v6.2: Finance remains the accounting source. Postings are the authoritative
+/* v6.3: Finance remains the accounting source. Postings are the authoritative
    fallback for exact product quantity whenever Finance cannot infer it.
    IMPORTANT: while the daily layer has not reconciled, backfill shipment history
    from just before BUSINESS_START instead of limiting the repair to recent days. */
