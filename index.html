@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v6.1-finance-quantity-2026-09-10";
+    window.__OZON_DASHBOARD_BUILD__ = "v7.1-ui-functional-2026-09-10";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — API-only v6.1</title>
+  <title>Ozon Seller Analytics — API-only v7.1</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v6.1</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v7.1</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -648,7 +648,10 @@ function activeDatasets(type){
   return list.filter(d=>d.start&&d.end&&d.start<=p.end&&d.end>=p.start);
 }
 function latestSnapshot(type){
-  const p=selectedPeriod();let list=state.datasets.filter(d=>d.type===type);if(p)list=list.filter(d=>!d.snapshot||d.snapshot<=p.end);return list.sort((a,b)=>String(a.snapshot||a.importedAt).localeCompare(String(b.snapshot||b.importedAt))).at(-1)||null;
+  // Cost/RRP are current 1C reference data, not period transactions.  A July/August
+  // analytics period must still use the latest loaded 1C reference snapshot.
+  const list=state.datasets.filter(d=>d.type===type);
+  return list.sort((a,b)=>String(a.snapshot||a.importedAt).localeCompare(String(b.snapshot||b.importedAt))).at(-1)||null;
 }
 function authoritativeDatasets(type){
   const list=activeDatasets(type);
@@ -656,9 +659,10 @@ function authoritativeDatasets(type){
   return api.length?api:list;
 }
 function authoritativeSnapshot(type){
-  const p=selectedPeriod();let list=state.datasets.filter(d=>d.type===type);
+  // Stock and catalogue price are point-in-time/current reference snapshots.  They
+  // do not disappear when the user analyses a historical sales period.
+  let list=state.datasets.filter(d=>d.type===type);
   const api=list.filter(d=>d.apiAuto);if(api.length)list=api;
-  if(p)list=list.filter(d=>!d.snapshot||d.snapshot<=p.end);
   return list.sort((a,b)=>String(a.snapshot||a.importedAt).localeCompare(String(b.snapshot||b.importedAt))).at(-1)||null;
 }
 function filterDatedRow(r,p){return !p||!r.date||(r.date>=p.start&&r.date<=p.end)}
@@ -1114,7 +1118,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v6.1</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v7.1</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1251,6 +1255,40 @@ function renderPlan(){
 function costCell(p){if(p.costConflict)return`<div class="negative">конфликт данных</div><span class="badge missing">несколько закупочных цен для id ${escapeHtml(p.article)}</span>`;if(p.costSource==='report')return`<div>${fmtMoney(p.cost)}</div><span class="badge report">из 1С${p.reportCostColumn?': '+escapeHtml(p.reportCostColumn):''}</span>`;return`<input class="cost-input manual-cost" data-key="${escapeHtml(p.key)}" type="number" min="0" step="0.01" placeholder="ввести" value="${p.costSource==='manual'?p.cost:''}"><div style="margin-top:3px"><span class="badge ${p.costSource==='manual'?'manual':'missing'}">${p.costSource==='manual'?'вручную':'не заполнено'}</span></div>`}
 function sourceBadge(src){return src==='actual'?'<span class="badge actual">факт</span>':src==='estimate'?'<span class="badge estimate">тарифная оценка</span>':src==='manual'?'<span class="badge manual">вручную</span>':src==='management'?'<span class="badge manual">оценка УСН</span>':src==='aggregate'?'<span class="badge missing">только на уровне бизнеса</span>':src==='allocated'?'<span class="badge estimate">факт · распределено по выручке</span>':'<span class="badge missing">нет данных</span>'}
 function perUnit(p,k){const c=p.components[k];return c?.value!=null&&p.units?c.value/p.units:null}
+
+// Shared table controls.  ID fields use exact matching, while product names keep
+// normal substring search.  Rendering only the table body preserves input focus.
+function matchesTableSearch(row,query,fields=['name','article','sku']){
+  const q=norm(query);if(!q)return true;
+  const qId=idNorm(query);
+  const ids=fields.filter(f=>f==='article'||f==='sku');
+  if(qId&&ids.some(f=>idNorm(row?.[f])===qId))return true;
+  return fields.filter(f=>f!=='article'&&f!=='sku').some(f=>norm(row?.[f]).includes(q));
+}
+function filteredSorted(rows,st,fields=['name','article','sku']){
+  let out=(rows||[]).filter(r=>matchesTableSearch(r,st?.search||'',fields));
+  if(st?.category)out=out.filter(r=>r.category===st.category);
+  if(st?.costSource)out=out.filter(r=>r.costSource===st.costSource);
+  return sortRows(out,st?.sort||'name',Number(st?.dir)||1);
+}
+function pagination(rows,st){
+  const pageSize=Math.max(1,Number(st.pageSize)||100),pages=Math.max(1,Math.ceil(rows.length/pageSize));
+  st.page=clamp(Number(st.page)||1,1,pages);
+  const start=(st.page-1)*pageSize,end=Math.min(rows.length,start+pageSize);
+  return{start,end,total:rows.length,page:st.page,pages};
+}
+function th(label,key,tableKey){
+  const st=tableState[tableKey]||{},active=st.sort===key,arrow=active?(st.dir>0?' ↑':' ↓'):'';
+  return `<th data-sort-table="${escapeHtml(tableKey)}" data-sort-key="${escapeHtml(key)}">${escapeHtml(label)}${arrow}</th>`;
+}
+function tableRenderFn(key){return key==='unit'?renderUnitTable:key==='products'?renderProductTable:key==='stock'?renderStockTable:null}
+function bindSort(key){
+  $$(`[data-sort-table="${key}"]`).forEach(el=>el.addEventListener('click',()=>{
+    const st=tableState[key],k=el.dataset.sortKey;if(!st||!k)return;
+    st.dir=st.sort===k?-st.dir:1;st.sort=k;st.page=1;
+    tableRenderFn(key)?.();
+  }));
+}
 function renderUnit(){
   const m=currentModel,complete=m.products.filter(p=>p.cleanProfit!=null),missingCost=m.products.filter(p=>p.costSource==='missing'),pos=complete.filter(p=>p.profitPerUnit>0).length;
   const avgMargin=m.completeRevenue?pct(m.completeProfit,m.completeRevenue):null,avgRoi=sum(complete,x=>x.cogs)?pct(m.completeProfit,sum(complete,x=>x.cogs)):null;
@@ -1278,7 +1316,7 @@ function renderProducts(){const cats=[...new Set(currentModel.products.map(x=>x.
 function sortRows(rows,key,dir){const accessor={article:p=>p.article||p.sku,name:p=>p.name,price:p=>p.price,cost:p=>p.cost,revenue:p=>p.revenue,units:p=>p.units,profit:p=>p.cleanProfit,margin:p=>p.margin,roi:p=>p.roi,drr:p=>p.drr,share:p=>p.revenueShare,daysToZero:p=>p.daysToZero,stock:p=>p.stock,velocity:p=>p.velocity,acq:p=>perUnit(p,'acquiring'),log:p=>perUnit(p,'logistics'),storage:p=>perUnit(p,'storage'),ads:p=>perUnit(p,'ads'),commission:p=>perUnit(p,'commission'),tax:p=>perUnit(p,'taxes'),rf:p=>(perUnit(p,'returns')||0)+(perUnit(p,'fines')||0),ppu:p=>p.profitPerUnit}[key]||((p)=>p[key]);return [...rows].sort((a,b)=>{let x=accessor(a),y=accessor(b);if(x==null)x=dir>0?Infinity:-Infinity;if(y==null)y=dir>0?Infinity:-Infinity;if(typeof x==='string')return dir*x.localeCompare(y,'ru');return dir*(x-y)})}
 function paginate(rows,st){const pages=Math.max(1,Math.ceil(rows.length/st.pageSize));st.page=clamp(st.page,1,pages);const start=(st.page-1)*st.pageSize;return{items:rows.slice(start,start+st.pageSize),total:rows.length,page:st.page,pages}}
 function pagerHtml(p,key){return`<div class="pager"><span>${p.total} строк · страница ${p.page} из ${p.pages}</span><div class="buttons"><button class="btn small" data-page-key="${key}" data-page="prev">←</button><button class="btn small" data-page-key="${key}" data-page="next">→</button></div></div>`}
-function bindPager(key,fn){$$(`[data-page-key="${key}"]`).forEach(b=>b.addEventListener('click',()=>{tableState[key].page+=b.dataset.page==='next'?1:-1;fn()}))}
+function bindPager(key,fn){const rerender=fn||tableRenderFn(key);$$(`[data-page-key="${key}"]`).forEach(b=>b.addEventListener('click',()=>{tableState[key].page+=b.dataset.page==='next'?1:-1;rerender?.()}))}
 function renderProductTable(){
   let rows=filteredSorted(currentModel.products,tableState.products,['name','article','sku']);
   const p=pagination(rows,tableState.products),page=rows.slice(p.start,p.end);
@@ -1328,7 +1366,7 @@ function campaignTable(rows){return`<div class="table-wrap"><table class="table"
 
 function renderStock(){const m=currentModel,s=m.stockStats,cats=[...new Set(s.rows.map(x=>x.category).filter(Boolean))].sort();$('#tab-stock').innerHTML=`<div class="grid g3"><div class="card clickable" data-drill="stockCritical"><div class="muted">Критично: &lt; ${state.settings.criticalDays} дней</div><div class="big negative">${s.critical}</div><div class="drill-hint">Показать товары →</div></div><div class="card clickable" data-drill="stockAttention"><div class="muted">Внимание: &lt; ${state.settings.attentionDays} дней</div><div class="big warning">${s.attention}</div><div class="drill-hint">Показать товары →</div></div><div class="card clickable" data-drill="stockNormal"><div class="muted">В норме</div><div class="big positive">${s.normal}</div><div class="drill-hint">Показать товары →</div></div></div><div class="grid g2" style="margin-top:12px"><div class="card"><h3>Распределение по сроку до обнуления</h3>${m.stockDs?'<div class="chartbox small"><canvas id="stockChart"></canvas></div>':'<div class="empty">Нет отчёта остатков.</div>'}</div><div class="card"><h3>Ближайшие к обнулению</h3>${stockNearest(s.rows)}</div></div><div class="card" style="margin-top:12px"><h3>Планирование поставок</h3><div class="table-tools"><input id="stockSearch" class="input" placeholder="Поиск" value="${escapeHtml(tableState.stock.search)}"><select id="stockCategory" class="select"><option value="">Все категории</option>${cats.map(c=>`<option ${tableState.stock.category===c?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select></div><div id="stockTable"></div></div>`;const upd=()=>{tableState.stock.search=$('#stockSearch').value;tableState.stock.category=$('#stockCategory').value;tableState.stock.page=1;renderStockTable()};$('#stockSearch')?.addEventListener('input',upd);$('#stockCategory')?.addEventListener('change',upd);renderStockTable()}
 function stockNearest(rows){const r=rows.filter(x=>x.status!=='Нет продаж'&&Number.isFinite(x.daysToZero)).sort((a,b)=>a.daysToZero-b.daysToZero).slice(0,12);if(!r.length)return'<div class="empty">Нет продающихся товаров с рассчитанным сроком обнуления.</div>';return r.map(p=>`<div class="metric-row clickable" data-product-drill="${escapeHtml(p.key)}"><div><b class="linkish">${escapeHtml(p.article||p.sku)}</b><div class="muted tiny">${escapeHtml(p.name)}</div></div><div class="num"><b>${fmtNum(p.daysToZero,1)} дн.</b><div class="muted tiny">≈ ${p.zeroDate}</div></div></div>`).join('')}
-function renderStockTable(){const st=tableState.stock;let rows=currentModel.stockStats.rows.filter(p=>(!st.search||norm(`${p.name} ${p.article} ${p.sku}`).includes(norm(st.search)))&&(!st.category||p.category===st.category));rows=sortRows(rows,st.sort,st.dir);const page=paginate(rows,st);$('#stockTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:900px"><thead><tr><th data-ssort="article">Артикул</th><th data-ssort="name">Товар</th><th class="num" data-ssort="stock">Остаток</th><th class="num" data-ssort="velocity">Скорость, шт/день</th><th class="num" data-ssort="daysToZero">Дней хватит</th><th>Статус</th><th>Дата обнуления</th><th>Рекомендация</th><th>ABC прибыль</th></tr></thead><tbody>${page.items.map(p=>`<tr><td><span class="linkish" data-product-drill="${escapeHtml(p.key)}">${escapeHtml(p.article||p.sku)}</span></td><td class="name">${escapeHtml(p.name)}</td><td class="num">${fmtNum(p.stock)}</td><td class="num">${fmtNum(p.velocity,2)}</td><td class="num">${p.status==='Нет продаж'?'нет продаж':fmtNum(p.daysToZero,1)}</td><td class="${p.status==='Критично'?'negative':p.status==='Внимание'?'warning':p.status==='Норма'?'positive':''}">${p.status}</td><td>${p.zeroDate}</td><td class="name">${p.recommendation}</td><td>${p.abcProfit}</td></tr>`).join('')}</tbody></table></div>${pagerHtml(page,'stock')}`;$$('[data-ssort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.ssort;st.dir=st.sort===k?-st.dir:1;st.sort=k;renderStockTable()}));bindPager('stock',renderStockTable)}
+function renderStockTable(){const st=tableState.stock;let rows=currentModel.stockStats.rows.filter(p=>matchesTableSearch(p,st.search,['name','article','sku'])&&(!st.category||p.category===st.category));rows=sortRows(rows,st.sort,st.dir);const page=paginate(rows,st);$('#stockTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:900px"><thead><tr><th data-ssort="article">Артикул</th><th data-ssort="name">Товар</th><th class="num" data-ssort="stock">Остаток</th><th class="num" data-ssort="velocity">Скорость, шт/день</th><th class="num" data-ssort="daysToZero">Дней хватит</th><th>Статус</th><th>Дата обнуления</th><th>Рекомендация</th><th>ABC прибыль</th></tr></thead><tbody>${page.items.map(p=>`<tr><td><span class="linkish" data-product-drill="${escapeHtml(p.key)}">${escapeHtml(p.article||p.sku)}</span></td><td class="name">${escapeHtml(p.name)}</td><td class="num">${fmtNum(p.stock)}</td><td class="num">${fmtNum(p.velocity,2)}</td><td class="num">${p.status==='Нет продаж'?'нет продаж':fmtNum(p.daysToZero,1)}</td><td class="${p.status==='Критично'?'negative':p.status==='Внимание'?'warning':p.status==='Норма'?'positive':''}">${p.status}</td><td>${p.zeroDate}</td><td class="name">${p.recommendation}</td><td>${p.abcProfit}</td></tr>`).join('')}</tbody></table></div>${pagerHtml(page,'stock')}`;$$('[data-ssort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.ssort;st.dir=st.sort===k?-st.dir:1;st.sort=k;renderStockTable()}));bindPager('stock',renderStockTable)}
 
 function renderSettings(){
   const s=state.settings,m=currentModel,q=m.quality||{},months=m.businessPeriod?monthsInRange(m.businessPeriod.start,m.businessPeriod.end):[];
