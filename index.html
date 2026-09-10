@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v7.1-ui-functional-2026-09-10";
+    window.__OZON_DASHBOARD_BUILD__ = "v8.0-delivered-pnl-2026-09-10";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — API-only v7.1</title>
+  <title>Ozon Seller Analytics — API-only v8.0</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v7.1</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v8.0</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -77,6 +77,7 @@
       <button class="tab-btn" data-tab="plan">План-факт</button>
       <button class="tab-btn" data-tab="unit">Юнит-экономика</button>
       <button class="tab-btn" data-tab="products">Товары</button>
+      <button class="tab-btn" data-tab="orders">Заказы</button>
       <button class="tab-btn" data-tab="ads">Реклама / Воронка</button>
       <button class="tab-btn" data-tab="stock">Остатки</button>
       <button class="tab-btn" data-tab="settings">Настройки</button>
@@ -86,6 +87,7 @@
     <section class="tab-pane" id="tab-plan"></section>
     <section class="tab-pane" id="tab-unit"></section>
     <section class="tab-pane" id="tab-products"></section>
+    <section class="tab-pane" id="tab-orders"></section>
     <section class="tab-pane" id="tab-ads"></section>
     <section class="tab-pane" id="tab-stock"></section>
     <section class="tab-pane" id="tab-settings"></section>
@@ -139,7 +141,8 @@ let currentModel = null;
 let tableState = {
   products:{search:'',category:'',sort:'revenue',dir:-1,page:1,pageSize:100,expanded:null},
   unit:{search:'',category:'',costSource:'',sort:'revenue',dir:-1,page:1,pageSize:100},
-  stock:{search:'',category:'',sort:'daysToZero',dir:1,page:1,pageSize:100}
+  stock:{search:'',category:'',sort:'daysToZero',dir:1,page:1,pageSize:100},
+  orders:{search:'',sort:'deliveryDate',dir:-1,page:1,pageSize:100}
 };
 
 let drillStack=[];
@@ -767,7 +770,8 @@ function buildModel(){
       o={key:a?`A:${a}`:`S:${s||uid()}`,article:a,sku:s,name:r.name||'',category:'',category2:'',category3:'',type:'',brand:'',scheme:'',productId:'',
         currentPrice:null,rrp:null,rrpSource:'missing',stock:null,volume:null,reportCost:null,reportCostColumn:null,costConflict:false,tariff:null,
         sales:{revenue:0,impressions:0,visits:0,carts:0,ordered:0,delivered:0,returns:0,cancellations:0},
-        realized:{sold:0,returned:0,net:0,hasRows:false},
+        realized:{sold:0,returned:0,net:0,revenue:0,originalRevenue:0,retroReturnedRevenue:0,hasRows:false,provisionalRows:0,inexactDeliveryRows:0},
+        orderEvents:[],_orderEventMap:new Map(),
         finance:{grossRevenue:0,rawNet:0,commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,hasRows:false,exactRows:0,accrualLines:0,postingQtyAudit:0,sellerPriceAudit:0,sellerPriceRaw:0,saleAmount:0,bonus:0,coinvestment:0},
         ads:{spend:0,impressions:0,clicks:0,carts:0,orders:0,revenue:0,hasRows:false}};
       products.push(o);
@@ -776,6 +780,26 @@ function buildModel(){
     if(s){skuMap.set(s,o);if(!o.sku)o.sku=s}
     if(r.name&&!o.name)o.name=r.name;
     return o;
+  }
+
+  function addOrderEvent(o,r,withQty=false){
+    const postingNumber=String(r.postingNumber||'').trim(),orderNumber=String(r.orderNumber||'').trim();
+    if(!postingNumber&&!orderNumber)return;
+    const deliveryDate=withQty?String(r.deliveryDate||r.date||'').slice(0,10):'';
+    const orderDate=String(r.orderDate||'').slice(0,10),financeDate=!withQty?String(r.date||'').slice(0,10):'';
+    let e=null,key='';
+    // A Finance row is an expense event on its own accrual date. It may enrich an
+    // already-present delivered order, but must never overwrite/create a fake delivery date.
+    if(!withQty){
+      for(const [k,v] of o._orderEventMap){if((postingNumber&&v.postingNumber===postingNumber)||(orderNumber&&v.orderNumber===orderNumber)){e=v;key=k;break}}
+      if(!e)key=`FIN:${postingNumber||orderNumber}`;
+    }else key=`DEL:${postingNumber||orderNumber}|${deliveryDate}`;
+    if(!e)e=o._orderEventMap.get(key);
+    if(!e){e={productKey:o.key,article:o.article||'',sku:o.sku||'',name:o.name||'',orderId:String(r.orderId||''),orderNumber,orderDate,orderDateSource:String(r.orderDateSource||''),postingNumber,orderSchema:String(r.orderSchema||''),deliveryDate,deliveryDateExact:withQty?r.deliveryDateExact!==false:null,deliveryDateSource:withQty?String(r.deliveryDateSource||''):'',soldQty:0,returnedQty:0,netQty:0,originalRevenue:0,revenue:0,retroReturnedRevenue:0,returnDate:String(r.returnDate||''),returnDates:Array.isArray(r.returnDates)?[...r.returnDates]:[],returnStatus:String(r.returnStatus||'none'),provisional:Boolean(r.provisional),quantityKnown:false,financeDates:[]};o._orderEventMap.set(key,e)}
+    if(!e.orderNumber&&orderNumber)e.orderNumber=orderNumber;if(!e.orderDate&&orderDate)e.orderDate=orderDate;if(!e.orderId&&r.orderId)e.orderId=String(r.orderId);if(!e.orderSchema&&r.orderSchema)e.orderSchema=String(r.orderSchema);
+    e.name=o.name||e.name;e.article=o.article||e.article;e.sku=o.sku||e.sku;
+    if(financeDate)e.financeDates=[...new Set([...(e.financeDates||[]),financeDate])].sort();
+    if(withQty){e.soldQty+=safe(r.soldQty);e.returnedQty+=safe(r.returnedQty);e.netQty+=safe(r.netQty);e.originalRevenue+=safe(r.originalRevenue);e.revenue+=safe(r.revenue);e.retroReturnedRevenue+=safe(r.retroReturnedRevenue);e.quantityKnown=true;e.provisional=e.provisional||Boolean(r.provisional);if(r.returnStatus&&r.returnStatus!=='none')e.returnStatus=r.returnStatus;if(r.returnDate)e.returnDate=r.returnDate;if(Array.isArray(r.returnDates))e.returnDates=[...new Set([...e.returnDates,...r.returnDates])].sort()}
   }
 
   if(stockDs)for(const r of stockDs.rows){
@@ -802,18 +826,21 @@ function buildModel(){
   }
   funnelSegmentsUsed=segmentKeys.size;
 
-  // Exact realized quantity layer: sale postings anchored to finance + return events.
+  // v8 delivered-sales layer. The row date is the actual delivery date. Later
+  // returns are already applied retroactively to netQty and revenue on that original row.
   for(const ds of realizedDs)for(const r of ds.rows){
     if(!filterDatedRow(r,p))continue;
     const o=ensure(r);o.name=r.name||o.name;o.realized.hasRows=true;
     o.realized.sold+=safe(r.soldQty);o.realized.returned+=safe(r.returnedQty);o.realized.net+=safe(r.netQty);
+    o.realized.revenue+=safe(r.revenue);o.realized.originalRevenue+=safe(r.originalRevenue);o.realized.retroReturnedRevenue+=safe(r.retroReturnedRevenue);
+    if(r.provisional)o.realized.provisionalRows++;if(r.deliveryDateExact===false)o.realized.inexactDeliveryRows++;
+    addOrderEvent(o,r,true);
   }
 
-  // Business finance ledger from /v1/finance/accrual/by-day.
-  // It is the source of truth for total revenue/net.  At SKU level we use it
-  // for economic gross revenue and business totals. The same by-day ledger also
-  // carries direct SKU commission/delivery/item_fees; a separate skuFinance
-  // dataset is just a projection of those direct SKU rows, not another API call.
+  // Business Finance ledger from /v1/finance/accrual/by-day.
+  // v8 uses this ledger ONLY for Ozon expenses on their accrual dates and for audit.
+  // Revenue/quantity/COGS/RRP are driven by delivered-order rows above. The direct
+  // skuFinance dataset is a projection of SKU-linked Finance rows, not another API call.
   const unallocatedFinance={commission:0,acquiring:0,logistics:0,storage:0,ads:0,taxes:0,fines:0,returns:0,other:0,grossRevenue:0,rawNet:0};
   for(const ds of financeDs)for(const r of ds.rows){
     if(!filterDatedRow(r,p))continue;
@@ -830,12 +857,13 @@ function buildModel(){
   const financeGrossAccrued=sum(finRows,r=>safe(r.grossRevenue));
   const financeNetAccrued=sum(finRows,r=>safe(r.rawAmount));
 
-  // Direct SKU money layer projected from /v1/finance/accrual/by-day.
-  // sale_amount, sale commission, delivery accruals and item_fees are
-  // tied to SKU by Ozon. bonus/coinvestment are audit breakdown fields already included in sale_amount; seller_price is diagnostic only. Non-item seller-level charges remain only in business P&L.
+  // Direct SKU expense layer projected from /v1/finance/accrual/by-day.
+  // Commission, delivery, item_fees and other SKU-linked charges stay on their Finance
+  // accrual dates. Finance sale_amount/seller_price are audit fields only in v8.
+  // Non-item seller-level charges remain only in business P&L.
   for(const ds of skuFinanceDs)for(const r of ds.rows){
     if(!filterDatedRow(r,p))continue;
-    const o=ensure(r),f=o.finance;f.hasRows=true;f.exactRows++;
+    const o=ensure(r),f=o.finance;f.hasRows=true;f.exactRows++;addOrderEvent(o,r,false);
     f.rawNet+=safe(r.rawAmount);f.accrualLines+=safe(r.accrualLines);
     f.postingQtyAudit=Math.max(safe(f.postingQtyAudit),Math.abs(safe(r.postingQtyAudit)));
     f.sellerPriceAudit=Math.max(safe(f.sellerPriceAudit),Math.abs(safe(r.sellerPriceAudit)));
@@ -879,73 +907,67 @@ function buildModel(){
 
   const manual=state.manualCosts||{};
   const skuFinanceCoverageComplete=diag.skuFinanceCoverageComplete===true;
+  const expenseKeys=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
 
-  /*
-    Finance v5.5 policy:
-      - business P&L is the exact /finance/accrual/by-day ledger;
-      - product economic gross = sale_amount from by-day (bonus and coinvestment are already included);
-      - product net money is computed from direct SKU fields inside /finance/accrual/by-day
-        (economic gross, sale commission, delivery and item_fees);
-      - seller_price is shown only as a diagnostic field because it can be per-unit;
-      - seller/non-item charges without SKU stay only in business P&L.
-    No catalogue-wide allocation and no quantity inference inside finance.
-  */
+  // Finance gross/net remains an audit ledger in v8. P&L revenue is NOT taken from it.
   const directGross=sum(products,x=>safe(x.finance.grossRevenue));
-  const directNet=sum(products,x=>x.finance.hasRows?safe(x.finance.rawNet):0);
+  const directFinanceNet=sum(products,x=>x.finance.hasRows?safe(x.finance.rawNet):0);
   const grossResidual=financeGrossAccrued-directGross;
-  const netResidual=financeNetAccrued-directNet;
+  const netResidual=financeNetAccrued-directFinanceNet;
 
   for(const o of products){
+    o.orderEvents=[...o._orderEventMap.values()].sort((a,b)=>(a.deliveryDate||a.orderDate||'').localeCompare(b.deliveryDate||b.orderDate||'')||(a.orderNumber||a.postingNumber||'').localeCompare(b.orderNumber||b.postingNumber||''));
+    delete o._orderEventMap;
+    o.orderCount=new Set(o.orderEvents.map(e=>e.orderNumber||e.postingNumber).filter(Boolean)).size;
+    o.firstOrderDate=o.orderEvents.map(e=>e.orderDate).filter(Boolean).sort()[0]||null;o.lastOrderDate=o.orderEvents.map(e=>e.orderDate).filter(Boolean).sort().at(-1)||null;
+    o.firstDeliveryDate=o.orderEvents.map(e=>e.deliveryDate).filter(Boolean).sort()[0]||null;o.lastDeliveryDate=o.orderEvents.map(e=>e.deliveryDate).filter(Boolean).sort().at(-1)||null;
     const m=manual[o.key]||manual[`A:${o.article}`]||manual[`S:${o.sku}`];
     o.cost=o.costConflict?null:(o.reportCost!=null?o.reportCost:(m&&Number.isFinite(+m.value)?+m.value:null));
     o.costSource=o.costConflict?'missing':(o.reportCost!=null?'report':(o.cost!=null?'manual':'missing'));
 
-    o.revenue=safe(o.finance.grossRevenue);
-    o.netAfterOzon=o.finance.hasRows?safe(o.finance.rawNet):null;
-    o.financeAllocationShare=0;
-    o.financeAllocated=false;
-
-    o.units=o.realized.hasRows?o.realized.net:null;
-    if(o.units!=null&&Math.abs(o.units)<1e-9)o.units=0;
+    // Revenue is the retained delivered revenue from v8. If a future return is
+    // registered, the original delivery row and this revenue shrink retroactively.
+    o.revenue=safe(o.realized.revenue);
+    o.originalDeliveredRevenue=safe(o.realized.originalRevenue);
+    o.retroReturnedRevenue=safe(o.realized.retroReturnedRevenue);
+    o.units=o.realized.hasRows?o.realized.net:0;
+    if(Math.abs(o.units)<1e-9)o.units=0;
     o.price=o.units>0&&o.revenue>0?o.revenue/o.units:o.currentPrice;
 
     const realizedDsRange=realizedDs.map(d=>({start:d.start,end:d.end})).filter(x=>x.start&&x.end);
     const periodDays=p?daysInclusive(p.start,p.end):(realizedDsRange.length?unionDays(realizedDsRange):null);
-    const soldForVelocity=Math.max(0,safe(o.realized.sold)-safe(o.realized.returned));
+    const soldForVelocity=Math.max(0,safe(o.realized.net));
     o.velocity=soldForVelocity>0&&periodDays?soldForVelocity/periodDays:0;
     o.daysToZero=o.stock==null?null:(o.velocity>0?o.stock/o.velocity:(o.stock>0?Infinity:0));
 
-    o.cogs=o.cost!=null&&o.units!=null?o.cost*o.units:null;
+    // No delivered units => COGS is exactly zero and a missing purchase price does
+    // not hide a Finance expense-only SKU from the selected period.
+    o.cogs=o.units===0?0:(o.cost!=null?o.cost*o.units:null);
 
-    const compNames=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
-    o.components={};
-    for(const k of compNames){
-      const direct=safe(o.finance[k]);
-      o.components[k]={value:direct,source:'actual'};
-    }
+    o.components={};let directOzonExpenses=0;
+    for(const k of expenseKeys){const direct=safe(o.finance[k]);o.components[k]={value:direct,source:'actual-finance-date'};directOzonExpenses+=direct}
     o.components.taxes={value:null,source:'aggregate'};
-    o.drr=o.revenue>0&&o.components.ads.value!=null?pct(o.components.ads.value,o.revenue):null;
+    o.directOzonExpenses=directOzonExpenses;
+    o.netAfterOzon=o.revenue-directOzonExpenses;
+    o.financeAllocationShare=0;o.financeAllocated=false;
+    o.drr=o.revenue>0?pct(o.components.ads.value,o.revenue):null;
 
-    // Product profit is shown only from exact posting/SKU accruals.  If the
-    // posting endpoint is not fully covered, do not present potentially partial
-    // SKU economics as a real profit/loss. Business P&L remains exact regardless.
-    o.financeExactComplete=skuFinanceCoverageComplete&&o.finance.hasRows;
-    o.operatingProfit=o.cogs!=null&&o.netAfterOzon!=null&&o.financeExactComplete?o.netAfterOzon-o.cogs:null;
+    // Expense attribution quality is global. A SKU with no Finance row in this
+    // selected period simply has zero direct Ozon expenses in that period.
+    o.financeExactComplete=skuFinanceCoverageComplete;
+    o.operatingProfit=o.cogs!=null&&o.financeExactComplete?o.netAfterOzon-o.cogs:null;
     o.operatingMargin=o.operatingProfit!=null&&o.revenue?pct(o.operatingProfit,o.revenue):null;
     o.operatingRoi=o.operatingProfit!=null&&o.cogs?pct(o.operatingProfit,o.cogs):null;
     o.operatingProfitPerUnit=o.operatingProfit!=null&&o.units?o.operatingProfit/o.units:null;
     o.cleanProfit=o.operatingProfit;o.margin=o.operatingMargin;o.roi=o.operatingRoi;o.profitPerUnit=o.operatingProfitPerUnit;
     o.missingOperating=[];
-    if(o.cost==null)o.missingOperating.push('закупочная цена');
-    if(o.units==null)o.missingOperating.push('реализованное количество');
-    if(!skuFinanceCoverageComplete)o.missingOperating.push('неполная прямая SKU-атрибуция Finance API');
-    else if(!o.finance.hasRows&&(Math.abs(o.revenue)>.005||Math.abs(safe(o.units))>.0001))o.missingOperating.push('нет точной товарной финансовой атрибуции');
-    o.missingProfit=[...o.missingOperating];
-    o.partialProfit=o.operatingProfit;
-    o.revenueShare=0;
+    if(o.units>0&&o.cost==null)o.missingOperating.push('закупочная цена');
+    if(!skuFinanceCoverageComplete)o.missingOperating.push('неполная прямая SKU-атрибуция расходов Finance API');
+    if(o.realized.provisionalRows)o.missingOperating.push('текущая выручка частично предварительная');
+    if(o.realized.inexactDeliveryRows)o.missingOperating.push('есть строки с резервной датой доставки');
+    o.missingProfit=[...o.missingOperating];o.partialProfit=o.operatingProfit;o.revenueShare=0;
   }
-
-  const totalRevenue=financeGrossAccrued;
+  const totalRevenue=sum(products,x=>safe(x.revenue));
   for(const o of products)o.revenueShare=pct(o.revenue,totalRevenue)||0;
   assignABC(products,'revenue','abcRevenue');
   assignABC(products,'operatingProfit','abcProfit');
@@ -957,29 +979,32 @@ function buildModel(){
   const costRev={report:0,manual:0,missing:0};
   for(const o of products)costRev[o.costSource]+=safe(o.revenue);
 
+  // All Ozon expenses are recognized strictly on the Finance API accrual date.
+  // The negative/return principal in Finance gross is intentionally NOT subtracted
+  // here because v8 already removes the original delivered revenue retroactively.
+  const financeOzonExpenses=sum(finRows,r=>expenseKeys.reduce((z,k)=>z+safe(r[k]),0));
+  const directOzonExpenses=sum(products,x=>safe(x.directOzonExpenses));
+  const unallocatedOzonExpenses=expenseKeys.reduce((z,k)=>z+safe(unallocatedFinance[k]),0);
+  const afterOzon=totalRevenue-financeOzonExpenses;
+
   // External expenses are business-level and are never distributed to SKU economics.
   const businessPeriod=externalExpensePeriod(p,financeDs);
   const externalExpenses=calculateExternalExpenses(businessPeriod);
-  const managementRemainderKnown=financeNetAccrued-externalExpenses.totalKnown;
-  const managementRemainder=externalExpenses.complete?financeNetAccrued-externalExpenses.total:null;
+  const managementRemainderKnown=afterOzon-externalExpenses.totalKnown;
+  const managementRemainder=externalExpenses.complete?afterOzon-externalExpenses.total:null;
 
   // Corporate benchmark RRP−10% is TOTAL-only.
   let rrpBaseKnown=0,rrpGrossUnitsKnown=0,rrpGrossUnitsMissing=0,rrpNetUnits=0;
   const missingRrpArticles=[];
   for(const o of products){
-    const sold=safe(o.realized.sold),ret=safe(o.realized.returned),net=safe(o.realized.net),flow=sold+ret;
-    if(flow<=0)continue;
+    const net=Math.max(0,safe(o.realized.net));if(net<=0)continue;
     rrpNetUnits+=net;
-    if(Number.isFinite(o.rrp)){
-      rrpBaseKnown+=o.rrp*net;rrpGrossUnitsKnown+=flow;
-    }else{
-      rrpGrossUnitsMissing+=flow;
-      if(missingRrpArticles.length<100)missingRrpArticles.push(o.article||o.sku);
-    }
+    if(Number.isFinite(o.rrp)){rrpBaseKnown+=o.rrp*net;rrpGrossUnitsKnown+=net}
+    else {rrpGrossUnitsMissing+=net;if(missingRrpArticles.length<100)missingRrpArticles.push(o.article||o.sku)}
   }
   const qtyCov=diag.realizationCoverage||null;
   const selectedWithinQtyCoverage=!p||Boolean(qtyCov?.from&&qtyCov?.to&&p.start>=qtyCov.from&&p.end<=qtyCov.to);
-  const quantityComplete=selectedWithinQtyCoverage&&qtyCov?.complete!==false&&(diag.unresolvedSaleOps??0)===0 && diag.returnsComplete!==false;
+  const quantityComplete=selectedWithinQtyCoverage&&qtyCov?.complete!==false&&(diag.unresolvedDeliveryDates??diag.unresolvedSaleOps??0)===0;
   const rrpCoverageUnits=(rrpGrossUnitsKnown+rrpGrossUnitsMissing)>0?pct(rrpGrossUnitsKnown,rrpGrossUnitsKnown+rrpGrossUnitsMissing):null;
   const rrpTargetKnown=rrpBaseKnown*.90;
   const rrpComplete=quantityComplete&&rrpGrossUnitsMissing===0&&rrpGrossUnitsKnown>0;
@@ -988,16 +1013,17 @@ function buildModel(){
   const rrpAttainment=rrpComplete&&managementRemainder!=null&&rrpTarget!==0?pct(managementRemainder,rrpTarget):null;
 
   // Business P&L after purchase cost. If cost/quantity coverage is incomplete, value is provisional.
-  const cogsCoveredRevenue=operatingRevenue;
-  const cogsCoverage=pct(cogsCoveredRevenue,totalRevenue)||0;
-  const profitBeforeHiredLogistics=financeNetAccrued-totalCogs-externalExpenses.fixedTotal;
-  const profitBeforeTax=externalExpenses.complete?financeNetAccrued-totalCogs-externalExpenses.total:null;
+  const cogsCoveredRevenue=sum(products.filter(x=>x.cogs!=null),x=>Math.max(0,safe(x.revenue)));
+  const cogsCoverage=totalRevenue>0?(pct(cogsCoveredRevenue,totalRevenue)||0):100;
+  const profitBeforeHiredLogistics=afterOzon-totalCogs-externalExpenses.fixedTotal;
+  const profitBeforeTax=externalExpenses.complete?afterOzon-totalCogs-externalExpenses.total:null;
   const taxRate=Number.isFinite(+state.settings.taxRate)?+state.settings.taxRate:null;
   const estimatedTax=profitBeforeTax!=null&&taxRate!=null?Math.max(0,profitBeforeTax)*taxRate/100:null;
   const businessNetProfit=profitBeforeTax!=null&&estimatedTax!=null?profitBeforeTax-estimatedTax:null;
   const businessMargin=businessNetProfit!=null&&totalRevenue?pct(businessNetProfit,totalRevenue):null;
   const businessRoi=businessNetProfit!=null&&totalCogs?pct(businessNetProfit,totalCogs):null;
 
+  const orderRows=products.flatMap(p=>p.orderEvents.map(e=>({...e,productKey:p.key,name:p.name,article:p.article,sku:p.sku,category:p.category}))).sort((a,b)=>(b.deliveryDate||b.orderDate||'').localeCompare(a.deliveryDate||a.orderDate||''));
   const categories=aggregateCategories(products),stockStats=computeStock(products),signals=computeGrowthSignals(products);
   const campaignRows=[...campaigns.values()].map(c=>({...c,ctr:pct(c.clicks,c.impressions),drr:pct(c.spend,c.revenue)}));
   const actualAdSpend=financeDs.length?sum(finRows,r=>safe(r.ads)):(adsDs.length?adsTotal:null);
@@ -1013,21 +1039,21 @@ function buildModel(){
     if(rr&&Number.isFinite(num(rr.rrp))&&num(rr.rrp)>0)ozonRrpKnown++;else if(missingRrpCatalog.length<100)missingRrpCatalog.push(a);
   }
 
-  // These are attribution gaps, not accounting errors:
-  // revenue gap should be ~0 because seller_price is SKU-level;
-  // net gap is expected and equals common Ozon operations without SKU.
-  const productRevenueReconciliation=sum(products,x=>safe(x.revenue))-financeGrossAccrued;
-  const productNetReconciliation=sum(products,x=>safe(x.netAfterOzon))-financeNetAccrued;
-  const unallocatedOzonNet=financeNetAccrued-sum(products,x=>safe(x.netAfterOzon));
+  // v8 deliberately uses different clocks for revenue and expenses. Therefore
+  // delivered revenue is NOT expected to equal Finance gross for a short period.
+  const financeRevenueTimingDelta=totalRevenue-financeGrossAccrued;
+  const expenseReconciliation=financeOzonExpenses-(directOzonExpenses+unallocatedOzonExpenses);
+  const productAfterOzon=sum(products,x=>safe(x.netAfterOzon));
+  const unallocatedOzonNet=-unallocatedOzonExpenses;
   return{
     products,totalRevenue,totalCogs,complete:operatingComplete,completeRevenue:operatingRevenue,completeProfit:operatingProfit,
     operatingComplete,operatingRevenue,operatingProfit,
-    financeGrossAccrued,financeNetAccrued,unallocatedFinance,unallocatedOzonNet,
+    financeGrossAccrued,financeNetAccrued,financeOzonExpenses,directOzonExpenses,unallocatedOzonExpenses,afterOzon,unallocatedFinance,unallocatedOzonNet,
     externalExpenses,managementRemainderKnown,managementRemainder,profitBeforeHiredLogistics,profitBeforeTax,
     estimatedTax,taxRate,businessNetProfit,businessMargin,businessRoi,businessPeriod,
     rrpBaseKnown,rrpTargetKnown,rrpTarget,rrpDelta,rrpAttainment,rrpCoverageUnits,rrpComplete,rrpGrossUnitsKnown,rrpGrossUnitsMissing,rrpNetUnits,missingRrpArticles,quantityComplete,
-    cogsCoverage,costRev,categories,stockStats,signals,campaigns:campaignRows,adsSpend:actualAdSpend,adsUnallocated,
-    reconciliation:{revenueDiff:productRevenueReconciliation,netDiff:productNetReconciliation,grossResidual,netResidual},
+    cogsCoverage,costRev,categories,stockStats,signals,orderRows,campaigns:campaignRows,adsSpend:actualAdSpend,adsUnallocated,
+    reconciliation:{financeRevenueTimingDelta,expenseDiff:expenseReconciliation,grossResidual,netResidual,productAfterOzon},
     quality:{currentOzonArticles:currentOzonArticles.size,ozonCostKnown,ozonRrpKnown,ozonCostConflict,missingCostArticles,missingRrpCatalog,funnelSegmentsUsed,funnelSegmentsSkipped,
       funnelTop1000:Boolean(diag.analyticsLatestSkuDetailTruncated),unresolvedSaleOps:diag.unresolvedSaleOps??null,returnsComplete:diag.returnsComplete??null,
       realizationCoverage:diag.realizationCoverage||null,realizationDailyPremiumAvailable:diag.realizationDailyPremiumAvailable??null,dailyQuantityMonthlyValidation:diag.dailyQuantityMonthlyValidation||null,
@@ -1036,7 +1062,9 @@ function buildModel(){
       financeReconcileDelta:diag.financeReconcileDelta??null,financeSource:diag.financeSource||null,
       skuFinanceSource:diag.skuFinanceSource||null,skuFinanceDirectRows:diag.skuFinanceDirectRows??null,skuFinanceRowsPublished:diag.skuFinanceRowsPublished??null,
       skuFinanceGross:diag.skuFinanceGross??null,skuFinanceNet:diag.skuFinanceNet??null,skuFinanceRevenueDelta:diag.skuFinanceRevenueDelta??null,
-      skuFinanceReconcileDelta:diag.skuFinanceReconcileDelta??null,skuFinanceCoverageComplete:diag.skuFinanceCoverageComplete??false},
+      skuFinanceReconcileDelta:diag.skuFinanceReconcileDelta??null,skuFinanceCoverageComplete:diag.skuFinanceCoverageComplete??false,
+      orderMetaVersion:diag.orderMetaVersion??null,orderSalePostings:diag.orderSalePostings??null,orderNumberResolved:diag.orderNumberResolved??null,orderDateResolved:diag.orderDateResolved??null,
+      deliveryEngineVersion:diag.deliveryEngineVersion??null,deliveryDateExactCoverage:diag.deliveryDateExactCoverage??null,unresolvedDeliveryDates:diag.unresolvedDeliveryDates??null,inexactDeliveryRows:diag.inexactDeliveryRows??null,retroReturnedUnits:diag.retroReturnedUnits??0,retroReturnedRevenue:diag.retroReturnedRevenue??0,provisionalDeliveredSales:diag.provisionalDeliveredSales??0,provisionalDeliveredRevenue:diag.provisionalDeliveredRevenue??0,currentRealizationPostingAvailable:diag.currentRealizationPostingAvailable??null,deliveryGrossMonthlyValidation:diag.deliveryGrossMonthlyValidation||null,fbsDeliveryComplete:diag.fbsDeliveryComplete??null,fbsDeliveryMissingDays:diag.fbsDeliveryMissingDays??null},
     funnelDs,realizedDs,stockDs,priceDs,financeDs,skuFinanceDs,adsDs,costDs,rrpDs,periodDays:p?daysInclusive(p.start,p.end):(businessPeriod?daysInclusive(businessPeriod.start,businessPeriod.end):null),period:p
   };
 }
@@ -1107,7 +1135,7 @@ function applyCustomPeriod(){
 }
 function renderAll(){
   currentModel=buildModel();
-  const steps=[['источники',renderSourceChips],['контроль данных',renderQuality],['KPI',renderKpis],['обзор',renderOverview],['план-факт',renderPlan],['юнит-экономика',renderUnit],['товары',renderProducts],['реклама/воронка',renderAds],['остатки',renderStock],['настройки',renderSettings]];
+  const steps=[['источники',renderSourceChips],['контроль данных',renderQuality],['KPI',renderKpis],['обзор',renderOverview],['план-факт',renderPlan],['юнит-экономика',renderUnit],['товары',renderProducts],['заказы',renderOrders],['реклама/воронка',renderAds],['остатки',renderStock],['настройки',renderSettings]];
   const errs=[];
   for(const [name,fn] of steps){try{fn()}catch(e){console.error(`Render ${name}:`,e);errs.push(`${name}: ${e?.message||e}`)}}
   try{renderChartsForTab(activeTab)}catch(e){console.error('Render charts:',e);errs.push(`графики: ${e?.message||e}`)}
@@ -1118,7 +1146,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v7.1</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v8.0</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1131,28 +1159,35 @@ function renderQuality(){
   const m=currentModel,q=m.quality||{},issues=[];
   if(!apiSyncStatus.loaded)issues.push('Ozon API не разблокирован');
   if(!m.financeDs.length)issues.push('нет финансов Ozon API');
-  if(!m.realizedDs.length)issues.push('нет количества фактической реализации');
+  if(!m.realizedDs.length)issues.push('нет delivered-sales слоя');
   if(!m.stockDs)issues.push('нет актуальных остатков');
-  if(q.unresolvedSaleOps>0)issues.push(`не сопоставлено отправлений реализации: ${fmtNum(q.unresolvedSaleOps)}`);
-  if(q.returnsComplete===false)issues.push('возвраты загружены не полностью');
-  if(q.realizationCoverage?.complete===false)issues.push('дневной слой реализации не прошёл контроль полноты');
-  if(q.dailyQuantityMonthlyValidation&&q.dailyQuantityMonthlyValidation.ok===false)issues.push('дневные количества не сошлись с официальными итогами закрытых месяцев');
-  if(!m.skuFinanceDs.length)issues.push('нет прямой SKU-атрибуции Finance API');
+  const unresolved=q.unresolvedDeliveryDates??q.unresolvedSaleOps??0;
+  if(unresolved>0)issues.push(`нет даты доставки для ${fmtNum(unresolved)} строк продажи`);
+  if((q.inexactDeliveryRows??0)>0)issues.push(`резервная Finance-дата вместо точной доставки: ${fmtNum(q.inexactDeliveryRows)} строк`);
+  if(q.fbsDeliveryComplete===false)issues.push(`история FBS delivery неполная${q.fbsDeliveryMissingDays!=null?`: пропущено дней ${fmtNum(q.fbsDeliveryMissingDays)}`:''}`);
+  if(q.realizationCoverage?.complete===false)issues.push('слой доставленных продаж не прошёл контроль полноты');
+  if(q.deliveryGrossMonthlyValidation&&q.deliveryGrossMonthlyValidation.ok===false)issues.push('доставленные количества не сошлись с официальной месячной реализацией');
+  if((q.unmatchedReturnUnits??0)>0)issues.push(`не привязано к исходной продаже возвратов: ${fmtNum(q.unmatchedReturnUnits)} шт.`);
+  if((q.provisionalDeliveredSales??0)>0)issues.push(`предварительная выручка открытого месяца: ${fmtNum(q.provisionalDeliveredSales)} строк`);
+  if(!m.skuFinanceDs.length)issues.push('нет прямой SKU-атрибуции расходов Finance API');
   if(q.skuFinanceCoverageComplete!==true)issues.push('прямая SKU-атрибуция Finance API не прошла сверку');
-  if(Math.abs(safe(q.skuFinanceRevenueDelta))>=1)issues.push(`SKU revenue reconcile delta: ${fmtMoney(Math.abs(safe(q.skuFinanceRevenueDelta)))}`);
   if(Math.abs(safe(q.skuFinanceReconcileDelta))>=1)issues.push(`SKU direct-net reconcile delta: ${fmtMoney(Math.abs(safe(q.skuFinanceReconcileDelta)))}`);
-  if(Math.abs(safe(q.financeReconcileDelta))>=1)issues.push(`business ledger reconcile delta: ${fmtMoney(Math.abs(safe(q.financeReconcileDelta)))}`);
+  if(Math.abs(safe(q.financeReconcileDelta))>=1)issues.push(`business Finance ledger delta: ${fmtMoney(Math.abs(safe(q.financeReconcileDelta)))}`);
+  if(Math.abs(safe(m.reconciliation?.expenseDiff))>=1)issues.push(`сверка расходов Finance: ${fmtMoney(Math.abs(safe(m.reconciliation?.expenseDiff)))}`);
+  if(q.orderSalePostings!=null&&q.orderNumberResolved!=null&&q.orderNumberResolved<q.orderSalePostings)issues.push(`номера заказов Ozon получены для ${fmtNum(q.orderNumberResolved)}/${fmtNum(q.orderSalePostings)} отправлений`);
   if(m.externalExpenses?.missingHired?.length)issues.push(`наёмная логистика неполная: ${m.externalExpenses.missingHired.join(', ')}`);
-  if(!m.rrpComplete)issues.push(`норматив РРЦ−10% предварительный: покрытие РРЦ по движениям ${fmtPct(m.rrpCoverageUnits)}`);
-  const revenueReconcileOk=Math.abs(safe(m.reconciliation?.revenueDiff))<1;
-  if(!revenueReconcileOk)issues.push(`сверка SKU→ledger по выручке: расхождение ${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}`);
+  if(!m.rrpComplete)issues.push(`норматив РРЦ−10% предварительный: покрытие РРЦ по доставленным единицам ${fmtPct(m.rrpCoverageUnits)}`);
   const costCatalogPct=q.currentOzonArticles?pct(q.ozonCostKnown,q.currentOzonArticles):null;
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
-  $('#dataQuality').innerHTML=`<b>Контроль данных.</b> Ozon в расчётах — <b>только Seller API</b>; Excel Ozon не используется. 
-    Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка найдена ${fmtPct(costCatalogPct)} · РРЦ найдена ${fmtPct(rrpCatalogPct)}.
-    Финансовый ledger: выручка ${fmtMoney(m.financeGrossAccrued)} · после услуг Ozon ${fmtMoney(m.financeNetAccrued)}.
-    Общие операции Ozon без SKU: ${fmtMoney(m.unallocatedOzonNet)} — учтены в общем P&L, но не распределяются по товарам.
-    Реализация по дням: ${q.realizationCoverage?.from||'нет'} — ${q.realizationCoverage?.to||'нет'}${q.realizationCoverage?.complete===false?' · <span class="warning">дневной слой неполный</span>':' · произвольные дневные периоды доступны'}${q.dailyQuantityMonthlyValidation?` · сверка закрытых месяцев: ${q.dailyQuantityMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:''}.
+  const exactDelivery=q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage);
+  const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
+  $('#dataQuality').innerHTML=`<b>Контроль данных v8.</b> Ozon — <b>только Seller API</b>. 
+    Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
+    <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — только фактически доставленные за выбранный период заказы; будущие возвраты ретроспективно уменьшают исходную доставку.
+    <b>Расходы Ozon:</b> ${fmtMoney(m.financeOzonExpenses)} — по датам начислений Finance API; после Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
+    Даты доставки: точность ${exactDelivery} · покрытие ${q.realizationCoverage?.from||'нет'} — ${q.realizationCoverage?.to||'нет'} · контроль gross delivery закрытых месяцев: ${grossCtl}.
+    Ретроспективно снято возвратами: ${fmtNum(q.retroReturnedUnits||0)} шт. · ${fmtMoney(q.retroReturnedRevenue||0)}.
+    Заказы Ozon: ${q.orderSalePostings!=null?`${fmtNum(q.orderNumberResolved||0)}/${fmtNum(q.orderSalePostings)} номеров · ${fmtNum(q.orderDateResolved||0)}/${fmtNum(q.orderSalePostings)} дат`:'ожидается синхронизация v8'}. Период продаж фильтруется по <b>дате фактической доставки</b>; дата заказа показывается отдельно.
     ${q.funnelTop1000?'Воронка: детализация top-1000 SKU по трафику на daily-срез.':'Воронка: доступная детализация API.'}
     ${issues.length?`<span class="warning"> Требуют внимания: ${escapeHtml(issues.join('; '))}.</span>`:'<span class="positive"> Контрольные проверки пройдены.</span>'}`;
 }
@@ -1165,8 +1200,8 @@ function renderKpis(){
   const normStatus=m.rrpDelta==null?'предварительно':m.rrpDelta>=0?'норматив выполнен':'норматив не выполнен';
   const normClass=m.rrpDelta==null?'warning':m.rrpDelta>=0?'positive':'negative';
   const cards=[
-    ['Выручка Ozon',fmtMoney(m.totalRevenue),'факт из Finance API','', 'revenue'],
-    ['После услуг Ozon',fmtMoney(m.financeNetAccrued),'фактический ledger после комиссий/логистики/удержаний','', 'ozonNet'],
+    ['Выручка Ozon',fmtMoney(m.totalRevenue),'фактически доставленные за период заказы; поздние возвраты снимаются ретроспективно','', 'revenue'],
+    ['После услуг Ozon',fmtMoney(m.afterOzon),`выручка по доставке − расходы Ozon по датам Finance API (${fmtMoney(m.financeOzonExpenses)})`,'', 'ozonNet'],
     ['Внешние расходы',ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),extSub,ext?.complete?'':'warning','external'],
     ['Управленческий остаток',m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),'до закупки и налога',ext?.complete?'':'warning','management'],
     ['Норматив РРЦ −10%',m.rrpTarget!=null?fmtMoney(m.rrpTarget):fmtMoney(m.rrpTargetKnown),`Σ(РРЦ × реализованное количество) × 90% · покрытие ${fmtPct(m.rrpCoverageUnits)}`,m.rrpComplete?'':'warning','rrpTarget'],
@@ -1176,7 +1211,7 @@ function renderKpis(){
     [`Оценка УСН ${fmtPct(m.taxRate)}`,m.estimatedTax!=null?fmtMoney(m.estimatedTax):'нет данных','управленческая оценка по положительной базе','warning','tax'],
     ['Результат после УСН',m.businessNetProfit!=null?fmtMoney(m.businessNetProfit):'нет итоговой оценки',`маржа ${fmtPct(m.businessMargin)} · ROI ${fmtPct(m.businessRoi)}`,m.businessNetProfit!=null?(m.businessNetProfit>=0?'positive':'negative'):'warning','businessNet'],
     ['Реклама',m.adsSpend!=null?fmtMoney(m.adsSpend):'нет данных',state.settings.adsActive?'реклама включена':'реклама сейчас отключена; исторические списания входят в Finance API','','ads'],
-    ['Требуют внимания',fmtNum(attention),`${m.stockStats.critical} SKU критично по запасу + ${losses} убыточных SKU`,'warning','attention']
+    ['Требуют внимания',fmtNum(attention),`${m.stockStats.critical} SKU критично по текущему остатку + ${losses} убыточных SKU за выбранный период`,'warning','attention']
   ];
   $('#kpiGrid').innerHTML=cards.map(c=>`<div class="kpi clickable" data-drill="${c[4]}" tabindex="0" role="button"><div class="label">${c[0]}</div><div class="value ${c[3]}">${c[1]}</div><div class="sub">${c[2]}</div><div class="drill-hint">Расшифровать →</div></div>`).join('');
 }
@@ -1219,20 +1254,25 @@ function auditSampleProducts(){
   return picked.slice(0,20);
 }
 function financeQualityStatus(){
-  const q=currentModel.quality||{};
+  const q=currentModel.quality||{},m=currentModel;
   const directRows=q.skuFinanceDirectRows??q.skuFinanceRowsPublished??0;
-  const revenueDelta=Math.abs(safe(q.skuFinanceRevenueDelta));
+  const financeGrossAttributionDelta=Math.abs(safe(q.skuFinanceRevenueDelta));
   const skuReconcile=Math.abs(safe(q.skuFinanceReconcileDelta));
   const ledgerReconcile=Math.abs(safe(q.financeReconcileDelta));
-  const saleUnresolved=q.unresolvedSaleOps??0;
-  const coverage=q.skuFinanceCoverageComplete===true;
-  const ok=coverage&&directRows>0&&revenueDelta<1&&skuReconcile<1&&ledgerReconcile<1&&saleUnresolved===0&&q.returnsComplete!==false;
-  return {ok,directRows,revenueDelta,skuReconcile,ledgerReconcile,saleUnresolved,coverage,unallocatedRows:q.financeUnallocatedRows??0,unallocatedNet:safe(q.financeUnallocatedNet)};
+  const expenseReconcile=Math.abs(safe(m.reconciliation?.expenseDiff));
+  const unresolvedDelivery=q.unresolvedDeliveryDates??q.unresolvedSaleOps??0;
+  const inexactDelivery=q.inexactDeliveryRows??0;
+  const deliveryCoverage=Number.isFinite(Number(q.deliveryDateExactCoverage))?Number(q.deliveryDateExactCoverage):null;
+  const financeCoverage=q.skuFinanceCoverageComplete===true;
+  const deliveryOk=unresolvedDelivery===0&&inexactDelivery===0&&q.fbsDeliveryComplete!==false&&m.quantityComplete!==false;
+  const financeOk=financeCoverage&&directRows>0&&skuReconcile<1&&ledgerReconcile<1&&expenseReconcile<1;
+  const ok=deliveryOk&&financeOk;
+  return {ok,directRows,financeGrossAttributionDelta,skuReconcile,ledgerReconcile,expenseReconcile,unresolvedDelivery,inexactDelivery,deliveryCoverage,financeCoverage,deliveryOk,financeOk,unallocatedRows:q.financeUnallocatedRows??0,unallocatedExpenses:safe(m.unallocatedOzonExpenses)};
 }
 function renderOverview(){
   const m=currentModel,top=[...m.complete].sort((a,b)=>b.cleanProfit-a.cleanProfit).slice(0,5),bottom=[...m.complete].sort((a,b)=>a.cleanProfit-b.cleanProfit).slice(0,5),fq=financeQualityStatus(),q=m.quality||{};
   $('#tab-overview').innerHTML=`
-  <div class="card clickable" data-drill="auditSample" style="margin-bottom:12px"><h3>Контроль качества товарной экономики</h3><div class="grid g4" style="margin-top:8px"><div><div class="muted tiny">прямых SKU-строк Finance</div><div class="big ${fq.directRows>0?'positive':'warning'}">${fmtNum(fq.directRows)}</div></div><div><div class="muted tiny">дельта выручки SKU → ledger</div><div class="big ${fq.revenueDelta<1?'positive':'negative'}">${fmtMoney(fq.revenueDelta)}</div></div><div><div class="muted tiny">дельта direct net</div><div class="big ${fq.skuReconcile<1?'positive':'negative'}">${fmtMoney(fq.skuReconcile)}</div></div><div><div class="muted tiny">статус</div><div class="big ${fq.ok?'positive':'warning'}">${fq.ok?'контроль пройден':'нужна проверка'}</div></div></div><div class="muted tiny" style="margin-top:8px">Общие операции Ozon без SKU: ${fmtNum(fq.unallocatedRows)} строк · ${fmtMoney(fq.unallocatedNet)} net. Они учитываются только в P&L бизнеса и не распределяются искусственно по товарам.</div><div class="drill-hint">Открыть контрольную выборку 20 SKU →</div></div>
+  <div class="card clickable" data-drill="auditSample" style="margin-bottom:12px"><h3>Контроль качества товарной экономики</h3><div class="grid g4" style="margin-top:8px"><div><div class="muted tiny">точность даты доставки</div><div class="big ${fq.deliveryOk?'positive':'warning'}">${fq.deliveryCoverage==null?'—':fmtPct(fq.deliveryCoverage)}</div></div><div><div class="muted tiny">дельта расходов Finance</div><div class="big ${fq.expenseReconcile<1?'positive':'negative'}">${fmtMoney(fq.expenseReconcile)}</div></div><div><div class="muted tiny">дельта direct SKU net</div><div class="big ${fq.skuReconcile<1?'positive':'negative'}">${fmtMoney(fq.skuReconcile)}</div></div><div><div class="muted tiny">статус</div><div class="big ${fq.ok?'positive':'warning'}">${fq.ok?'контроль пройден':'нужна проверка'}</div></div></div><div class="muted tiny" style="margin-top:8px">Выручка/количество/закупка/РРЦ — по фактической дате доставки. Расходы Ozon — по дате начисления Finance API. Общие расходы Ozon без SKU: ${fmtNum(fq.unallocatedRows)} строк · ${fmtMoney(fq.unallocatedExpenses)}; по товарам не распределяются.</div><div class="drill-hint">Открыть контрольную выборку 20 SKU →</div></div>
   <div class="grid g2"><div class="card"><h3>Что важно по выбранному периоду</h3><div class="insights">${insightCards(m).map(([h,t])=>{const d=insightDrillType(h);return`<div class="insight ${d?'clickable':''}" ${d?`data-drill="${d}"`:''}><strong>${escapeHtml(h)}</strong><span class="muted">${escapeHtml(t)}</span>${d?'<div class="drill-hint">Показать детализацию →</div>':''}</div>`}).join('')}</div></div><div class="card"><h3>Нитка результата бизнеса</h3><div id="waterfallNote" class="muted tiny" style="margin-bottom:8px"></div><div id="waterfallEmpty" class="empty hidden"></div><div class="chartbox"><canvas id="waterfallChart"></canvas></div></div></div>
   <div class="grid g2" style="margin-top:12px"><div class="card"><h3>Тренд сохранённых срезов</h3><div class="muted tiny" style="margin-bottom:8px">История строится только по кнопке «Сохранить срез» и не подменяет фактическую дневную историю API.</div><div id="trendEmpty" class="empty hidden"></div><div class="chartbox small"><canvas id="trendChart"></canvas></div></div><div class="card"><h3>ABC по товарной прибыли</h3><div id="abcEmpty" class="empty hidden"></div><div class="chartbox small"><canvas id="abcChart"></canvas></div></div></div>
   <div class="grid g2" style="margin-top:12px"><div class="card"><h3>Товарная прибыль по категориям</h3>${categoryTable(m.categories)}</div><div class="card"><h3>Топ-5 / антитоп-5 по товарной прибыли</h3><div class="grid g2"><div><h4 class="positive">Топ-5</h4>${rankList(top)}</div><div><h4 class="negative">Антитоп-5</h4>${rankList(bottom)}</div></div></div></div>`;
@@ -1303,9 +1343,9 @@ function renderUnitTable(){
   let rows=filteredSorted(currentModel.products,tableState.unit,['name','article','sku']);
   const p=pagination(rows,tableState.unit);const page=rows.slice(p.start,p.end);
   $('#unitTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:2100px"><thead><tr>
-    ${th('Товар','name','unit')}<th>Артикул</th><th class="num">РРЦ, ₽/шт.</th><th class="num">Цена реализации</th><th>Закупочная цена, ₽/шт.</th><th class="num">Закупочная стоимость</th><th class="num">РРЦ реализации</th><th class="num">Продано net</th><th class="num">Выручка</th>
+    ${th('Товар','name','unit')}<th>Артикул</th><th>Заказы Ozon</th><th class="num">РРЦ, ₽/шт.</th><th class="num">Цена реализации</th><th>Закупочная цена, ₽/шт.</th><th class="num">Закупочная стоимость</th><th class="num">РРЦ реализации</th><th class="num">Продано net</th><th class="num">Выручка</th>
     <th class="num">После Ozon / ед.</th><th class="num">Комиссия / ед.</th><th class="num">Эквайринг / ед.</th><th class="num">Логистика / ед.</th><th class="num">Хранение / ед.</th><th class="num">Продвижение / ед.</th><th class="num">Возвраты/штрафы / ед.</th><th class="num">Прибыль / ед.</th><th class="num">Маржа</th><th class="num">ROI</th>
-    </tr></thead><tbody>${page.map(x=>`<tr><td class="name"><span class="linkish" data-product-drill="${escapeHtml(x.key)}">${escapeHtml(x.name||'Без названия')}</span></td><td>${escapeHtml(x.article||x.sku)}</td><td class="num">${fmtMoney(x.rrp)}</td><td class="num">${fmtMoney(x.price)}</td><td>${costCell(x)}</td><td class="num">${fmtMoney(x.cogs)}</td><td class="num">${fmtMoney(Number.isFinite(x.rrp)&&x.units!=null?x.rrp*x.units:null)}</td><td class="num">${x.units!=null?fmtNum(x.units,0):'нет данных'}</td><td class="num">${fmtMoney(x.revenue)}</td>
+    </tr></thead><tbody>${page.map(x=>`<tr><td class="name"><span class="linkish" data-product-drill="${escapeHtml(x.key)}">${escapeHtml(x.name||'Без названия')}</span></td><td>${escapeHtml(x.article||x.sku)}</td><td class="name">${orderSummaryHtml(x)}</td><td class="num">${fmtMoney(x.rrp)}</td><td class="num">${fmtMoney(x.price)}</td><td>${costCell(x)}</td><td class="num">${fmtMoney(x.cogs)}</td><td class="num">${fmtMoney(Number.isFinite(x.rrp)&&x.units!=null?x.rrp*x.units:null)}</td><td class="num">${x.units!=null?fmtNum(x.units,0):'нет данных'}</td><td class="num">${fmtMoney(x.revenue)}</td>
     <td class="num">${x.units?fmtMoney(x.netAfterOzon/x.units):'нет данных'}</td>
     <td class="num">${fmtMoney(perUnit(x,'commission'))}</td><td class="num">${fmtMoney(perUnit(x,'acquiring'))}</td><td class="num">${fmtMoney(perUnit(x,'logistics'))}</td><td class="num">${fmtMoney(perUnit(x,'storage'))}</td><td class="num">${fmtMoney(perUnit(x,'ads'))}</td><td class="num">${fmtMoney(x.units?(safe(x.components.returns?.value)+safe(x.components.fines?.value))/x.units:null)}</td>
     <td class="num ${x.profitPerUnit!=null?(x.profitPerUnit>=0?'positive':'negative'):''}">${fmtMoney(x.profitPerUnit)}</td><td class="num">${fmtPct(x.margin)}</td><td class="num">${fmtPct(x.roi)}</td></tr>`).join('')}</tbody></table></div>${pagerHtml(p,'unit')}`;
@@ -1321,11 +1361,22 @@ function renderProductTable(){
   let rows=filteredSorted(currentModel.products,tableState.products,['name','article','sku']);
   const p=pagination(rows,tableState.products),page=rows.slice(p.start,p.end);
   $('#productTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:2300px"><thead><tr>
-    <th></th>${th('Товар','name','products')}<th>Артикул</th><th>SKU</th><th>Категория</th><th class="num">РРЦ, ₽/шт.</th><th class="num">Цена реализации</th><th>Закупочная цена, ₽/шт.</th><th class="num">Закупочная стоимость</th><th class="num">РРЦ реализации</th><th class="num">Net, шт.</th><th class="num">Выручка</th><th class="num">После Ozon</th><th class="num">Товарная прибыль</th><th class="num">Прибыль / ед.</th><th class="num">Маржа</th><th class="num">ROI</th><th class="num">Доля выручки</th><th>ABC прибыль</th><th>ABC выручка</th><th class="num">Остаток</th><th class="num">Дней запаса</th>
-    </tr></thead><tbody>${page.map(x=>`<tr><td class="row-expand" data-expand="${escapeHtml(x.key)}">${tableState.products.expanded===x.key?'▾':'▸'}</td><td class="name"><span class="linkish" data-product-drill="${escapeHtml(x.key)}">${escapeHtml(x.name||'Без названия')}</span></td><td>${escapeHtml(x.article)}</td><td>${escapeHtml(x.sku)}</td><td class="name">${escapeHtml(x.category||'—')}</td><td class="num">${fmtMoney(x.rrp)}</td><td class="num">${fmtMoney(x.price)}</td><td>${costCell(x)}</td><td class="num">${fmtMoney(x.cogs)}</td><td class="num">${fmtMoney(Number.isFinite(x.rrp)&&x.units!=null?x.rrp*x.units:null)}</td><td class="num">${x.units!=null?fmtNum(x.units,0):'нет данных'}</td><td class="num">${fmtMoney(x.revenue)}</td><td class="num">${fmtMoney(x.netAfterOzon)}</td><td class="num ${x.cleanProfit!=null?(x.cleanProfit>=0?'positive':'negative'):''}">${fmtMoney(x.cleanProfit)}</td><td class="num">${fmtMoney(x.profitPerUnit)}</td><td class="num">${fmtPct(x.margin)}</td><td class="num">${fmtPct(x.roi)}</td><td class="num">${fmtPct(x.revenueShare)}</td><td>${x.abcProfit||'—'}</td><td>${x.abcRevenue||'—'}</td><td class="num">${x.stock!=null?fmtNum(x.stock):'нет данных'}</td><td class="num">${x.daysToZero===Infinity?'∞':fmtNum(x.daysToZero,1)}</td></tr>${tableState.products.expanded===x.key?expandedProductRow(x):''}`).join('')}</tbody></table></div>${pagerHtml(p,'products')}`;
+    <th></th>${th('Товар','name','products')}<th>Артикул</th><th>SKU</th><th>Категория</th><th>Заказы Ozon</th><th class="num">РРЦ, ₽/шт.</th><th class="num">Цена реализации</th><th>Закупочная цена, ₽/шт.</th><th class="num">Закупочная стоимость</th><th class="num">РРЦ реализации</th><th class="num">Net, шт.</th><th class="num">Выручка</th><th class="num">После Ozon</th><th class="num">Товарная прибыль</th><th class="num">Прибыль / ед.</th><th class="num">Маржа</th><th class="num">ROI</th><th class="num">Доля выручки</th><th>ABC прибыль</th><th>ABC выручка</th><th class="num">Остаток</th><th class="num">Дней запаса</th>
+    </tr></thead><tbody>${page.map(x=>`<tr><td class="row-expand" data-expand="${escapeHtml(x.key)}">${tableState.products.expanded===x.key?'▾':'▸'}</td><td class="name"><span class="linkish" data-product-drill="${escapeHtml(x.key)}">${escapeHtml(x.name||'Без названия')}</span></td><td>${escapeHtml(x.article)}</td><td>${escapeHtml(x.sku)}</td><td class="name">${escapeHtml(x.category||'—')}</td><td class="name">${orderSummaryHtml(x)}</td><td class="num">${fmtMoney(x.rrp)}</td><td class="num">${fmtMoney(x.price)}</td><td>${costCell(x)}</td><td class="num">${fmtMoney(x.cogs)}</td><td class="num">${fmtMoney(Number.isFinite(x.rrp)&&x.units!=null?x.rrp*x.units:null)}</td><td class="num">${x.units!=null?fmtNum(x.units,0):'нет данных'}</td><td class="num">${fmtMoney(x.revenue)}</td><td class="num">${fmtMoney(x.netAfterOzon)}</td><td class="num ${x.cleanProfit!=null?(x.cleanProfit>=0?'positive':'negative'):''}">${fmtMoney(x.cleanProfit)}</td><td class="num">${fmtMoney(x.profitPerUnit)}</td><td class="num">${fmtPct(x.margin)}</td><td class="num">${fmtPct(x.roi)}</td><td class="num">${fmtPct(x.revenueShare)}</td><td>${x.abcProfit||'—'}</td><td>${x.abcRevenue||'—'}</td><td class="num">${x.stock!=null?fmtNum(x.stock):'нет данных'}</td><td class="num">${x.daysToZero===Infinity?'∞':fmtNum(x.daysToZero,1)}</td></tr>${tableState.products.expanded===x.key?expandedProductRow(x):''}`).join('')}</tbody></table></div>${pagerHtml(p,'products')}`;
   bindSort('products');bindPager('products');bindCostInputs();$$('[data-expand]').forEach(el=>el.addEventListener('click',()=>{tableState.products.expanded=tableState.products.expanded===el.dataset.expand?null:el.dataset.expand;renderProductTable()}));
 }
 function productTr(p){const exp=tableState.products.expanded===p.key;const c=p.components;return`<tr><td class="row-expand" data-expand="${escapeHtml(p.key)}">${exp?'▾':'▸'} ${escapeHtml(p.article||p.sku)}</td><td class="name">${escapeHtml(p.name)}</td><td>${costCell(p)}</td><td class="num">${fmtMoney(p.price)}</td><td class="num">${fmtNum(p.units)}</td><td class="num">${fmtMoney(p.revenue)}</td><td class="num">${fmtMoney(c.acquiring.value)}</td><td class="num">${fmtMoney(c.logistics.value)}</td><td class="num">${fmtMoney(c.storage.value)}</td><td class="num">${fmtMoney(c.ads.value)}</td><td class="num">${fmtPct(p.drr)}</td><td class="num">${fmtMoney(c.taxes.value)}</td><td class="num">${fmtMoney(c.fines.value)}</td><td class="num">${fmtMoney(c.returns.value)}</td><td class="num">${fmtMoney(c.other.value)}</td><td class="num ${p.cleanProfit!=null?(p.cleanProfit>=0?'positive':'negative'):''}">${fmtMoney(p.cleanProfit)}</td><td class="num">${fmtMoney(p.profitPerUnit)}</td><td class="num">${fmtPct(p.roi)}</td><td class="num">${fmtPct(p.margin)}</td><td class="num">${fmtPct(p.revenueShare)}</td><td>${p.abcProfit}</td><td>${p.abcRevenue}</td></tr>${exp?`<tr class="expanded"><td colspan="22">${productDetail(p)}</td></tr>`:''}`}
+function uniqueProductOrders(p){
+  const m=new Map();for(const e of p?.orderEvents||[]){const k=e.orderNumber||e.postingNumber;if(!k)continue;const old=m.get(k)||e;if(!old.orderDate&&e.orderDate)old.orderDate=e.orderDate;if(!old.postingNumber&&e.postingNumber)old.postingNumber=e.postingNumber;m.set(k,old)}return[...m.values()].sort((a,b)=>(a.orderDate||'').localeCompare(b.orderDate||''));
+}
+function orderSummaryHtml(p,max=2){const a=uniqueProductOrders(p);if(!a.length)return'<span class="muted">—</span>';const shown=a.slice(0,max).map(e=>`<div><b>${escapeHtml(e.orderNumber||'номер не получен')}</b>${e.orderDate?` · ${dateLabel(e.orderDate)}`:''}</div>`).join('');return `${shown}${a.length>max?`<div class="muted tiny">ещё ${a.length-max}</div>`:''}`}
+function orderSummaryText(p){return uniqueProductOrders(p).map(e=>`${e.orderNumber||'[нет номера]'}${e.orderDate?' | '+e.orderDate:''}${e.postingNumber?' | отправление '+e.postingNumber:''}`).join('; ')}
+function productOrdersTable(p){
+  const rows=[...(p?.orderEvents||[])].sort((a,b)=>(b.deliveryDate||b.orderDate||b.financeDates?.at(-1)||'').localeCompare(a.deliveryDate||a.orderDate||a.financeDates?.at(-1)||''));
+  if(!rows.length)return'<div class="empty">Для товара в выбранном периоде нет заказов/финансовых событий с номером заказа.</div>';
+  return`<div class="table-wrap"><table class="table" style="min-width:1650px"><thead><tr><th>Дата заказа Ozon</th><th>Номер заказа Ozon</th><th>Номер отправления Ozon</th><th>Дата доставки</th><th class="num">Доставлено</th><th class="num">Возвращено позже</th><th class="num">Осталось в продаже</th><th class="num">Выручка до возврата</th><th class="num">Снято возвратом</th><th class="num">Выручка</th><th>Дата возврата</th><th>Finance-даты в периоде</th><th>Статус возврата</th><th>Схема</th></tr></thead><tbody>${rows.map(e=>`<tr><td>${e.orderDate?dateLabel(e.orderDate):'—'}</td><td><b>${escapeHtml(e.orderNumber||'—')}</b></td><td>${escapeHtml(e.postingNumber||'—')}</td><td>${e.deliveryDate?dateLabel(e.deliveryDate):'—'}${e.deliveryDateExact===false?' <span class="badge estimate">резервная дата</span>':''}</td><td class="num">${e.quantityKnown?fmtNum(e.soldQty,0):'—'}</td><td class="num">${e.quantityKnown?fmtNum(e.returnedQty,0):'—'}</td><td class="num">${e.quantityKnown?fmtNum(e.netQty,0):'—'}</td><td class="num">${e.quantityKnown?fmtMoney(e.originalRevenue):'—'}</td><td class="num">${e.quantityKnown?fmtMoney(e.retroReturnedRevenue):'—'}</td><td class="num">${e.quantityKnown?fmtMoney(e.revenue):'—'}</td><td>${e.returnDate?dateLabel(e.returnDate):'—'}</td><td>${(e.financeDates||[]).map(dateLabel).join(', ')||'—'}</td><td>${e.returnStatus==='full'?'полный':e.returnStatus==='partial'?'частичный':e.returnStatus==='none'?'—':escapeHtml(e.returnStatus||'—')}</td><td>${escapeHtml(e.orderSchema||'—')}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
 function productDetail(p){
   const max=Math.max(1,p.sales.impressions,p.sales.visits,p.sales.carts,p.sales.ordered,p.sales.delivered);
   const bars=[['Показы',p.sales.impressions],['Визиты',p.sales.visits],['В корзину',p.sales.carts],['Заказано',p.sales.ordered],['Доставлено',p.sales.delivered]];
@@ -1339,10 +1390,10 @@ function productDetail(p){
     ['РРЦ, ₽/шт.',fmtMoney(p.rrp)],
     ['РРЦ реализации',fmtMoney(Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null)],
     ['Finance by-day: Σ seller_price (диагностика)',fmtMoney(p.finance?.sellerPriceRaw)],
-    ['Выручка / sale_amount',fmtMoney(p.finance?.saleAmount)],
+    ['Finance sale_amount (только аудит)',fmtMoney(p.finance?.saleAmount)],
     ['Баллы за скидки / bonus',fmtMoney(p.finance?.bonus)],
     ['Соинвестирование / coinvestment',fmtMoney(p.finance?.coinvestment)],
-    ['Валовой доход до расходов Ozon',fmtMoney(p.revenue)],
+    ['Выручка доставленных и не возвращённых товаров',fmtMoney(p.revenue)],
     ['Точных SKU-начислений',fmtNum(p.finance?.accrualLines||0)],
     ['Комиссия Ozon',fmtMoney(p.components.commission.value)],
     ['Эквайринг',fmtMoney(p.components.acquiring.value)],
@@ -1356,17 +1407,31 @@ function productDetail(p){
     ['Товарная прибыль',fmtMoney(p.operatingProfit)]
   ];
   const qtyAudit=`Прямая SKU-атрибуция /finance/accrual/by-day: ${fmtNum(p.finance?.exactRows||0)} финансовых строк${p.financeExactComplete===false?' · товарная прибыль не показывается, пока сверка прямой SKU-атрибуции не пройдена':''}`;
-  return`<div class="detail-grid"><div><h4>Нитка прибыли</h4><div class="chain">${chain.map((x,i)=>`${i?'<span class="arrow">→</span>':''}<span>${escapeHtml(x[0])}: <b>${fmtMoney(x[1])}</b></span>`).join('')}</div>${p.missingProfit.length?`<div class="muted tiny" style="margin-top:8px">Не хватает: ${escapeHtml(p.missingProfit.join(', '))}</div>`:''}</div><div><h4>Мини-воронка</h4><div class="funnel-mini">${bars.map(([n,v])=>`<div class="fbar"><i style="width:${100*v/max}%"></i><span>${n}: ${fmtNum(v)}</span></div>`).join('')}</div></div><div><h4>Остаток и поставка</h4>${s?`<div class="metric-row"><span>Остаток</span><b>${fmtNum(s.stock)} шт.</b></div><div class="metric-row"><span>Скорость</span><b>${fmtNum(s.velocity,2)} шт./день</b></div><div class="metric-row"><span>Хватит</span><b>${s.daysToZero===Infinity?'нет продаж':fmtNum(s.daysToZero,1)+' дн.'}</b></div><div class="metric-row"><span>Рекомендация</span><b>${escapeHtml(s.recommendation)}</b></div>`:'<div class="empty">Нет отчёта остатков для товара.</div>'}</div></div><div class="card" style="margin-top:12px"><h4>Аудит товарной прибыли</h4><div class="muted tiny" style="margin-bottom:8px">${escapeHtml(qtyAudit)}. Для товарной экономики валовой доход берётся из /finance/accrual/by-day как sale_amount. Поля bonus и coinvestment показываются только для аудита: они уже входят в sale_amount и повторно не прибавляются. seller_price показывается только для диагностики и не используется как итоговая выручка. Деньги после Ozon = валовой доход минус прямая комиссия, доставка и item_fees. Количество для закупочной стоимости — из слоя реализации.</div><div class="table-wrap"><table class="table" style="min-width:620px"><tbody>${auditRows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num"><b>${v}</b></td></tr>`).join('')}</tbody></table></div></div>`
+  return`<div class="detail-grid"><div><h4>Нитка прибыли</h4><div class="chain">${chain.map((x,i)=>`${i?'<span class="arrow">→</span>':''}<span>${escapeHtml(x[0])}: <b>${fmtMoney(x[1])}</b></span>`).join('')}</div>${p.missingProfit.length?`<div class="muted tiny" style="margin-top:8px">Не хватает: ${escapeHtml(p.missingProfit.join(', '))}</div>`:''}</div><div><h4>Мини-воронка</h4><div class="funnel-mini">${bars.map(([n,v])=>`<div class="fbar"><i style="width:${100*v/max}%"></i><span>${n}: ${fmtNum(v)}</span></div>`).join('')}</div></div><div><h4>Остаток и поставка</h4>${s?`<div class="metric-row"><span>Остаток</span><b>${fmtNum(s.stock)} шт.</b></div><div class="metric-row"><span>Скорость</span><b>${fmtNum(s.velocity,2)} шт./день</b></div><div class="metric-row"><span>Хватит</span><b>${s.daysToZero===Infinity?'нет продаж':fmtNum(s.daysToZero,1)+' дн.'}</b></div><div class="metric-row"><span>Рекомендация</span><b>${escapeHtml(s.recommendation)}</b></div>`:'<div class="empty">Нет отчёта остатков для товара.</div>'}</div></div><div class="card" style="margin-top:12px"><h4>Аудит товарной прибыли</h4><div class="muted tiny" style="margin-bottom:8px">${escapeHtml(qtyAudit)}. В v8 выручка и количество берутся из доставленных заказов по фактической дате доставки. Если товар позже возвращён, исходная доставка ретроспективно уменьшается. Прямые расходы Ozon берутся отдельно из /finance/accrual/by-day по датам их начисления. sale_amount, seller_price, bonus и coinvestment в Finance показываются здесь только для аудита и не задают период выручки.</div><div class="table-wrap"><table class="table" style="min-width:620px"><tbody>${auditRows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num"><b>${v}</b></td></tr>`).join('')}</tbody></table></div></div><div class="card" style="margin-top:12px"><h4>Заказы Ozon за выбранный период</h4><div class="muted tiny" style="margin-bottom:8px">Дата заказа — дата оформления заказа в Ozon. Дата доставки — дата признания продажи в P&amp;L. Поздний возврат ретроспективно уменьшает эту исходную продажу; дата возврата показана отдельно. Номер заказа и номер отправления — разные идентификаторы Ozon.</div>${productOrdersTable(p)}</div>`
 }
 function bindManualCosts(){$$('.manual-cost').forEach(el=>el.addEventListener('change',e=>{const v=num(e.target.value);if(v==null||v<0)delete state.manualCosts[e.target.dataset.key];else state.manualCosts[e.target.dataset.key]={value:v,updatedAt:new Date().toISOString()};persistState();renderAll()}))}
 function focusCost(key){activeTab='unit';$$('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab==='unit'));$$('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-unit'));const p=currentModel.products.find(x=>x.key===key);tableState.unit.search=p?.article||p?.sku||'';tableState.unit.page=1;renderUnit();setTimeout(()=>document.querySelector(`[data-product-key="${CSS.escape(key)}"] .manual-cost`)?.focus(),50)}
+
+function renderOrders(){
+  const st=tableState.orders;
+  $('#tab-orders').innerHTML=`<div class="card"><h3>Заказы Ozon, влияющие на выбранный период</h3><div class="drawer-note">Продажи попадают в период по <b>фактической дате доставки</b>. Если товар возвращён позже, исходная доставка уже уменьшена ретроспективно. Отдельные строки без даты доставки — это заказы, по которым в выбранном периоде были Finance-начисления, но сама доставка находится вне выбранного периода.</div><div class="table-tools"><input id="ordersSearch" class="input" placeholder="Номер заказа / отправления / товар / артикул / SKU" value="${escapeHtml(st.search)}" autocomplete="off"><button id="ordersExport" class="btn">Экспорт Excel</button></div><div id="ordersTable"></div></div>`;
+  $('#ordersSearch')?.addEventListener('input',e=>{st.search=e.target.value;st.page=1;renderOrdersTable()});$('#ordersExport')?.addEventListener('click',exportOrders);renderOrdersTable();
+}
+function filteredOrderRows(){const st=tableState.orders,q=norm(st.search||'');let rows=currentModel.orderRows||[];if(q)rows=rows.filter(r=>norm(`${r.orderNumber||''} ${r.postingNumber||''} ${r.name||''} ${r.article||''} ${r.sku||''}`).includes(q));return sortRows(rows,st.sort,st.dir)}
+function renderOrdersTable(){
+  const st=tableState.orders,rows=filteredOrderRows(),page=paginate(rows,st);
+  $('#ordersTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:1950px"><thead><tr><th data-osort="deliveryDate">Дата доставки</th><th data-osort="orderDate">Дата заказа Ozon</th><th data-osort="orderNumber">Номер заказа Ozon</th><th data-osort="postingNumber">Номер отправления Ozon</th><th data-osort="article">Артикул</th><th data-osort="sku">SKU</th><th data-osort="name">Товар</th><th class="num">Доставлено</th><th class="num">Возвращено позже</th><th class="num">Осталось в продаже</th><th class="num">Выручка до возврата</th><th class="num">Снято возвратом</th><th class="num">Выручка</th><th>Дата возврата</th><th>Finance-даты в периоде</th><th>Статус возврата</th><th>Схема</th></tr></thead><tbody>${page.items.map(r=>`<tr><td>${r.deliveryDate?dateLabel(r.deliveryDate):'—'}${r.deliveryDateExact===false?' <span class="badge estimate">резервная</span>':''}</td><td>${r.orderDate?dateLabel(r.orderDate):'—'}</td><td><b>${escapeHtml(r.orderNumber||'—')}</b></td><td>${escapeHtml(r.postingNumber||'—')}</td><td><span class="linkish" data-product-drill="${escapeHtml(r.productKey)}">${escapeHtml(r.article||'—')}</span></td><td>${escapeHtml(r.sku||'—')}</td><td class="name">${escapeHtml(r.name||'')}</td><td class="num">${r.quantityKnown?fmtNum(r.soldQty,0):'—'}</td><td class="num">${r.quantityKnown?fmtNum(r.returnedQty,0):'—'}</td><td class="num">${r.quantityKnown?fmtNum(r.netQty,0):'—'}</td><td class="num">${r.quantityKnown?fmtMoney(r.originalRevenue):'—'}</td><td class="num">${r.quantityKnown?fmtMoney(r.retroReturnedRevenue):'—'}</td><td class="num">${r.quantityKnown?fmtMoney(r.revenue):'—'}</td><td>${r.returnDate?dateLabel(r.returnDate):'—'}</td><td>${(r.financeDates||[]).map(dateLabel).join(', ')||'—'}</td><td>${r.returnStatus==='full'?'полный':r.returnStatus==='partial'?'частичный':r.returnStatus==='none'?'—':escapeHtml(r.returnStatus||'—')}</td><td>${escapeHtml(r.orderSchema||'—')}</td></tr>`).join('')}</tbody></table></div>${pagerHtml(page,'orders')}`;
+  $$('[data-osort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.osort;st.dir=st.sort===k?-st.dir:1;st.sort=k;renderOrdersTable()}));bindPager('orders',renderOrdersTable);
+}
+function orderExportRow(r){return {'Дата доставки':r.deliveryDate||'','Дата заказа Ozon':r.orderDate||'','Номер заказа Ozon':r.orderNumber||'','Номер отправления Ozon':r.postingNumber||'','Артикул':r.article||'','SKU':r.sku||'','Товар':r.name||'','Доставлено':r.quantityKnown?r.soldQty:null,'Возвращено позже':r.quantityKnown?r.returnedQty:null,'Осталось в продаже':r.quantityKnown?r.netQty:null,'Выручка до возврата':r.quantityKnown?r.originalRevenue:null,'Снято возвратом':r.quantityKnown?r.retroReturnedRevenue:null,'Выручка':r.quantityKnown?r.revenue:null,'Дата возврата':r.returnDate||'','Finance-даты в периоде':(r.financeDates||[]).join(', '),'Статус возврата':r.returnStatus||'','Точная дата доставки':r.deliveryDate? (r.deliveryDateExact!==false?'да':'нет') : 'не применимо','Схема':r.orderSchema||''}}
+function exportOrders(){if(!window.XLSX)return;const rows=filteredOrderRows().map(orderExportRow);const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Заказы Ozon');XLSX.writeFile(wb,`ozon_orders_${currentModel.period?.start||'all'}_${currentModel.period?.end||'all'}.xlsx`)}
 
 function renderAds(){const m=currentModel;const adStatus=state.settings.adsActive?'<span class="badge actual">реклама включена</span>':'<span class="badge missing">реклама отключена</span>';$('#tab-ads').innerHTML=`<div class="notice ${state.settings.adsActive?'warning':'success'}"><b>Статус:</b> ${adStatus} ${!state.settings.adsActive&&m.adsSpend!=null?`Исторические расходы на продвижение за выбранный период — <b>${fmtMoney(m.adsSpend)}</b>; они учтены в P&L.`:''}</div><div class="grid g2" style="margin-top:12px"><div class="card"><h3>Воронка каталога</h3>${m.funnelDs.length?'<div class="chartbox"><canvas id="funnelChart"></canvas></div>':'<div class="empty">Нужны данные по показам, визитам, корзине и заказам.</div>'}</div><div class="card"><h3>Точки роста</h3>${m.signals.length?`<div class="table-wrap" style="max-height:330px"><table class="table" style="min-width:720px"><thead><tr><th>Товар</th><th>Сигнал</th><th>Почему</th><th class="num">Потенциал</th></tr></thead><tbody>${m.signals.slice(0,100).map(x=>`<tr class="drill-row" data-product-drill="${escapeHtml(x.product.key)}"><td class="name"><span class="linkish">${escapeHtml(x.product.article)} · ${escapeHtml(x.product.name)}</span></td><td>${escapeHtml(x.type)}</td><td class="name">${escapeHtml(x.detail)}</td><td class="num">${fmtMoney(x.potential)}</td></tr>`).join('')}</tbody></table></div><div class="footer-note">Потенциал рассчитан как сценарий достижения медианной конверсии каталога и умножен на прибыль на единицу. Это ориентир для приоритизации, не гарантия.</div>`:'<div class="empty">Сигналы требуют воронку и рассчитанную маржу.</div>'}</div></div><div class="card" style="margin-top:12px"><h3>Рекламные кампании</h3>${m.adsDs.length?campaignTable(m.campaigns):`<div class="empty">${state.settings.adsActive?'Для разбивки по кампаниям нужен детальный рекламный отчёт.':'Реклама сейчас отключена. Детализация по кампаниям не требуется для текущего P&L; исторические расходы уже учтены из финансовых начислений.'}</div>`}</div>`}
 function campaignTable(rows){return`<div class="table-wrap"><table class="table" style="min-width:800px"><thead><tr><th>Кампания</th><th class="num">Расход</th><th class="num">Показы</th><th class="num">Клики</th><th class="num">CTR</th><th class="num">Заказы</th><th class="num">Выручка</th><th class="num">ДРР</th></tr></thead><tbody>${rows.sort((a,b)=>b.spend-a.spend).map(c=>`<tr><td class="name">${escapeHtml(c.campaign)}</td><td class="num">${fmtMoney(c.spend)}</td><td class="num">${fmtNum(c.impressions)}</td><td class="num">${fmtNum(c.clicks)}</td><td class="num">${fmtPct(c.ctr)}</td><td class="num">${fmtNum(c.orders)}</td><td class="num">${fmtMoney(c.revenue)}</td><td class="num">${fmtPct(c.drr)}</td></tr>`).join('')}</tbody></table></div>`}
 
 function renderStock(){const m=currentModel,s=m.stockStats,cats=[...new Set(s.rows.map(x=>x.category).filter(Boolean))].sort();$('#tab-stock').innerHTML=`<div class="grid g3"><div class="card clickable" data-drill="stockCritical"><div class="muted">Критично: &lt; ${state.settings.criticalDays} дней</div><div class="big negative">${s.critical}</div><div class="drill-hint">Показать товары →</div></div><div class="card clickable" data-drill="stockAttention"><div class="muted">Внимание: &lt; ${state.settings.attentionDays} дней</div><div class="big warning">${s.attention}</div><div class="drill-hint">Показать товары →</div></div><div class="card clickable" data-drill="stockNormal"><div class="muted">В норме</div><div class="big positive">${s.normal}</div><div class="drill-hint">Показать товары →</div></div></div><div class="grid g2" style="margin-top:12px"><div class="card"><h3>Распределение по сроку до обнуления</h3>${m.stockDs?'<div class="chartbox small"><canvas id="stockChart"></canvas></div>':'<div class="empty">Нет отчёта остатков.</div>'}</div><div class="card"><h3>Ближайшие к обнулению</h3>${stockNearest(s.rows)}</div></div><div class="card" style="margin-top:12px"><h3>Планирование поставок</h3><div class="table-tools"><input id="stockSearch" class="input" placeholder="Поиск" value="${escapeHtml(tableState.stock.search)}"><select id="stockCategory" class="select"><option value="">Все категории</option>${cats.map(c=>`<option ${tableState.stock.category===c?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select></div><div id="stockTable"></div></div>`;const upd=()=>{tableState.stock.search=$('#stockSearch').value;tableState.stock.category=$('#stockCategory').value;tableState.stock.page=1;renderStockTable()};$('#stockSearch')?.addEventListener('input',upd);$('#stockCategory')?.addEventListener('change',upd);renderStockTable()}
 function stockNearest(rows){const r=rows.filter(x=>x.status!=='Нет продаж'&&Number.isFinite(x.daysToZero)).sort((a,b)=>a.daysToZero-b.daysToZero).slice(0,12);if(!r.length)return'<div class="empty">Нет продающихся товаров с рассчитанным сроком обнуления.</div>';return r.map(p=>`<div class="metric-row clickable" data-product-drill="${escapeHtml(p.key)}"><div><b class="linkish">${escapeHtml(p.article||p.sku)}</b><div class="muted tiny">${escapeHtml(p.name)}</div></div><div class="num"><b>${fmtNum(p.daysToZero,1)} дн.</b><div class="muted tiny">≈ ${p.zeroDate}</div></div></div>`).join('')}
-function renderStockTable(){const st=tableState.stock;let rows=currentModel.stockStats.rows.filter(p=>matchesTableSearch(p,st.search,['name','article','sku'])&&(!st.category||p.category===st.category));rows=sortRows(rows,st.sort,st.dir);const page=paginate(rows,st);$('#stockTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:900px"><thead><tr><th data-ssort="article">Артикул</th><th data-ssort="name">Товар</th><th class="num" data-ssort="stock">Остаток</th><th class="num" data-ssort="velocity">Скорость, шт/день</th><th class="num" data-ssort="daysToZero">Дней хватит</th><th>Статус</th><th>Дата обнуления</th><th>Рекомендация</th><th>ABC прибыль</th></tr></thead><tbody>${page.items.map(p=>`<tr><td><span class="linkish" data-product-drill="${escapeHtml(p.key)}">${escapeHtml(p.article||p.sku)}</span></td><td class="name">${escapeHtml(p.name)}</td><td class="num">${fmtNum(p.stock)}</td><td class="num">${fmtNum(p.velocity,2)}</td><td class="num">${p.status==='Нет продаж'?'нет продаж':fmtNum(p.daysToZero,1)}</td><td class="${p.status==='Критично'?'negative':p.status==='Внимание'?'warning':p.status==='Норма'?'positive':''}">${p.status}</td><td>${p.zeroDate}</td><td class="name">${p.recommendation}</td><td>${p.abcProfit}</td></tr>`).join('')}</tbody></table></div>${pagerHtml(page,'stock')}`;$$('[data-ssort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.ssort;st.dir=st.sort===k?-st.dir:1;st.sort=k;renderStockTable()}));bindPager('stock',renderStockTable)}
+function renderStockTable(){const st=tableState.stock;let rows=currentModel.stockStats.rows.filter(p=>matchesTableSearch(p,st.search,['name','article','sku'])&&(!st.category||p.category===st.category));rows=sortRows(rows,st.sort,st.dir);const page=paginate(rows,st);$('#stockTable').innerHTML=`<div class="table-wrap"><table class="table" style="min-width:900px"><thead><tr><th data-ssort="article">Артикул</th><th data-ssort="name">Товар</th><th class="num" data-ssort="stock">Остаток</th><th class="num" data-ssort="velocity">Скорость, шт/день</th><th class="num" data-ssort="daysToZero">Дней хватит</th><th>Статус</th><th>Дата обнуления</th><th>Заказы выбранного периода</th><th>Рекомендация</th><th>ABC прибыль</th></tr></thead><tbody>${page.items.map(p=>`<tr><td><span class="linkish" data-product-drill="${escapeHtml(p.key)}">${escapeHtml(p.article||p.sku)}</span></td><td class="name">${escapeHtml(p.name)}</td><td class="num">${fmtNum(p.stock)}</td><td class="num">${fmtNum(p.velocity,2)}</td><td class="num">${p.status==='Нет продаж'?'нет продаж':fmtNum(p.daysToZero,1)}</td><td class="${p.status==='Критично'?'negative':p.status==='Внимание'?'warning':p.status==='Норма'?'positive':''}">${p.status}</td><td>${p.zeroDate}</td><td class="name">${orderSummaryHtml(p)}</td><td class="name">${p.recommendation}</td><td>${p.abcProfit}</td></tr>`).join('')}</tbody></table></div>${pagerHtml(page,'stock')}`;$$('[data-ssort]').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.ssort;st.dir=st.sort===k?-st.dir:1;st.sort=k;renderStockTable()}));bindPager('stock',renderStockTable)}
 
 function renderSettings(){
   const s=state.settings,m=currentModel,q=m.quality||{},months=m.businessPeriod?monthsInRange(m.businessPeriod.start,m.businessPeriod.end):[];
@@ -1410,12 +1475,16 @@ function renderSettings(){
     <div class="metric-row"><span>Закупочная цена найдена</span><span>${fmtNum(q.ozonCostKnown)} / ${fmtNum(q.currentOzonArticles)} (${fmtPct(pct(q.ozonCostKnown,q.currentOzonArticles))})</span></div>
     <div class="metric-row"><span>РРЦ найдена</span><span>${fmtNum(q.ozonRrpKnown)} / ${fmtNum(q.currentOzonArticles)} (${fmtPct(pct(q.ozonRrpKnown,q.currentOzonArticles))})</span></div>
     <div class="metric-row"><span>Конфликтов закупочной цены</span><span class="${q.ozonCostConflict?'negative':'positive'}">${fmtNum(q.ozonCostConflict)}</span></div>
-    <div class="metric-row"><span>Сверка выручки SKU → business ledger</span><span class="${Math.abs(safe(m.reconciliation?.revenueDiff))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(m.reconciliation?.revenueDiff)))}</span></div>
+    <div class="metric-row"><span>Выручка доставленных заказов (P&amp;L)</span><b>${fmtMoney(m.totalRevenue)}</b></div>
+    <div class="metric-row"><span>Finance gross (только аудит, другой временной базис)</span><span>${fmtMoney(m.financeGrossAccrued)} · разница по времени ${fmtMoney(m.reconciliation?.financeRevenueTimingDelta)}</span></div>
+    <div class="metric-row"><span>Расходы Ozon по Finance-дате</span><b>${fmtMoney(m.financeOzonExpenses)}</b></div>
+    <div class="metric-row"><span>Сверка расходов direct SKU + общие → Finance</span><span class="${Math.abs(safe(m.reconciliation?.expenseDiff))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(m.reconciliation?.expenseDiff)))}</span></div>
     <div class="metric-row"><span>Business ledger reconcile delta</span><span class="${Math.abs(safe(q.financeReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.financeReconcileDelta)))}</span></div>
-    <div class="metric-row"><span>Количество реализации</span><span>${m.quantityComplete?'<span class="positive">контроль пройден</span>':`<span class="warning">есть несопоставленные операции: ${fmtNum(q.unresolvedSaleOps)}</span>`}</span></div>
-    <div class="metric-row"><span>Источник товарной экономики</span><span>${escapeHtml(q.skuFinanceSource||'finance/accrual/by-day · sale_amount')}</span></div>
+    <div class="metric-row"><span>Даты фактической доставки</span><span>${m.quantityComplete?`<span class="positive">контроль пройден · точность ${q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage)}</span>`:`<span class="warning">нет точной даты: ${fmtNum(q.unresolvedDeliveryDates??q.unresolvedSaleOps??0)} · резервных дат: ${fmtNum(q.inexactDeliveryRows||0)}</span>`}</span></div>
+    <div class="metric-row"><span>Ретроспективные возвраты</span><span>${fmtNum(q.retroReturnedUnits||0)} шт. · снято выручки ${fmtMoney(q.retroReturnedRevenue||0)}</span></div>
+    <div class="metric-row"><span>Источник товарной экономики</span><span>${escapeHtml(q.skuFinanceSource||'finance/accrual/by-day · direct SKU expenses')}</span></div>
     <div class="metric-row"><span>Прямых SKU-строк Finance</span><span>${fmtNum(q.skuFinanceDirectRows??q.skuFinanceRowsPublished??0)}</span></div>
-    <div class="metric-row"><span>Дельта выручки SKU → business ledger</span><span class="${Math.abs(safe(q.skuFinanceRevenueDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceRevenueDelta)))}</span></div>
+    <div class="metric-row"><span>Finance gross attribution delta (аудит)</span><span class="${Math.abs(safe(q.skuFinanceRevenueDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceRevenueDelta)))}</span></div>
     <div class="metric-row"><span>Дельта direct SKU net</span><span class="${Math.abs(safe(q.skuFinanceReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.skuFinanceReconcileDelta)))}</span></div>
     <div class="metric-row"><span>Прямые SKU-строки business ledger</span><span>${fmtNum(q.financeDirectSkuRows??0)}</span></div>
     <div class="metric-row"><span>Общие строки Finance без SKU</span><span>${fmtNum(q.financeUnallocatedRows??0)} · net ${fmtMoney(q.financeUnallocatedNet)}</span></div>
@@ -1481,7 +1550,8 @@ function attentionProducts(){
 function baseProductColumns(){return[
   {key:'article',label:'Артикул',fmt:p=>escapeHtml(p.article||p.sku||'—'),html:true},
   {key:'name',label:'Товар',fmt:p=>`<span class="linkish" data-product-drill="${escapeHtml(p.key)}">${escapeHtml(p.name||'Без названия')}</span>`,html:true,cls:'name'},
-  {key:'category',label:'Категория',fmt:p=>escapeHtml(p.category||'—'),html:true,cls:'name'}
+  {key:'category',label:'Категория',fmt:p=>escapeHtml(p.category||'—'),html:true,cls:'name'},
+  {key:'orderCount',label:'Заказы Ozon',fmt:p=>orderSummaryHtml(p),html:true,cls:'name'}
 ]}
 function drillDefinition(type,payload={}){
   const m=currentModel, ext=m.externalExpenses;
@@ -1491,21 +1561,21 @@ function drillDefinition(type,payload={}){
   const percent=(key,label)=>({key,label,fmt:p=>fmtPct(typeof key==='function'?key(p):p[key]),cls:'num'});
   let def={type,title:'Детализация',subtitle:`Период: ${drillPeriodText()}`,kind:'products',rows:[],columns:cols,sort:'revenue',dir:-1,note:'',stats:[]};
   if(type==='revenue')Object.assign(def,{title:'Выручка Ozon — товары',rows:m.products.filter(p=>Math.abs(safe(p.revenue))>.005),columns:[...cols,number('units','Реализовано, шт.'),money('revenue','Выручка'),percent('revenueShare','Доля')],sort:'revenue',stats:[{label:'Выручка',value:fmtMoney(m.totalRevenue)},{label:'SKU с выручкой',value:fmtNum(m.products.filter(p=>p.revenue>0).length)},{label:'Период',value:drillPeriodText()}]});
-  else if(type==='ozonNet')Object.assign(def,{title:'После услуг Ozon — расшифровка по товарам',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Выручка',value:fmtMoney(m.totalRevenue)},{label:'Услуги / удержания Ozon',value:fmtMoney(m.totalRevenue-m.financeNetAccrued)},{label:'После Ozon',value:fmtMoney(m.financeNetAccrued)}],note:'Операции без SKU не распределяются по товарам и учитываются только в общем P&L. Товарная экономика использует только прямые SKU-начисления.'});
+  else if(type==='ozonNet')Object.assign(def,{title:'После услуг Ozon — расшифровка по товарам',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Выручка доставок',value:fmtMoney(m.totalRevenue)},{label:'Расходы Ozon по Finance-дате',value:fmtMoney(m.financeOzonExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Операции без SKU не распределяются по товарам и учитываются только в общем P&L. Товарная экономика использует только прямые SKU-начисления.'});
   else if(type==='external')Object.assign(def,{title:'Внешние расходы вне Ozon',kind:'external',stats:[{label:'Всего',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),cls:ext?.complete?'':'warning'},{label:'Репрайсер',value:fmtMoney(ext?.repricer)},{label:'Премии магазинам',value:fmtMoney(ext?.storeBonus)},{label:'Наёмная логистика',value:fmtMoney(ext?.hiredKnown)}],note:'Это расходы бизнеса, которых нет в кабинете Ozon. Они не распределяются на SKU и учитываются только на уровне общего P&L.'});
-  else if(type==='management')Object.assign(def,{title:'Управленческий остаток — состав',kind:'management',stats:[{label:'После Ozon',value:fmtMoney(m.financeNetAccrued)},{label:'Внешние расходы',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown)},{label:'Управленческий остаток',value:m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),cls:ext?.complete?'positive':'warning'}],note:'Управленческий остаток = фактический ledger Ozon после всех услуг − внешние операционные расходы. Закупка и УСН здесь ещё не вычтены.'});
+  else if(type==='management')Object.assign(def,{title:'Управленческий остаток — состав',kind:'management',stats:[{label:'После Ozon',value:fmtMoney(m.afterOzon)},{label:'Внешние расходы',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown)},{label:'Управленческий остаток',value:m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),cls:ext?.complete?'positive':'warning'}],note:'Управленческий остаток = выручка фактически доставленных и не возвращённых товаров − расходы Ozon, начисленные Finance API в выбранном периоде − внешние операционные расходы. Закупка и УСН здесь ещё не вычтены.'});
   else if(type==='rrpTarget')Object.assign(def,{title:'Норматив РРЦ −10% — из чего складывается',rows:m.products.filter(p=>productRrpTarget(p)!=null&&Math.abs(safe(p.units))>.0001),columns:[...cols,number('units','Net, шт.'),money('rrp','РРЦ'),money(p=>p.rrp*p.units,'База РРЦ'),money(p=>productRrpTarget(p),'90% РРЦ')],sort:'units',stats:[{label:'База РРЦ',value:fmtMoney(m.rrpBaseKnown)},{label:'Норматив 90%',value:fmtMoney(m.rrpTarget??m.rrpTargetKnown)},{label:'Покрытие движений',value:fmtPct(m.rrpCoverageUnits)}],note:'Это детализация вклада SKU в общий норматив. Статус «выполнен/не выполнен» по отдельному товару намеренно не рассчитывается.'});
   else if(type==='rrpDelta')Object.assign(def,{title:'Почему отклонились от норматива РРЦ −10%',rows:m.products.filter(p=>productPreExternalGap(p)!=null&&Math.abs(safe(p.units))>.0001),columns:[...cols,number('units','Net, шт.'),money(p=>productRrpTarget(p),'Вклад в норматив'),money('netAfterOzon','После Ozon'),money(p=>productPreExternalGap(p),'Вклад в разрыв до внешних расходов')],sort:'preExternalGap',dir:1,stats:[{label:'Управленческий остаток',value:fmtMoney(m.managementRemainder??m.managementRemainderKnown)},{label:'Норматив',value:fmtMoney(m.rrpTarget??m.rrpTargetKnown)},{label:'Отклонение',value:m.rrpDelta!=null?fmtMoney(m.rrpDelta):'предварительно',cls:m.rrpDelta!=null?(m.rrpDelta>=0?'positive':'negative'):'warning'},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)}],note:'Колонка «вклад в разрыв» нужна только для объяснения общего результата: После Ozon − 90% РРЦ. Это НЕ индивидуальный норматив SKU. Из общей суммы дополнительно вычитаются внешние расходы бизнеса.'});
   else if(type==='cogs')Object.assign(def,{title:'Закупочная стоимость реализованных товаров',rows:m.products.filter(p=>p.cogs!=null&&Math.abs(p.cogs)>.005),columns:[...cols,number('units','Net, шт.'),money('cost','Закупочная цена, ₽/шт.'),money('cogs','Закупочная стоимость'),money('rrp','РРЦ, ₽/шт.'),money(p=>Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'РРЦ реализации'),money('revenue','Выручка')],sort:'cogs',stats:[{label:'Закупочная стоимость',value:fmtMoney(m.totalCogs)},{label:'Покрытие P&L',value:fmtPct(m.cogsCoverage)},{label:'SKU с закупкой в каталоге',value:`${fmtNum(m.quality?.ozonCostKnown)} / ${fmtNum(m.quality?.currentOzonArticles)}`} ]});
-  else if(type==='profitBeforeTax')Object.assign(def,{title:'Прибыль до УСН — товарные источники',rows:m.operatingComplete,columns:[...cols,money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cost','Закупочная цена, ₽/шт.'),money('cogs','Закупочная стоимость'),money('rrp','РРЦ, ₽/шт.'),money(p=>Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'РРЦ реализации'),money('operatingProfit','Товарный вклад'),percent('operatingMargin','Маржа')],sort:'operatingProfit',stats:[{label:'Товарный результат до внешних расходов',value:fmtMoney(m.financeNetAccrued-m.totalCogs)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Прибыль до УСН',value:m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'неполно',cls:m.profitBeforeTax!=null?(m.profitBeforeTax>=0?'positive':'negative'):'warning'}],note:'Внешние расходы не распределяются по SKU. Таблица показывает товарный вклад после только тех расходов Ozon, которые Seller API напрямую привязал к SKU, и закупки. Общие операции Ozon без SKU и внешние расходы учитываются только в общем P&L и не искажают прибыль отдельных товаров.'});
+  else if(type==='profitBeforeTax')Object.assign(def,{title:'Прибыль до УСН — товарные источники',rows:m.operatingComplete,columns:[...cols,money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cost','Закупочная цена, ₽/шт.'),money('cogs','Закупочная стоимость'),money('rrp','РРЦ, ₽/шт.'),money(p=>Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'РРЦ реализации'),money('operatingProfit','Товарный вклад'),percent('operatingMargin','Маржа')],sort:'operatingProfit',stats:[{label:'Товарный результат до внешних расходов',value:fmtMoney(m.afterOzon-m.totalCogs)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Прибыль до УСН',value:m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'неполно',cls:m.profitBeforeTax!=null?(m.profitBeforeTax>=0?'positive':'negative'):'warning'}],note:'Внешние расходы не распределяются по SKU. Таблица показывает товарный вклад после только тех расходов Ozon, которые Seller API напрямую привязал к SKU, и закупки. Общие операции Ozon без SKU и внешние расходы учитываются только в общем P&L и не искажают прибыль отдельных товаров.'});
   else if(type==='tax')Object.assign(def,{title:'Оценка УСН — расчёт',kind:'tax',stats:[{label:'База до УСН',value:m.profitBeforeTax!=null?fmtMoney(m.profitBeforeTax):'нет данных'},{label:'Ставка',value:fmtPct(m.taxRate)},{label:'Оценка УСН',value:m.estimatedTax!=null?fmtMoney(m.estimatedTax):'нет данных',cls:'warning'},{label:'После УСН',value:m.businessNetProfit!=null?fmtMoney(m.businessNetProfit):'нет данных',cls:m.businessNetProfit!=null?(m.businessNetProfit>=0?'positive':'negative'):''}],note:'Это управленческая оценка УСН «доходы − расходы». Она не заменяет налоговый расчёт/декларацию и не распределяется на SKU.'});
-  else if(type==='businessNet')Object.assign(def,{title:'Результат бизнеса после УСН',kind:'business',stats:[{label:'После услуг Ozon',value:fmtMoney(m.financeNetAccrued)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Закупочная стоимость',value:fmtMoney(m.totalCogs)},{label:'УСН',value:fmtMoney(m.estimatedTax)},{label:'Итог',value:fmtMoney(m.businessNetProfit),cls:m.businessNetProfit>=0?'positive':'negative'},{label:'Маржа',value:fmtPct(m.businessMargin)},{label:'ROI',value:fmtPct(m.businessRoi)}]});
+  else if(type==='businessNet')Object.assign(def,{title:'Результат бизнеса после УСН',kind:'business',stats:[{label:'После услуг Ozon',value:fmtMoney(m.afterOzon)},{label:'Внешние расходы',value:fmtMoney(ext?.totalKnown)},{label:'Закупочная стоимость',value:fmtMoney(m.totalCogs)},{label:'УСН',value:fmtMoney(m.estimatedTax)},{label:'Итог',value:fmtMoney(m.businessNetProfit),cls:m.businessNetProfit>=0?'positive':'negative'},{label:'Маржа',value:fmtPct(m.businessMargin)},{label:'ROI',value:fmtPct(m.businessRoi)}]});
   else if(type==='ads')Object.assign(def,{title:'Продвижение / реклама',rows:m.products.filter(p=>Math.abs(safe(p.components?.ads?.value))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>p.components?.ads?.value,'Продвижение'),percent('drr','ДРР')],sort:'adsValue',stats:[{label:'Расход',value:fmtMoney(m.adsSpend)},{label:'Статус',value:state.settings.adsActive?'включена':'отключена'},{label:'Источник',value:'Finance API'}],note:state.settings.adsActive?'':'Реклама сейчас отключена. Здесь отображаются исторические списания на продвижение, если они присутствуют в выбранном финансовом периоде.'});
   else if(type==='attention')Object.assign(def,{title:'Товары, требующие внимания',rows:attentionProducts(),columns:[...cols,{key:'attentionReason',label:'Причина',fmt:p=>`<span class="${String(p.attentionReason).includes('Убыток')?'negative':'warning'}">${escapeHtml(p.attentionReason)}</span>`,html:true},money('revenue','Выручка'),money('operatingProfit','Товарная прибыль'),number('stock','Остаток'),number('daysToZero','Дней запаса',1)],sort:'operatingProfit',dir:1,stats:[{label:'Всего уникальных SKU',value:fmtNum(attentionProducts().length)},{label:'Критичный остаток',value:fmtNum(m.stockStats.critical)},{label:'Убыточные SKU',value:fmtNum(m.operatingComplete.filter(x=>x.operatingProfit<0).length)}]});
   else if(type==='losses')Object.assign(def,{title:'Убыточные товары',rows:m.operatingComplete.filter(x=>x.operatingProfit<0),columns:[...cols,number('units','Net, шт.'),money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cost','Закупочная цена, ₽/шт.'),money('cogs','Закупочная стоимость'),money('rrp','РРЦ, ₽/шт.'),money(p=>Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'РРЦ реализации'),money('operatingProfit','Убыток'),percent('operatingMargin','Маржа'),percent('operatingRoi','ROI')],sort:'operatingProfit',dir:1,stats:[{label:'Убыточных SKU',value:fmtNum(m.operatingComplete.filter(x=>x.operatingProfit<0).length)},{label:'Суммарный убыток',value:fmtMoney(-sum(m.operatingComplete.filter(x=>x.operatingProfit<0),x=>x.operatingProfit)),cls:'negative'}]});
   else if(type==='auditSample'){
     const fq=financeQualityStatus(),rows=auditSampleProducts();
-    Object.assign(def,{title:'Контрольная выборка товарной прибыли',rows,columns:[...cols,number('units','Net, шт.'),number(p=>p.finance?.exactRows,'Прямых Finance строк'),money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cost','Закупочная цена, ₽/шт.'),money('cogs','Закупочная стоимость'),money('rrp','РРЦ, ₽/шт.'),money(p=>Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'РРЦ реализации'),money('operatingProfit','Товарная прибыль'),number(p=>p.realized?.returned,'Возвратов, шт.')],sort:'revenue',dir:-1,stats:[{label:'SKU в выборке',value:fmtNum(rows.length)},{label:'Дельта выручки SKU',value:fmtMoney(fq.revenueDelta),cls:fq.revenueDelta<1?'positive':'negative'},{label:'Дельта direct net',value:fmtMoney(fq.skuReconcile),cls:fq.skuReconcile<1?'positive':'negative'},{label:'Статус',value:fq.ok?'контроль пройден':'нужна проверка',cls:fq.ok?'positive':'warning'}],note:'Выборка автоматически включает контрольный SKU 5657, крупнейшие по выручке и количеству, товары с возвратами, наиболее прибыльные и наиболее слабые SKU. Кликните по товару: выручка и прямые расходы Ozon берутся из одного /finance/accrual/by-day; закупочная стоимость = закупочная цена × реализованное количество. Общие non-item расходы Ozon не распределяются на SKU.'});
+    Object.assign(def,{title:'Контрольная выборка товарной прибыли',rows,columns:[...cols,number('units','Net, шт.'),number(p=>p.finance?.exactRows,'Прямых Finance строк'),money('revenue','Выручка'),money('netAfterOzon','После Ozon'),money('cost','Закупочная цена, ₽/шт.'),money('cogs','Закупочная стоимость'),money('rrp','РРЦ, ₽/шт.'),money(p=>Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'РРЦ реализации'),money('operatingProfit','Товарная прибыль'),number(p=>p.realized?.returned,'Возвратов, шт.')],sort:'revenue',dir:-1,stats:[{label:'SKU в выборке',value:fmtNum(rows.length)},{label:'Finance gross attribution delta',value:fmtMoney(fq.financeGrossAttributionDelta),cls:fq.financeGrossAttributionDelta<1?'positive':'negative'},{label:'Дельта direct net',value:fmtMoney(fq.skuReconcile),cls:fq.skuReconcile<1?'positive':'negative'},{label:'Статус',value:fq.ok?'контроль пройден':'нужна проверка',cls:fq.ok?'positive':'warning'}],note:'Выборка автоматически включает контрольный SKU 5657, крупнейшие по выручке и количеству, товары с возвратами, наиболее прибыльные и наиболее слабые SKU. В v8 выручка и количество берутся по фактической доставке (с ретроспективным снятием возвратов), а прямые расходы Ozon — по датам начисления /finance/accrual/by-day. Закупочная стоимость = закупочная цена × оставшееся реализованное количество. Общие non-item расходы Ozon не распределяются на SKU.'});
   }
   else if(type==='stockRisk'||type==='stockCritical'||type==='stockAttention'||type==='stockNormal'){
     const status=type==='stockCritical'?'Критично':type==='stockAttention'?'Внимание':type==='stockNormal'?'Норма':null;
@@ -1576,7 +1646,7 @@ function renderExternalDrill(def){
 function renderCategoriesDrill(def){const rows=currentModel.categories;return `${drillStatsHtml(def.stats)}<div class="table-wrap"><table class="table" style="min-width:760px"><thead><tr><th>Категория</th><th class="num">Товаров</th><th class="num">Выручка</th><th class="num">Товарная прибыль</th><th class="num">Маржа</th></tr></thead><tbody>${rows.map(r=>`<tr class="drill-row" data-category-drill="${escapeHtml(r.category)}"><td class="name"><span class="linkish">${escapeHtml(r.category)}</span></td><td class="num">${fmtNum(r.count)}</td><td class="num">${fmtMoney(r.revenue)}</td><td class="num">${fmtMoney(r.profit)}</td><td class="num">${fmtPct(r.margin)}</td></tr>`).join('')}</tbody></table></div>`}
 function renderSignalsDrill(def){const rows=currentModel.signals;return `${drillStatsHtml(def.stats)}${def.note?`<div class="drawer-note">${escapeHtml(def.note)}</div>`:''}<div class="table-wrap"><table class="table" style="min-width:900px"><thead><tr><th>Товар</th><th>Сигнал</th><th>Почему</th><th class="num">Потенциал</th></tr></thead><tbody>${rows.map(x=>`<tr class="drill-row" data-product-drill="${escapeHtml(x.product.key)}"><td class="name"><span class="linkish">${escapeHtml(x.product.article)} · ${escapeHtml(x.product.name)}</span></td><td>${escapeHtml(x.type)}</td><td class="name">${escapeHtml(x.detail)}</td><td class="num">${fmtMoney(x.potential)}</td></tr>`).join('')}</tbody></table></div>`}
 function renderBusinessDrill(def){
-  const m=currentModel,e=m.externalExpenses;const rows=[['Выручка Ozon',m.totalRevenue],['Минус услуги/удержания Ozon',-(m.totalRevenue-m.financeNetAccrued)],['После услуг Ozon',m.financeNetAccrued],['Минус внешние расходы',-safe(e?.totalKnown)],['Управленческий остаток',m.managementRemainder??m.managementRemainderKnown],['Минус закупочную стоимость',-m.totalCogs],['Прибыль до УСН',m.profitBeforeTax],['Минус оценка УСН',m.estimatedTax!=null?-m.estimatedTax:null],['Результат после УСН',m.businessNetProfit]];
+  const m=currentModel,e=m.externalExpenses;const rows=[['Выручка доставленных заказов',m.totalRevenue],['Минус расходы Ozon по Finance-дате',-m.financeOzonExpenses],['После услуг Ozon',m.afterOzon],['Минус внешние расходы',-safe(e?.totalKnown)],['Управленческий остаток',m.managementRemainder??m.managementRemainderKnown],['Минус закупочную стоимость',-m.totalCogs],['Прибыль до УСН',m.profitBeforeTax],['Минус оценка УСН',m.estimatedTax!=null?-m.estimatedTax:null],['Результат после УСН',m.businessNetProfit]];
   return `${drillStatsHtml(def.stats)}${def.note?`<div class="drawer-note">${escapeHtml(def.note)}</div>`:''}<div class="table-wrap"><table class="table" style="min-width:620px"><thead><tr><th>Этап</th><th class="num">Сумма</th></tr></thead><tbody>${rows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num ${v!=null&&v<0?'negative':''}">${v==null?'нет данных':fmtMoney(v)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function renderProductDrill(def){const p=def.product;if(!p)return'<div class="empty">Товар не найден в текущем периоде.</div>';return `${drillStatsHtml(def.stats)}<div class="drawer-product-title"><div><div class="article">Артикул ${escapeHtml(p.article||'—')} · SKU ${escapeHtml(p.sku||'—')}</div><div class="muted tiny">${escapeHtml(p.category||'Без категории')} · ${escapeHtml(p.brand||'')}</div></div></div>${productDetail(p)}`}
@@ -1603,10 +1673,15 @@ function bindDrillControls(def){
 function exportCurrentDrilldown(){
   const cur=drillStack.at(-1);if(!cur||!window.XLSX)return;const def=drillDefinition(cur.type,cur.payload);if(def.kind!=='products'&&def.kind!=='signals'&&def.kind!=='categories')return;
   let rows=[];
-  if(def.kind==='products')rows=def.rows.map(p=>({'Артикул':p.article||'',SKU:p.sku||'','Товар':p.name||'','Категория':p.category||'','РРЦ, ₽/шт.':p.rrp,'РРЦ реализации':Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'Net, шт.':p.units,'Выручка':p.revenue,'После Ozon':p.netAfterOzon,'Расходы Ozon':productOzonCost(p),'Закупочная цена, ₽/шт.':p.cost,'Закупочная стоимость':p.cogs,'Товарная прибыль':p.operatingProfit,'Маржа, %':p.operatingMargin,'ROI, %':p.operatingRoi,'Остаток':p.stock,'Дней запаса':p.daysToZero===Infinity?null:p.daysToZero,'ABC прибыль':p.abcProfit,'ABC выручка':p.abcRevenue,'Причина внимания':p.attentionReason||'','Вклад в общий норматив':productRrpTarget(p),'Вклад в разрыв до внешних расходов':productPreExternalGap(p)}));
+  if(def.kind==='products')rows=def.rows.map(p=>({'Артикул':p.article||'',SKU:p.sku||'','Товар':p.name||'','Категория':p.category||'','РРЦ, ₽/шт.':p.rrp,'РРЦ реализации':Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'Net, шт.':p.units,'Выручка':p.revenue,'После Ozon':p.netAfterOzon,'Расходы Ozon':productOzonCost(p),'Закупочная цена, ₽/шт.':p.cost,'Закупочная стоимость':p.cogs,'Товарная прибыль':p.operatingProfit,'Маржа, %':p.operatingMargin,'ROI, %':p.operatingRoi,'Остаток':p.stock,'Дней запаса':p.daysToZero===Infinity?null:p.daysToZero,'ABC прибыль':p.abcProfit,'ABC выручка':p.abcRevenue,'Причина внимания':p.attentionReason||'','Заказы Ozon (номер | дата | отправление)':orderSummaryText(p),'Вклад в общий норматив':productRrpTarget(p),'Вклад в разрыв до внешних расходов':productPreExternalGap(p)}));
   else if(def.kind==='signals')rows=currentModel.signals.map(x=>({'Артикул':x.product.article,'Товар':x.product.name,'Категория':x.product.category,'Сигнал':x.type,'Почему':x.detail,'Потенциал, ₽':x.potential}));
   else rows=currentModel.categories.map(x=>({'Категория':x.category,'Товаров':x.count,'Выручка':x.revenue,'Товарная прибыль':x.profit,'Маржа, %':x.margin}));
-  const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Детализация');const fn=`ozon_detail_${cur.type}_${(currentModel.period?.start||'all')}_${(currentModel.period?.end||'all')}.xlsx`;XLSX.writeFile(wb,fn);
+  const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Детализация');
+  if(def.kind==='products'){
+    const keys=new Set(def.rows.map(p=>p.key)),orders=(currentModel.orderRows||[]).filter(r=>keys.has(r.productKey)).map(orderExportRow);
+    XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(orders),'Заказы Ozon');
+  }
+  const fn=`ozon_detail_${cur.type}_${(currentModel.period?.start||'all')}_${(currentModel.period?.end||'all')}.xlsx`;XLSX.writeFile(wb,fn);
 }
 
 /* ------------------------------- charts ------------------------------- */
@@ -1616,12 +1691,12 @@ const chartDefaults={responsive:true,maintainAspectRatio:false,plugins:{legend:{
 function renderChartsForTab(tab){requestAnimationFrame(()=>{if(tab==='overview')renderOverviewCharts();if(tab==='ads')renderFunnelChart();if(tab==='stock')renderStockChart()})}
 function renderOverviewCharts(){
   const m=currentModel,ext=m.externalExpenses,note=$('#waterfallNote');
-  if(note)note.textContent=`Источник Ozon — Finance API. Нитка: выручка → услуги Ozon → внешние расходы → управленческий остаток → закупка → УСН. Норматив РРЦ−10% показан отдельным KPI и не вычитается из прибыли.${ext?.missingHired.length?' Наёмная логистика неполная: '+ext.missingHired.join(', ')+'.':''}`;
+  if(note)note.textContent=`Источники Ozon: выручка — фактические доставки; расходы — Finance API по дате начисления. Нитка: выручка доставок → расходы Ozon → внешние расходы → управленческий остаток → закупка → УСН. Норматив РРЦ−10% показан отдельным KPI и не вычитается из прибыли.${ext?.missingHired.length?' Наёмная логистика неполная: '+ext.missingHired.join(', ')+'.':''}`;
   if(!m.financeDs.length){
     $('#waterfallEmpty')?.classList.remove('hidden');if($('#waterfallEmpty'))$('#waterfallEmpty').textContent='Нет финансового ledger Ozon API.';destroyChart('waterfallChart');
   }else{
     $('#waterfallEmpty')?.classList.add('hidden');
-    const rev=m.financeGrossAccrued,ozonNet=m.financeNetAccrued,ozonCost=rev-ozonNet;
+    const rev=m.totalRevenue,ozonNet=m.afterOzon,ozonCost=m.financeOzonExpenses;
     let cur=rev;const labels=['Выручка'],data=[[0,rev]];
     const step=(label,val)=>{const v=safe(val);labels.push(label);data.push([cur-v,cur]);cur-=v};
     step('Услуги Ozon',ozonCost);
