@@ -673,59 +673,64 @@ function mergeReturnRows(previousRows,freshRows){
 }
 function buildPostingFallbackRealizedRows(financeRows,postingMap,returnRows,maps){
   /*
-    v6.1 daily realized quantity priority:
-      1) exact quantity inferred directly from /v1/finance/accrual/by-day:
-         commission.sale_amount / commission.seller_price (unit price);
-      2) posting product quantity only as a fallback when finance quantity cannot
-         be inferred for a rare row;
+    v6.4 daily realized quantity priority:
+      1) explicit product quantity from the matching FBO/FBS posting;
+      2) finance sale_amount / seller_price only when the posting is unavailable;
       3) returns from the unified returns API.
 
-    This keeps the daily quantity on the same accrual date as the finance ledger
-    and avoids historical bulk joins to FBO/FBS shipment lists.
+    The realization date stays equal to the Finance accrual date, but quantity is
+    taken from the operational posting whenever possible. This avoids treating
+    seller_price as a unit price for multi-unit posting lines.
   */
   const rows=[];
   let unresolvedSaleOps=0,financeQtyRows=0,postingQtyRows=0;
-  const seenPostingFallback=new Set();
+  const seenPostingQty=new Set();
+  const unresolvedExamples=[];
   for(const f of financeRows||[]){
     const sale=asNum(first(f.saleAmount,f.grossRevenue),0),date=f.date;
     if(!date||sale<=0.00001)continue;
     const article=asStr(first(f.article,maps.articleBySku.get(asStr(f.sku)))),sku=asStr(f.sku);
+    const pn=asStr(f.postingNumber),posting=pn?postingMap[pn]:null;
 
-    // Preferred path: quantity came directly from sale_amount / unit price.
+    // Preferred path: postings carry an explicit product quantity. Count a given
+    // posting+SKU once on the Finance accrual date even if several accrual rows
+    // refer to the same sale line.
+    if(posting?.products?.length){
+      const matches=posting.products.filter(p=>(sku&&asStr(p.sku)===sku)||(article&&asStr(p.article)===article));
+      if(matches.length){
+        const key=[date,pn,sku||article].join('|');
+        if(!seenPostingQty.has(key)){
+          seenPostingQty.add(key);
+          let pushed=false;
+          for(const p of matches){
+            const a=asStr(first(article,p.article,maps.articleBySku.get(p.sku))),q=Math.max(0,asNum(p.quantity,0));
+            if((!a&&!p.sku)||q<=0)continue;
+            rows.push({date,article:a,sku:asStr(first(sku,p.sku)),name:p.name||'',soldQty:q,returnedQty:0,netQty:q,postingNumber:pn,source:'posting-quantity'});
+            postingQtyRows++;pushed=true;
+          }
+          if(pushed)continue;
+        } else {
+          continue;
+        }
+      }
+    }
+
+    // Secondary fallback: keep the Finance ratio only when no usable posting
+    // quantity was found. It is not assumed to be authoritative for multi-unit rows.
     const directQty=Math.max(0,asNum(f.soldQty,0));
     if(directQty>0&&(article||sku)){
-      rows.push({date,article,sku,name:asStr(first(maps.nameBySku.get(sku),'')),soldQty:directQty,returnedQty:0,netQty:directQty,postingNumber:asStr(f.postingNumber),source:'finance-by-day-quantity'});
+      rows.push({date,article,sku,name:asStr(first(maps.nameBySku.get(sku),'')),soldQty:directQty,returnedQty:0,netQty:directQty,postingNumber:pn,source:'finance-ratio-fallback'});
       financeQtyRows++;
       continue;
     }
 
-    // Rare fallback: use only the matching SKU from the posting, so a multi-SKU
-    // shipment cannot double-count products already resolved from finance.
-    const pn=asStr(f.postingNumber),posting=pn?postingMap[pn]:null;
-    if(posting?.products?.length){
-      const matches=posting.products.filter(p=>
-        (sku&&asStr(p.sku)===sku)||(article&&asStr(p.article)===article)
-      );
-      if(matches.length){
-        const key=[date,pn,sku||article].join('|');
-        if(!seenPostingFallback.has(key)){
-          seenPostingFallback.add(key);
-          for(const p of matches){
-            const a=asStr(first(article,p.article,maps.articleBySku.get(p.sku))),q=Math.max(0,asNum(p.quantity,0));
-            if((!a&&!p.sku)||q<=0)continue;
-            rows.push({date,article:a,sku:asStr(first(sku,p.sku)),name:p.name||'',soldQty:q,returnedQty:0,netQty:q,postingNumber:pn,source:'posting-fallback'});
-            postingQtyRows++;
-          }
-        }
-        continue;
-      }
-    }
     unresolvedSaleOps++;
+    if(unresolvedExamples.length<20)unresolvedExamples.push({date,postingNumber:pn,sku,article,saleAmount:sale});
   }
   for(const r of returnRows||[]){
     rows.push({date:r.date,article:r.article,sku:r.sku,name:r.name||'',soldQty:0,returnedQty:r.quantity,netQty:-r.quantity,postingNumber:r.postingNumber,source:`returns-${String(r.schema||'').toLowerCase()}`});
   }
-  return {rows,diagnostics:{unresolvedSaleOps,financeQtyRows,postingQtyRows,returnRows:(returnRows||[]).length,returnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)}};
+  return {rows,diagnostics:{unresolvedSaleOps,financeQtyRows,postingQtyRows,unresolvedExamples,returnRows:(returnRows||[]).length,returnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)}};
 }
 
 function aggregateRealizedBySku(rows,start,end){
@@ -744,10 +749,13 @@ function validateDailyAgainstMonthly(dailyRows,officialSegments){
     const a=aggregateRealizedBySku(dailyRows,seg.start,seg.end),b=aggregateRealizedBySku(seg.rows||[]);
     const keys=new Set([...a.keys(),...b.keys()]);let absSkuDelta=0;
     for(const k of keys)absSkuDelta+=Math.abs(asNum(a.get(k)?.netQty,0)-asNum(b.get(k)?.netQty,0));
-    const dailyNet=[...a.values()].reduce((z,r)=>z+r.netQty,0),officialNet=[...b.values()].reduce((z,r)=>z+r.netQty,0);
-    const netDelta=dailyNet-officialNet;totalAbsSkuDelta+=absSkuDelta;totalNetDelta+=netDelta;
+    const dailyVals=[...a.values()],officialVals=[...b.values()];
+    const dailySold=dailyVals.reduce((z,r)=>z+r.soldQty,0),officialSold=officialVals.reduce((z,r)=>z+r.soldQty,0);
+    const dailyReturned=dailyVals.reduce((z,r)=>z+r.returnedQty,0),officialReturned=officialVals.reduce((z,r)=>z+r.returnedQty,0);
+    const dailyNet=dailyVals.reduce((z,r)=>z+r.netQty,0),officialNet=officialVals.reduce((z,r)=>z+r.netQty,0);
+    const soldDelta=dailySold-officialSold,returnDelta=dailyReturned-officialReturned,netDelta=dailyNet-officialNet;totalAbsSkuDelta+=absSkuDelta;totalNetDelta+=netDelta;
     const monthOk=Math.abs(netDelta)<0.001&&absSkuDelta<0.001;ok=ok&&monthOk;
-    months.push({month:monthKey(seg.start),dailyNet,officialNet,netDelta,absSkuDelta,ok:monthOk});
+    months.push({month:monthKey(seg.start),dailySold,officialSold,soldDelta,dailyReturned,officialReturned,returnDelta,dailyNet,officialNet,netDelta,absSkuDelta,ok:monthOk});
   }
   return {ok:months.length>0&&ok,months,totalAbsSkuDelta,totalNetDelta};
 }
@@ -871,8 +879,9 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
     warnings.push(`Daily quantity monthly reconciliation failed: ${bad||'no official closed month available'}`);
   }
   if(reconstructed.diagnostics.unresolvedSaleOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedSaleOps} sale postings could not be resolved to product quantities.`);
-  console.log(`Daily quantity layer v6.3 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
-  for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: dailyNet=${m.dailyNet}; officialNet=${m.officialNet}; netDelta=${m.netDelta}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
+  console.log(`Daily quantity layer v6.4 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
+  for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: sold=${m.dailySold}/${m.officialSold} (Δ${m.soldDelta}); returns=${m.dailyReturned}/${m.officialReturned} (Δ${m.returnDelta}); net=${m.dailyNet}/${m.officialNet} (Δ${m.netDelta}); absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
+  if(reconstructed.diagnostics.unresolvedExamples?.length)console.log('Unresolved sale examples:',JSON.stringify(reconstructed.diagnostics.unresolvedExamples));
   return {
     rows,
     segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day quantity + historical posting fallback + returns; official daily override',rows}],
