@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (schema v6.0.1 arbitrary daily business periods)
+  Ozon Seller Analytics — API-only sync (schema v6.1 exact daily quantity from finance unit price)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -364,8 +364,8 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         operation,
         transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:sku:${sku}`,
         grossRevenue:0,
-        sellerPriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,
-        soldQty:0,returnedQty:0,
+        sellerPriceRaw:0,salePriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,
+        soldQty:0,returnedQty:0,financeQtyResolved:0,financeQtyUnresolved:0,
         ...emptyFinanceComponents(),
         rawAmount:0,
         financeSource:'accrual/by-day',
@@ -380,15 +380,33 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       if(!row)continue;
       const comm=prod?.commission||{};
       const sellerPrice=money(comm.seller_price);
+      const salePrice=money(comm.sale_price);
       const saleAmount=money(comm.sale_amount);
       const bonus=money(comm.bonus);
       const coinvestment=money(comm.coinvestment);
       row.sellerPriceRaw+=sellerPrice;
+      row.salePriceRaw+=salePrice;
       row.saleAmount+=saleAmount;
       row.bonus+=bonus;
       row.coinvestment+=coinvestment;
       const economicGross=saleAmount;
       row.grossRevenue+=Math.abs(economicGross)>0.0005?economicGross:sellerPrice;
+
+      // v6.1: Ozon documents seller_price as the unit price and sale_amount as
+      // the sold amount for this SKU line. Therefore sale_amount / unit price
+      // gives the exact sold quantity for the accrual day. Use sale_price only
+      // as a secondary unit-price fallback. This removes the need to resolve
+      // historical quantities through shipment-list joins.
+      if(saleAmount>0.0005){
+        let qty=null;
+        for(const unit of [Math.abs(sellerPrice),Math.abs(salePrice)]){
+          if(unit<=0.0005)continue;
+          const rawQty=Math.abs(saleAmount)/unit,rounded=Math.round(rawQty);
+          if(rounded>0&&Math.abs(rawQty-rounded)<=0.01){qty=rounded;break}
+        }
+        if(qty!=null){row.soldQty+=qty;row.financeQtyResolved++}
+        else row.financeQtyUnresolved++;
+      }
       row.commission+=-money(comm.sale_commission);
 
       const delivery=prod?.delivery||{};
@@ -422,7 +440,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       itemSkus:[...bySku.keys()],
       group,operation,
       transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:unallocated`,
-      grossRevenue:0,sellerPriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,soldQty:0,returnedQty:0,
+      grossRevenue:0,sellerPriceRaw:0,salePriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,soldQty:0,returnedQty:0,financeQtyResolved:0,financeQtyUnresolved:0,
       ...emptyFinanceComponents(),
       rawAmount:0,financeSource:'accrual/by-day',
       financeAttribution:'unallocated',
@@ -540,18 +558,17 @@ async function fetchFboPostings(fromDate,toDate){
     for(let guard=0;guard<1000;guard++){
       const r=await post('/v3/posting/fbo/list',{
         cursor,
-        filter:{since:rfc3339Start(from),to:rfc3339End(to)},
+        filter:{posting_number:[],order_number:[],since:rfc3339Start(from),to:rfc3339End(to),status:[]},
         limit:100,sort_dir:'asc',translit:false,
         with:{analytics_data:false,financial_data:false,legal_info:false}
-      },{allowError:true,retries:4});
+      },{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
       const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
       for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
-      if((guard+1)%10===0||!first(r.has_next,r?.result?.has_next))console.log(`FBO postings ${from}..${to}: pages=${guard+1}; rows=${byNumber.size}`);
       const next=asStr(first(r.cursor,r?.result?.cursor));
       const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
       if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;await sleep(1100);
+      cursor=next;await sleep(700);
     }
   } return [...byNumber.values()];
 }
@@ -562,18 +579,20 @@ async function fetchFbsPostings(fromDate,toDate){
     for(let guard=0;guard<1000;guard++){
       const r=await post('/v4/posting/fbs/list',{
         sort_dir:'asc',
-        filter:{since:rfc3339Start(from),to:rfc3339End(to)},
+        filter:{
+          order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
+          order_id:0,since:rfc3339Start(from),to:rfc3339End(to),status:[],provider_ids:[],warehouse_ids:[]
+        },
         limit:100,cursor,
         with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
-      },{allowError:true,retries:4});
+      },{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
       const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
       for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
-      if((guard+1)%10===0||!first(r.has_next,r?.result?.has_next))console.log(`FBS postings ${from}..${to}: pages=${guard+1}; rows=${byNumber.size}`);
       const next=asStr(first(r.cursor,r?.result?.cursor));
       const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
       if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;await sleep(1100);
+      cursor=next;await sleep(700);
     }
   } return [...byNumber.values()];
 }
@@ -640,32 +659,60 @@ function mergeReturnRows(previousRows,freshRows){
 }
 function buildPostingFallbackRealizedRows(financeRows,postingMap,returnRows,maps){
   /*
-    Realized quantity is anchored to Ozon API events:
-      + positive sale accrual: exact product quantities from the matching FBO/FBS posting;
-      - returns: exact FBO/FBS quantity from the current /v1/returns/list endpoint.
+    v6.1 daily realized quantity priority:
+      1) exact quantity inferred directly from /v1/finance/accrual/by-day:
+         commission.sale_amount / commission.seller_price (unit price);
+      2) posting product quantity only as a fallback when finance quantity cannot
+         be inferred for a rare row;
+      3) returns from the unified returns API.
 
-    If a sale posting cannot be resolved or a returns endpoint fails, diagnostics mark the
-    quantity layer incomplete. The dashboard then labels the RRP−10% norm as provisional
-    instead of silently inventing quantities.
+    This keeps the daily quantity on the same accrual date as the finance ledger
+    and avoids historical bulk joins to FBO/FBS shipment lists.
   */
-  const rows=[],seenSalePosting=new Set();let unresolvedSaleOps=0;
-  for(const f of financeRows){
-    const gross=asNum(f.grossRevenue,0),date=f.date;if(!date||gross<=0.00001)continue;
-    const pn=asStr(f.postingNumber);if(!pn||seenSalePosting.has(pn))continue;seenSalePosting.add(pn);
-    const posting=postingMap[pn];
-    if(!posting?.products?.length){unresolvedSaleOps++;continue}
-    for(const p of posting.products){
-      const article=asStr(first(p.article,maps.articleBySku.get(p.sku))),q=Math.max(0,asNum(p.quantity,0));
-      if((!article&&!p.sku)||q<=0)continue;
-      rows.push({date,article,sku:p.sku,name:p.name||'',soldQty:q,returnedQty:0,netQty:q,postingNumber:pn,source:'posting+finance'});
+  const rows=[];
+  let unresolvedSaleOps=0,financeQtyRows=0,postingQtyRows=0;
+  const seenPostingFallback=new Set();
+  for(const f of financeRows||[]){
+    const sale=asNum(first(f.saleAmount,f.grossRevenue),0),date=f.date;
+    if(!date||sale<=0.00001)continue;
+    const article=asStr(first(f.article,maps.articleBySku.get(asStr(f.sku)))),sku=asStr(f.sku);
+
+    // Preferred path: quantity came directly from sale_amount / unit price.
+    const directQty=Math.max(0,asNum(f.soldQty,0));
+    if(directQty>0&&(article||sku)){
+      rows.push({date,article,sku,name:asStr(first(maps.nameBySku.get(sku),'')),soldQty:directQty,returnedQty:0,netQty:directQty,postingNumber:asStr(f.postingNumber),source:'finance-by-day-quantity'});
+      financeQtyRows++;
+      continue;
     }
+
+    // Rare fallback: use only the matching SKU from the posting, so a multi-SKU
+    // shipment cannot double-count products already resolved from finance.
+    const pn=asStr(f.postingNumber),posting=pn?postingMap[pn]:null;
+    if(posting?.products?.length){
+      const matches=posting.products.filter(p=>
+        (sku&&asStr(p.sku)===sku)||(article&&asStr(p.article)===article)
+      );
+      if(matches.length){
+        const key=[date,pn,sku||article].join('|');
+        if(!seenPostingFallback.has(key)){
+          seenPostingFallback.add(key);
+          for(const p of matches){
+            const a=asStr(first(article,p.article,maps.articleBySku.get(p.sku))),q=Math.max(0,asNum(p.quantity,0));
+            if((!a&&!p.sku)||q<=0)continue;
+            rows.push({date,article:a,sku:asStr(first(sku,p.sku)),name:p.name||'',soldQty:q,returnedQty:0,netQty:q,postingNumber:pn,source:'posting-fallback'});
+            postingQtyRows++;
+          }
+        }
+        continue;
+      }
+    }
+    unresolvedSaleOps++;
   }
   for(const r of returnRows||[]){
     rows.push({date:r.date,article:r.article,sku:r.sku,name:r.name||'',soldQty:0,returnedQty:r.quantity,netQty:-r.quantity,postingNumber:r.postingNumber,source:`returns-${String(r.schema||'').toLowerCase()}`});
   }
-  return {rows,diagnostics:{unresolvedSaleOps,returnRows:(returnRows||[]).length,returnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)}};
+  return {rows,diagnostics:{unresolvedSaleOps,financeQtyRows,postingQtyRows,returnRows:(returnRows||[]).length,returnedUnits:(returnRows||[]).reduce((a,r)=>a+asNum(r.quantity,0),0)}};
 }
-
 
 function aggregateRealizedBySku(rows,start,end){
   const by=new Map();
@@ -810,14 +857,14 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
     warnings.push(`Daily quantity monthly reconciliation failed: ${bad||'no official closed month available'}`);
   }
   if(reconstructed.diagnostics.unresolvedSaleOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedSaleOps} sale postings could not be resolved to product quantities.`);
-  console.log(`Daily quantity layer ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; unresolvedSalePostings=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
+  console.log(`Daily quantity layer v6.1 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
   for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: dailyNet=${m.dailyNet}; officialNet=${m.officialNet}; netDelta=${m.netDelta}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
   return {
     rows,
-    segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day + posting quantities + returns; official daily override',rows}],
+    segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day quantity + posting fallback + returns; official daily override',rows}],
     officialSegments:official.segments,
     coverage:{start:BUSINESS_START,end:targetEnd,complete,gaps:[]},
-    diagnostics:{monthlyLoaded:official.diagnostics.monthlyLoaded,dailyLoaded:official.diagnostics.dailyLoaded,dailyPremiumAvailable:official.diagnostics.dailyPremiumAvailable,fallbackUnresolvedSaleOps:reconstructed.diagnostics.unresolvedSaleOps,monthlyValidation}
+    diagnostics:{monthlyLoaded:official.diagnostics.monthlyLoaded,dailyLoaded:official.diagnostics.dailyLoaded,dailyPremiumAvailable:official.diagnostics.dailyPremiumAvailable,fallbackUnresolvedSaleOps:reconstructed.diagnostics.unresolvedSaleOps,financeQtyRows:reconstructed.diagnostics.financeQtyRows||0,postingQtyRows:reconstructed.diagnostics.postingQtyRows||0,monthlyValidation}
   };
 }
 
@@ -881,13 +928,13 @@ const priceRows=freshPrice.length?freshPrice:(previousPrice?.rows||[]);
 if(!stockComplete)warnings.push(`Stock refresh incomplete ${freshStock.length}/${products.length}; previous API stock kept.`);
 if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kept.');
 
-/* Daily quantity layer uses posting product quantities, keyed to the exact Finance by-day sale date.
-   v6 performs a one-time full posting backfill; later runs refresh only the recent window. */
+/* v6.1 derives historical sold quantity directly from Finance by-day.
+   Shipment lists are retained only as a recent fallback for rare rows where the
+   Finance unit-price ratio cannot be resolved. */
 const financeAttributionUpgrade=previous?.financeAttributionVersion!==7;
 const dailyQuantityUpgrade=previous?.diagnostics?.dailyQuantityVersion!==DAILY_QTY_VERSION;
-const postingBackfillStart=BUSINESS_START;
-const postingFrom=dailyQuantityUpgrade?postingBackfillStart:(previous?maxDateStr(postingBackfillStart,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):postingBackfillStart);
-console.log(`Posting quantity refresh ${postingFrom}..${TODAY}; dailyQuantityUpgrade=${dailyQuantityUpgrade}`);
+const postingFrom=maxDateStr(addDays(BUSINESS_START,-7),addDays(TODAY,-POSTING_LOOKBACK_DAYS));
+console.log(`Posting fallback refresh ${postingFrom}..${TODAY}; dailyQuantityUpgrade=${dailyQuantityUpgrade}`);
 let freshFbo=[],freshFbs=[];
 try{freshFbo=await fetchFboPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBO postings: ${e}`)}
 try{freshFbs=await fetchFbsPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBS postings: ${e}`)}
@@ -913,7 +960,7 @@ console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${finance
    because Ozon rate-limits it heavily and it is better suited for spot checks. */
 const skuFinanceFrom=financeFrom;
 const skuFinanceRows=financeRows.filter(r=>r.financeAttribution==='direct_sku'&&(r.sku||r.article));
-console.log(`SKU finance by-day direct v6.0.1: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
+console.log(`SKU finance by-day direct v6.0: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
 
 /* Exact return quantities. v6 backfills from the business baseline once, then refreshes recent returns. */
 const returnFrom=dailyQuantityUpgrade?BUSINESS_START:(previous?maxDateStr(BUSINESS_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):BUSINESS_START);
@@ -997,6 +1044,6 @@ const payload={
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. Daily quantities from 2026-06-01 are reconstructed from Finance sale dates + FBO/FBS posting quantities + returns and reconciled to official monthly realization.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. Daily quantities from 2026-06-01 are derived from Finance sale_amount / unit seller_price, with posting fallback and returns, and reconciled to official monthly realization.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
