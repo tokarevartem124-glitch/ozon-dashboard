@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (v8.5 unmatched-return diagnostics)
+  Ozon Seller Analytics — API-only sync (v8.6 proven pre-period returns)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -1254,17 +1254,17 @@ function orphanReturnDiagnosticRows(orphanReturns,sourceRows,financeRows,returnR
 function logOrphanReturnDiagnostics(diags){
   for(let i=0;i<(diags||[]).length;i++){
     const d=diags[i],n=i+1;
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: return=${JSON.stringify(d.returnEvent)}`);
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: posting=${JSON.stringify(d.posting)}`);
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: sourceRowsExact=${JSON.stringify(d.sourceRowsExact)}`);
-    if(d.sourceRowsSamePostingOtherProduct?.length)console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: sourceRowsSamePostingOtherProduct=${JSON.stringify(d.sourceRowsSamePostingOtherProduct)}`);
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: financeExactNegative=${JSON.stringify(d.financeExactNegative)}`);
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: financeExactPositive=${JSON.stringify(d.financeExactPositive)}`);
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: financePriorSameProduct=${JSON.stringify(d.financePriorSameProduct)}`);
-    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.5 #${n}: returnsListExact=${JSON.stringify(d.returnsListExact)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: return=${JSON.stringify(d.returnEvent)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: posting=${JSON.stringify(d.posting)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: sourceRowsExact=${JSON.stringify(d.sourceRowsExact)}`);
+    if(d.sourceRowsSamePostingOtherProduct?.length)console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: sourceRowsSamePostingOtherProduct=${JSON.stringify(d.sourceRowsSamePostingOtherProduct)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: financeExactNegative=${JSON.stringify(d.financeExactNegative)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: financeExactPositive=${JSON.stringify(d.financeExactPositive)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: financePriorSameProduct=${JSON.stringify(d.financePriorSameProduct)}`);
+    console.log(`UNMATCHED RETURN DIAGNOSTIC v8.6 #${n}: returnsListExact=${JSON.stringify(d.returnsListExact)}`);
   }
 }
-function applyRetroactiveReturns(eventRows,postingMap={},businessStart=BUSINESS_START){
+function applyRetroactiveReturns(eventRows,postingMap={},businessStart=BUSINESS_START,deliveryContext={},returnRowsAudit=[]){
   const sales=new Map(),returns=new Map();
   for(const r of eventRows||[]){
     const key=`${asStr(r.postingNumber)}|${asStr(r.sku)||asStr(r.article)}`;
@@ -1291,11 +1291,25 @@ function applyRetroactiveReturns(eventRows,postingMap={},businessStart=BUSINESS_
   // classify it explicitly as pre-period context. Only genuinely unclassified returns
   // remain diagnostic orphans.
   const orphanReturns=[],prePeriodReturns=[];
+  const exactHistoryStart=asStr(deliveryContext?.historyStart).slice(0,10);
+  const exactFbsHistoryComplete=deliveryContext?.fbsComplete===true;
   for(const [key,rr] of returns)if(!sales.has(key)){
     for(const r of rr){
-      const delivered=asStr(postingMap?.[asStr(r.postingNumber)]?.observedDeliveredDate).slice(0,10);
-      if(delivered&&delivered<businessStart)prePeriodReturns.push({...r,sourceDeliveryDate:delivered});
-      else orphanReturns.push(r);
+      const pn=asStr(r.postingNumber),sku=asStr(r.sku),article=asStr(r.article);
+      const pm=postingMap?.[pn]||{};
+      const delivered=asStr(pm.observedDeliveredDate).slice(0,10);
+      const orderDate=asStr(first(r.orderDate,pm.orderDate)).slice(0,10);
+      const audit=(returnRowsAudit||[]).find(x=>asStr(x.postingNumber)===pn&&((sku&&asStr(x.sku)===sku)||(article&&asStr(x.article)===article)));
+      const schema=asStr(first(r.orderSchema,pm.orderSchema,audit?.schema)).toUpperCase();
+      if(delivered&&delivered<businessStart){
+        prePeriodReturns.push({...r,sourceDeliveryDate:delivered,prePeriodProof:'exact-delivery-date'});
+      }else if(!delivered&&exactFbsHistoryComplete&&exactHistoryStart&&exactHistoryStart<businessStart&&schema==='FBS'&&orderDate&&orderDate<exactHistoryStart){
+        // Proof by exclusion: exact FBS delivered-status history is complete from
+        // exactHistoryStart onward. This posting has a genuine FBS return, was ordered
+        // before that window, and never appears as delivered inside the complete window.
+        // Therefore its source delivery predates exactHistoryStart, hence BUSINESS_START.
+        prePeriodReturns.push({...r,sourceDeliveryDate:'',prePeriodProof:'complete-fbs-history-exclusion',proofHistoryStart:exactHistoryStart,orderDate,schema});
+      }else orphanReturns.push(r);
     }
   }
   out.sort((a,b)=>asStr(a.date).localeCompare(asStr(b.date))||asStr(a.article).localeCompare(asStr(b.article))||asStr(a.postingNumber).localeCompare(asStr(b.postingNumber)));
@@ -1350,7 +1364,7 @@ async function updateOfficialRealizationControls(previous,maps,warnings){
   const segments=[...map.values()].filter(s=>s.start&&s.end&&s.end>=BUSINESS_START&&s.start<=YESTERDAY).sort((a,b)=>a.start.localeCompare(b.start)||a.key.localeCompare(b.key));
   return {segments,diagnostics:{monthlyLoaded,dailyLoaded,dailyPremiumAvailable,dailyErrors,dailyStart,dailyEnd}};
 }
-async function buildDailyBusinessRealization(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings){
+async function buildDailyBusinessRealization(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings,deliveryHistoryContext={}){
   const controls=await updateOfficialRealizationControls(previous,maps,warnings);
   const closed=closedMonthKeys(BUSINESS_START,TODAY);
   const currentYm=monthKey(TODAY),targetEnd=YESTERDAY;
@@ -1448,7 +1462,7 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   // onto the actual delivered day. This keeps source completeness separate from P&L timing.
   const sourceMonthlyValidation=validateDailyAgainstMonthly(sourceRows,controls.segments);
   const deliveryDatedRows=applyExactPostingDeliveryDates(sourceRows,postingMap);
-  const retro=applyRetroactiveReturns(deliveryDatedRows,postingMap,BUSINESS_START);
+  const retro=applyRetroactiveReturns(deliveryDatedRows,postingMap,BUSINESS_START,{historyStart:HISTORY_START,fbsComplete:deliveryHistoryContext?.fbsComplete===true},returnRows);
   let rows=retro.rows.filter(r=>r.deliveryDate&&r.deliveryDate>=BUSINESS_START&&r.deliveryDate<=targetEnd);
 
   // Recent Premium daily report is an independent control of the final delivered-date
@@ -1474,9 +1488,9 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   const prePeriodReturnUnits=retro.prePeriodReturns.reduce((z,r)=>z+asNum(r.returnedQty,0),0);
   const orphanReturnDiagnostics=orphanReturnDiagnosticRows(retro.orphanReturns,deliveryDatedRows,financeRows,returnRows,postingMap);
   if(orphanReturnDiagnostics.length)logOrphanReturnDiagnostics(orphanReturnDiagnostics);
-  if(retro.orphanReturns.length)warnings.push(`Delivered P&L: ${retro.orphanReturns.length} return event rows (${orphanReturnUnits} units) cannot be matched to a delivered sale or proven to be pre-period; principal is not double-counted. See UNMATCHED RETURN DIAGNOSTIC v8.5 lines above.`);
+  if(retro.orphanReturns.length)warnings.push(`Delivered P&L: ${retro.orphanReturns.length} return event rows (${orphanReturnUnits} units) cannot be matched to a delivered sale or proven to be pre-period; principal is not double-counted. See UNMATCHED RETURN DIAGNOSTIC v8.6 lines above.`);
   if(prePeriodReturnUnits)console.log(`Delivered P&L pre-period return context: ${retro.prePeriodReturns.length} row(s), ${prePeriodReturnUnits} unit(s); original delivery is before ${BUSINESS_START}, so current-period revenue is not reduced again.`);
-  console.log(`Delivered-order engine v8.5 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; closedComplete=${closedComplete}; currentPosting=${currentRealizationPostingAvailable}; currentFallback=${!currentRealizationPostingAvailable}; currentUnresolved=${currentUnresolved}; sourceMonthlyReconcile=${sourceMonthlyOk}; currentDailyTimingAudit=${finalCurrentDailyValidation.ok}; retroReturnedUnits=${retro.retroReturnedUnits}; prePeriodReturnUnits=${prePeriodReturnUnits}; inexactDeliveryRows=${inexactDeliveryRows}; complete=${complete}`);
+  console.log(`Delivered-order engine v8.6 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; closedComplete=${closedComplete}; currentPosting=${currentRealizationPostingAvailable}; currentFallback=${!currentRealizationPostingAvailable}; currentUnresolved=${currentUnresolved}; sourceMonthlyReconcile=${sourceMonthlyOk}; currentDailyTimingAudit=${finalCurrentDailyValidation.ok}; retroReturnedUnits=${retro.retroReturnedUnits}; prePeriodReturnUnits=${prePeriodReturnUnits}; inexactDeliveryRows=${inexactDeliveryRows}; complete=${complete}`);
   for(const m of sourceMonthlyValidation.months)console.log(`Source quantity reconcile ${m.month}: sold=${m.dailySold}/${m.officialSold}; returns=${m.dailyReturned}/${m.officialReturned}; net=${m.dailyNet}/${m.officialNet}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
 
   return {
@@ -1585,7 +1599,7 @@ console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${finance
    because Ozon rate-limits it heavily and it is better suited for spot checks. */
 const skuFinanceFrom=financeFrom;
 const skuFinanceRows=financeRows.filter(r=>r.financeAttribution==='direct_sku'&&(r.sku||r.article));
-console.log(`SKU finance by-day direct v8.5: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
+console.log(`SKU finance by-day direct v8.6: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
 
 /* Logistics-return API is retained ONLY as an audit feed. It is not the realization-return quantity source in v7. */
 const returnFrom=previous?maxDateStr(BUSINESS_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):BUSINESS_START;
@@ -1593,7 +1607,7 @@ let freshReturns=[],returnsComplete=true;
 try{freshReturns=await fetchUnifiedReturns(returnFrom,TODAY)}catch(e){returnsComplete=false;warnings.push(`Returns: ${e}`)}
 const freshReturnRows=normalizeReturnRows(freshReturns,maps).filter(r=>r.date>=BUSINESS_START&&r.date<=TODAY);
 const returnRows=returnsComplete?mergeReturnRows(previousReturnRows,freshReturnRows):previousReturnRows;
-const realization=await buildDailyBusinessRealization(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings);
+const realization=await buildDailyBusinessRealization(previous,maps,financeRows,postingMap,returnRows,returnsComplete,warnings,{fbsComplete:fbsDeliveryHistory.complete,historyStart:HISTORY_START});
 const realizedRange={start:realization.coverage.start,end:realization.coverage.end};
 console.log(`Daily realization rows=${realization.rows.length}; coverage=${realizedRange.start||'none'}..${realizedRange.end||'none'}; complete=${realization.coverage.complete}; monthlyLoaded=${realization.diagnostics.monthlyLoaded}; dailyOfficialLoaded=${realization.diagnostics.dailyLoaded}; dailyPremium=${realization.diagnostics.dailyPremiumAvailable}`);
 
@@ -1637,7 +1651,7 @@ const dailyRealizationSegments=realization.segments.filter(s=>s.kind==='daily'&&
 const dailyRealizationStart=dailyRealizationSegments.map(s=>s.start).filter(Boolean).sort()[0]||null;
 const dailyRealizationEnd=dailyRealizationSegments.map(s=>s.end).filter(Boolean).sort().at(-1)||null;
 if(funnelRows.length)datasets.push({id:`api-funnel-${salesStart}_${salesEnd}`,apiAuto:true,type:'funnel',label:'Воронка Ozon API',sheetName:'analytics/data',sourceName:'Ozon Seller API',start:salesStart,end:salesEnd,snapshot:null,importedAt:generatedAt,capabilities:{funnel:true,api:true,topTrafficDetail:true,periodSegmented:true,note:'Для SKU детализация до 1000 товаров с наибольшим трафиком на каждом сегменте.'},rows:funnelRows});
-if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Доставленные продажи Ozon API',sheetName:'delivered orders v8.5: exact FBS delivered-status dates + realization quantities + retro returns',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthlyValidation:true,officialPostingQuantities:true,dailyArbitrary:true,quantityEngineVersion:QUANTITY_ENGINE_VERSION,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
+if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Доставленные продажи Ozon API',sheetName:'delivered orders v8.6: exact FBS delivered-status dates + realization quantities + retro returns',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthlyValidation:true,officialPostingQuantities:true,dailyArbitrary:true,quantityEngineVersion:QUANTITY_ENGINE_VERSION,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
 if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'stock',label:'Остатки Ozon API',sheetName:stockComplete?stockResult.source:(previousStock?.sheetName||'previous API snapshot'),sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{stock:true,prices:true,api:true,complete:stockComplete},rows:stockRows});
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
@@ -1670,6 +1684,6 @@ const payload={
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. v8.5 P&L revenue is timed by the FBS delivered-status transition; /finance/realization/by-day is an independent timing audit and current-return quantity source, not a same-day delivery constraint. Later returns retroactively reduce the original delivery. Ozon expenses remain on Finance API accrual dates. A pre-business FBS delivery-history window is retained to classify returns whose source sale predates the dashboard horizon.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. v8.6 P&L revenue is timed by the FBS delivered-status transition; /finance/realization/by-day is an independent timing audit and current-return quantity source, not a same-day delivery constraint. Later returns retroactively reduce the original delivery. Ozon expenses remain on Finance API accrual dates. A pre-business FBS delivery-history window is retained to classify returns whose source sale predates the dashboard horizon.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
