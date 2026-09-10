@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (schema v6.0 arbitrary daily business periods)
+  Ozon Seller Analytics — API-only sync (schema v6.0.1 arbitrary daily business periods)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -32,7 +32,7 @@ const POSTING_LOOKBACK_DAYS = Math.max(7, Number(process.env.POSTING_LOOKBACK_DA
 const RETURN_LOOKBACK_DAYS = Math.max(7, Number(process.env.RETURN_LOOKBACK_DAYS || 35));
 const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
-const DAILY_QTY_VERSION = 1;
+const DAILY_QTY_VERSION = 2;
 const ANALYTICS_MAX_CATCHUP_DAYS = Math.max(1, Number(process.env.ANALYTICS_MAX_CATCHUP_DAYS || 7));
 
 if (!CLIENT_ID || !API_KEY) throw new Error('Missing OZON_CLIENT_ID or OZON_API_KEY');
@@ -540,17 +540,18 @@ async function fetchFboPostings(fromDate,toDate){
     for(let guard=0;guard<1000;guard++){
       const r=await post('/v3/posting/fbo/list',{
         cursor,
-        filter:{posting_number:[],order_number:[],since:rfc3339Start(from),to:rfc3339End(to),status:[]},
-        limit:1000,sort_dir:'asc',translit:false,
+        filter:{since:rfc3339Start(from),to:rfc3339End(to)},
+        limit:100,sort_dir:'asc',translit:false,
         with:{analytics_data:false,financial_data:false,legal_info:false}
-      },{allowError:true,retries:2});
+      },{allowError:true,retries:4});
       if(r.__error)throw new Error(r.__error);
       const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
       for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
+      if((guard+1)%10===0||!first(r.has_next,r?.result?.has_next))console.log(`FBO postings ${from}..${to}: pages=${guard+1}; rows=${byNumber.size}`);
       const next=asStr(first(r.cursor,r?.result?.cursor));
       const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
       if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;await sleep(400);
+      cursor=next;await sleep(1100);
     }
   } return [...byNumber.values()];
 }
@@ -561,20 +562,18 @@ async function fetchFbsPostings(fromDate,toDate){
     for(let guard=0;guard<1000;guard++){
       const r=await post('/v4/posting/fbs/list',{
         sort_dir:'asc',
-        filter:{
-          order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
-          order_id:0,since:rfc3339Start(from),to:rfc3339End(to),status:[],provider_ids:[],warehouse_ids:[]
-        },
-        limit:1000,cursor,
+        filter:{since:rfc3339Start(from),to:rfc3339End(to)},
+        limit:100,cursor,
         with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
-      },{allowError:true,retries:2});
+      },{allowError:true,retries:4});
       if(r.__error)throw new Error(r.__error);
       const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
       for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
+      if((guard+1)%10===0||!first(r.has_next,r?.result?.has_next))console.log(`FBS postings ${from}..${to}: pages=${guard+1}; rows=${byNumber.size}`);
       const next=asStr(first(r.cursor,r?.result?.cursor));
       const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
       if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;await sleep(400);
+      cursor=next;await sleep(1100);
     }
   } return [...byNumber.values()];
 }
@@ -886,7 +885,7 @@ if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kep
    v6 performs a one-time full posting backfill; later runs refresh only the recent window. */
 const financeAttributionUpgrade=previous?.financeAttributionVersion!==7;
 const dailyQuantityUpgrade=previous?.diagnostics?.dailyQuantityVersion!==DAILY_QTY_VERSION;
-const postingBackfillStart=addDays(BUSINESS_START,-45);
+const postingBackfillStart=BUSINESS_START;
 const postingFrom=dailyQuantityUpgrade?postingBackfillStart:(previous?maxDateStr(postingBackfillStart,addDays(TODAY,-POSTING_LOOKBACK_DAYS)):postingBackfillStart);
 console.log(`Posting quantity refresh ${postingFrom}..${TODAY}; dailyQuantityUpgrade=${dailyQuantityUpgrade}`);
 let freshFbo=[],freshFbs=[];
@@ -914,7 +913,7 @@ console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${finance
    because Ozon rate-limits it heavily and it is better suited for spot checks. */
 const skuFinanceFrom=financeFrom;
 const skuFinanceRows=financeRows.filter(r=>r.financeAttribution==='direct_sku'&&(r.sku||r.article));
-console.log(`SKU finance by-day direct v6.0: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
+console.log(`SKU finance by-day direct v6.0.1: rows=${skuFinanceRows.length}; source=/v1/finance/accrual/by-day; gross=sale_amount; no postings endpoint used`);
 
 /* Exact return quantities. v6 backfills from the business baseline once, then refreshes recent returns. */
 const returnFrom=dailyQuantityUpgrade?BUSINESS_START:(previous?maxDateStr(BUSINESS_START,addDays(TODAY,-RETURN_LOOKBACK_DAYS)):BUSINESS_START);
