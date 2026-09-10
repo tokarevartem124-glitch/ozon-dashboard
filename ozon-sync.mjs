@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 /*
-  Ozon Seller Analytics — API-only sync (schema v6.1 exact daily quantity from finance unit price)
+  Ozon Seller Analytics — API-only sync (schema v6.2 historical postings backfill + exact pagination)
 
   Source policy:
     - every operational Ozon dataset comes ONLY from Seller API;
@@ -32,7 +32,7 @@ const POSTING_LOOKBACK_DAYS = Math.max(7, Number(process.env.POSTING_LOOKBACK_DA
 const RETURN_LOOKBACK_DAYS = Math.max(7, Number(process.env.RETURN_LOOKBACK_DAYS || 35));
 const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
-const DAILY_QTY_VERSION = 2;
+const DAILY_QTY_VERSION = 3;
 const ANALYTICS_MAX_CATCHUP_DAYS = Math.max(1, Number(process.env.ANALYTICS_MAX_CATCHUP_DAYS || 7));
 
 if (!CLIENT_ID || !API_KEY) throw new Error('Missing OZON_CLIENT_ID or OZON_API_KEY');
@@ -551,50 +551,48 @@ function financeTotals(rows){
    for bulk sync because it is heavily rate-limited and intended for spot checks. */
 
 /* ------------------------------- postings ----------------------------- */
-async function fetchFboPostings(fromDate,toDate){
+async function fetchPostingPages(endpoint,bodyFactory,fromDate,toDate,label){
   const byNumber=new Map();
+  let totalPages=0;
   for(const [from,to] of monthChunks(fromDate,toDate)){
-    let cursor='';
-    for(let guard=0;guard<1000;guard++){
-      const r=await post('/v3/posting/fbo/list',{
-        cursor,
-        filter:{posting_number:[],order_number:[],since:rfc3339Start(from),to:rfc3339End(to),status:[]},
-        limit:100,sort_dir:'asc',translit:false,
-        with:{analytics_data:false,financial_data:false,legal_info:false}
-      },{allowError:true,retries:2});
+    let cursor='',pages=0;
+    for(let guard=0;guard<5000;guard++){
+      const r=await post(endpoint,bodyFactory(from,to,cursor),{allowError:true,retries:2});
       if(r.__error)throw new Error(r.__error);
       const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
+      pages++;totalPages++;
       for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
+
       const next=asStr(first(r.cursor,r?.result?.cursor));
-      const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
-      if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;await sleep(700);
+      const hasNextRaw=first(r.has_next,r?.result?.has_next);
+      const hasNext=hasNextRaw===undefined||hasNextRaw===null ? batch.length===100 : Boolean(hasNextRaw);
+      if(!batch.length||!next||next===cursor||!hasNext)break;
+      cursor=next;
+      await sleep(700);
     }
-  } return [...byNumber.values()];
+    console.log(`${label} postings chunk ${from.slice(0,10)}..${to.slice(0,10)}: pages=${pages}; cumulative unique=${byNumber.size}`);
+  }
+  console.log(`${label} postings complete ${fromDate}..${toDate}: pages=${totalPages}; unique=${byNumber.size}`);
+  return [...byNumber.values()];
+}
+async function fetchFboPostings(fromDate,toDate){
+  return fetchPostingPages('/v3/posting/fbo/list',(from,to,cursor)=>({
+    cursor,
+    filter:{posting_number:[],order_number:[],since:rfc3339Start(from),to:rfc3339End(to),status:[]},
+    limit:100,sort_dir:'asc',translit:false,
+    with:{analytics_data:false,financial_data:false,legal_info:false}
+  }),fromDate,toDate,'FBO');
 }
 async function fetchFbsPostings(fromDate,toDate){
-  const byNumber=new Map();
-  for(const [from,to] of monthChunks(fromDate,toDate)){
-    let cursor='';
-    for(let guard=0;guard<1000;guard++){
-      const r=await post('/v4/posting/fbs/list',{
-        sort_dir:'asc',
-        filter:{
-          order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
-          order_id:0,since:rfc3339Start(from),to:rfc3339End(to),status:[],provider_ids:[],warehouse_ids:[]
-        },
-        limit:100,cursor,
-        with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
-      },{allowError:true,retries:2});
-      if(r.__error)throw new Error(r.__error);
-      const batch=Array.isArray(r.postings)?r.postings:(r?.result?.postings||[]);
-      for(const p of batch)if(p?.posting_number)byNumber.set(asStr(p.posting_number),p);
-      const next=asStr(first(r.cursor,r?.result?.cursor));
-      const hasNext=Boolean(first(r.has_next,r?.result?.has_next));
-      if(!batch.length||!hasNext||!next||next===cursor)break;
-      cursor=next;await sleep(700);
-    }
-  } return [...byNumber.values()];
+  return fetchPostingPages('/v4/posting/fbs/list',(from,to,cursor)=>({
+    sort_dir:'asc',
+    filter:{
+      order_numbers:[],delivery_method_id:[],last_changed_status_date:{},
+      order_id:0,since:rfc3339Start(from),to:rfc3339End(to),status:[],provider_ids:[],warehouse_ids:[]
+    },
+    limit:100,cursor,
+    with:{analytics_data:false,barcodes:false,financial_data:false,legal_info:false,translit:false}
+  }),fromDate,toDate,'FBS');
 }
 function normalizePostingMap(postings){
   const out={};
@@ -857,11 +855,11 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
     warnings.push(`Daily quantity monthly reconciliation failed: ${bad||'no official closed month available'}`);
   }
   if(reconstructed.diagnostics.unresolvedSaleOps>0)warnings.push(`Daily quantity: ${reconstructed.diagnostics.unresolvedSaleOps} sale postings could not be resolved to product quantities.`);
-  console.log(`Daily quantity layer v6.1 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
+  console.log(`Daily quantity layer v6.2 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; financeQtyRows=${reconstructed.diagnostics.financeQtyRows||0}; postingFallbackRows=${reconstructed.diagnostics.postingQtyRows||0}; unresolvedSaleRows=${reconstructed.diagnostics.unresolvedSaleOps}; returnsComplete=${returnsComplete}; monthlyReconcile=${monthlyValidation.ok}`);
   for(const m of monthlyValidation.months)console.log(`Daily quantity reconcile ${m.month}: dailyNet=${m.dailyNet}; officialNet=${m.officialNet}; netDelta=${m.netDelta}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
   return {
     rows,
-    segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day quantity + posting fallback + returns; official daily override',rows}],
+    segments:[{key:`Q:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'finance by-day quantity + historical posting fallback + returns; official daily override',rows}],
     officialSegments:official.segments,
     coverage:{start:BUSINESS_START,end:targetEnd,complete,gaps:[]},
     diagnostics:{monthlyLoaded:official.diagnostics.monthlyLoaded,dailyLoaded:official.diagnostics.dailyLoaded,dailyPremiumAvailable:official.diagnostics.dailyPremiumAvailable,fallbackUnresolvedSaleOps:reconstructed.diagnostics.unresolvedSaleOps,financeQtyRows:reconstructed.diagnostics.financeQtyRows||0,postingQtyRows:reconstructed.diagnostics.postingQtyRows||0,monthlyValidation}
@@ -928,13 +926,18 @@ const priceRows=freshPrice.length?freshPrice:(previousPrice?.rows||[]);
 if(!stockComplete)warnings.push(`Stock refresh incomplete ${freshStock.length}/${products.length}; previous API stock kept.`);
 if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kept.');
 
-/* v6.1 derives historical sold quantity directly from Finance by-day.
-   Shipment lists are retained only as a recent fallback for rare rows where the
-   Finance unit-price ratio cannot be resolved. */
+/* v6.2: Finance remains the accounting source. Postings are the authoritative
+   fallback for exact product quantity whenever Finance cannot infer it.
+   IMPORTANT: while the daily layer has not reconciled, backfill shipment history
+   from just before BUSINESS_START instead of limiting the repair to recent days. */
 const financeAttributionUpgrade=previous?.financeAttributionVersion!==7;
 const dailyQuantityUpgrade=previous?.diagnostics?.dailyQuantityVersion!==DAILY_QTY_VERSION;
-const postingFrom=maxDateStr(addDays(BUSINESS_START,-7),addDays(TODAY,-POSTING_LOOKBACK_DAYS));
-console.log(`Posting fallback refresh ${postingFrom}..${TODAY}; dailyQuantityUpgrade=${dailyQuantityUpgrade}`);
+const previousDailyComplete=Boolean(previous?.diagnostics?.realizationCoverage?.complete);
+const needsPostingBackfill=dailyQuantityUpgrade||!previousDailyComplete;
+const postingFrom=needsPostingBackfill
+  ? addDays(BUSINESS_START,-7)
+  : maxDateStr(addDays(BUSINESS_START,-7),addDays(TODAY,-POSTING_LOOKBACK_DAYS));
+console.log(`Posting quantity refresh ${postingFrom}..${TODAY}; dailyQuantityUpgrade=${dailyQuantityUpgrade}; previousDailyComplete=${previousDailyComplete}; fullBackfill=${needsPostingBackfill}`);
 let freshFbo=[],freshFbs=[];
 try{freshFbo=await fetchFboPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBO postings: ${e}`)}
 try{freshFbs=await fetchFbsPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBS postings: ${e}`)}
@@ -1012,7 +1015,7 @@ const dailyRealizationSegments=realization.segments.filter(s=>s.kind==='daily'&&
 const dailyRealizationStart=dailyRealizationSegments.map(s=>s.start).filter(Boolean).sort()[0]||null;
 const dailyRealizationEnd=dailyRealizationSegments.map(s=>s.end).filter(Boolean).sort().at(-1)||null;
 if(funnelRows.length)datasets.push({id:`api-funnel-${salesStart}_${salesEnd}`,apiAuto:true,type:'funnel',label:'Воронка Ozon API',sheetName:'analytics/data',sourceName:'Ozon Seller API',start:salesStart,end:salesEnd,snapshot:null,importedAt:generatedAt,capabilities:{funnel:true,api:true,topTrafficDetail:true,periodSegmented:true,note:'Для SKU детализация до 1000 товаров с наибольшим трафиком на каждом сегменте.'},rows:funnelRows});
-if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Реализованное количество Ozon API',sheetName:'daily quantity: finance by-day + posting quantities + returns',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthlyValidation:true,dailyArbitrary:true,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
+if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Реализованное количество Ozon API',sheetName:'daily quantity: finance by-day + historical posting quantities + returns',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthlyValidation:true,dailyArbitrary:true,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
 if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'stock',label:'Остатки Ozon API',sheetName:stockComplete?stockResult.source:(previousStock?.sheetName||'previous API snapshot'),sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{stock:true,prices:true,api:true,complete:stockComplete},rows:stockRows});
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
@@ -1030,11 +1033,11 @@ const payload={
   version:4,sourcePolicy:'ozon-api-only',financeAttributionVersion:7,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
   history:{analyticsSegments,postingMap,returnRows,realizationSegments:realization.officialSegments,financeRowsAll:financeRows,skuFinanceRowsAll:skuFinanceRows},
   diagnostics:{
-    mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,businessStart:BUSINESS_START,dailyQuantityVersion:persistedDailyQuantityVersion,dailyQuantityUpgrade,
+    mode:SYNC_MODE,sourcePolicy:'ozon-api-only',previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,businessStart:BUSINESS_START,dailyQuantityVersion:persistedDailyQuantityVersion,dailyQuantityUpgrade,needsPostingBackfill,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
     financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:7,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
-    postingRefreshFrom:postingFrom,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
+    postingRefreshFrom:postingFrom,postingFullBackfill:needsPostingBackfill,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
     returnRefreshFrom:returnFrom,returnsApiComplete:returnsComplete,returnsComplete:realization.coverage.complete,returnsFresh:freshReturnRows.length,fbsReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBS').length,fboReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBO').length,returnRows:returnRows.length,
     realizedRows:realization.rows.length,unresolvedSaleOps:realization.diagnostics.fallbackUnresolvedSaleOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,dailyQuantityMonthlyValidation:realization.diagnostics.monthlyValidation,
     analyticsSegments:analyticsSegments.length,analyticsCoverage:{from:salesStart,to:salesEnd},analyticsRows:salesRows.length,analyticsSegmentRows:funnelRows.length,analyticsLatestSkuDetailTruncated:Boolean(analyticsSegments.at(-1)?.skuDetailTruncated),
@@ -1044,6 +1047,6 @@ const payload={
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. Daily quantities from 2026-06-01 are derived from Finance sale_amount / unit seller_price, with posting fallback and returns, and reconciled to official monthly realization.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:'ozon-api-only',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day. Daily quantities from 2026-06-01 use Finance quantity where exact and a fully paginated historical FBO/FBS posting fallback otherwise, plus returns; closed months are reconciled to official monthly realization.'},null,2));
 console.log(`Encrypted API-only dashboard state written. warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
