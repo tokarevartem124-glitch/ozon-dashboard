@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v9.1-item-verified-2026-09-14";
+    window.__OZON_DASHBOARD_BUILD__ = "v9.2-finance-cis-2026-09-14";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — API-only v9.1</title>
+  <title>Ozon Seller Analytics — v9.2</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">API-only v9.1</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v9.2 · API + validated CIS</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -276,8 +276,8 @@ function apiPasswordDialog(){
   });
 }
 function applyApiPayload(payload){
-  if(payload?.version!==4||payload?.sourcePolicy!=='ozon-api-only'){
-    throw new Error(`Нужен API-only payload v4. Получено: version=${payload?.version??'?'}, source=${payload?.sourcePolicy??'?'}`);
+  if(payload?.version!==4||!['ozon-api-only','ozon-api-plus-validated-supplements'].includes(payload?.sourcePolicy)){
+    throw new Error(`Нужен payload v4 Seller API. Получено: version=${payload?.version??'?'}, source=${payload?.sourcePolicy??'?'}`);
   }
   if(!Array.isArray(payload?.datasets)||!payload.datasets.length)throw new Error('В файле автообновления нет наборов данных.');
   for(const d of payload.datasets){
@@ -297,7 +297,7 @@ function applyApiPayload(payload){
     apiSyncStatus.loaded=true;apiSyncStatus.loading=false;apiSyncStatus.error=null;
     // Re-render the status-dependent blocks after the model is already valid.
     renderSourceChips();renderQuality();renderKpis();
-    showMessage(`Ozon API обновлён: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}. Excel Ozon в расчётах не используется.`,'success');
+    showMessage(`Данные обновлены: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}. Seller API дополнен валидированным слоем комиссий СНГ; выручка из него не добавляется.`,'success');
   }catch(e){
     state.datasets=previousDatasets;
     apiSyncStatus={...previousStatus,available:true,loaded:false,loading:false,generatedAt:payload.generatedAt,error:`Ошибка применения API-данных: ${e?.message||e}`};
@@ -988,10 +988,14 @@ function buildModel(){
   const costRev={report:0,manual:0,missing:0};
   for(const o of products)costRev[o.costSource]+=safe(o.revenue);
 
-  // All Ozon expenses are recognized strictly on the Finance API accrual date.
-  // The negative/return principal in Finance gross is intentionally NOT subtracted
-  // here because v8 already removes the original delivered revenue retroactively.
-  const financeOzonExpenses=sum(finRows,r=>expenseKeys.reduce((z,k)=>z+safe(r[k]),0));
+  // Standard Ozon expenses are recognized on the Finance API accrual date.
+  // Validated marketplace-buyout/CIS commission rows are the only business supplement:
+  // they contribute EXPENSES ONLY, are allocated inside August by buyout date and never add revenue.
+  // Positive reversals/compensations reduce net expense but remain visible separately.
+  const financeOzonExpensesGross=sum(finRows,r=>expenseKeys.reduce((z,k)=>z+Math.max(0,safe(r[k])),0));
+  const financeOzonRefunds=sum(finRows,r=>expenseKeys.reduce((z,k)=>z+Math.max(0,-safe(r[k])),0));
+  const financeOzonExpenses=financeOzonExpensesGross-financeOzonRefunds;
+  const marketplaceBuyoutExpenses=sum(finRows.filter(r=>r.manualSupplement===true),r=>expenseKeys.reduce((z,k)=>z+Math.max(0,safe(r[k])),0));
   const directOzonExpenses=sum(products,x=>safe(x.directOzonExpenses));
   const unallocatedOzonExpenses=expenseKeys.reduce((z,k)=>z+safe(unallocatedFinance[k]),0);
   const afterOzon=totalRevenue-financeOzonExpenses;
@@ -1057,7 +1061,7 @@ function buildModel(){
   return{
     products,totalRevenue,totalCogs,complete:operatingComplete,completeRevenue:operatingRevenue,completeProfit:operatingProfit,
     operatingComplete,operatingRevenue,operatingProfit,
-    financeGrossAccrued,financeNetAccrued,financeOzonExpenses,directOzonExpenses,unallocatedOzonExpenses,afterOzon,unallocatedFinance,unallocatedOzonNet,
+    financeGrossAccrued,financeNetAccrued,financeOzonExpensesGross,financeOzonRefunds,financeOzonExpenses,marketplaceBuyoutExpenses,directOzonExpenses,unallocatedOzonExpenses,afterOzon,unallocatedFinance,unallocatedOzonNet,
     externalExpenses,managementRemainderKnown,managementRemainder,profitBeforeHiredLogistics,profitBeforeTax,
     estimatedTax,taxRate,businessNetProfit,businessMargin,businessRoi,businessPeriod,
     rrpBaseKnown,rrpTargetKnown,rrpTarget,rrpDelta,rrpAttainment,rrpCoverageUnits,rrpComplete,rrpGrossUnitsKnown,rrpGrossUnitsMissing,rrpNetUnits,missingRrpArticles,quantityComplete,
@@ -1155,7 +1159,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v9.1</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v9.2</span>`;
   if(apiSyncStatus.loaded)html+=`<span class="chip ok">API: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}</span>`;
   else if(apiSyncStatus.loading)html+=`<span class="chip">API: подключение…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1192,10 +1196,10 @@ function renderQuality(){
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
   const exactDelivery=q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage);
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v9.1.</b> Ozon — <b>только Seller API</b>. 
+  $('#dataQuality').innerHTML=`<b>Контроль данных v9.2.</b> Ozon — <b>Seller API + валидированный слой комиссий СНГ</b>. 
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
-    <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) отправлений FBS, фактически перешедших в delivered в выбранный период; будущие возвраты ретроспективно уменьшают исходную доставку.
-    <b>Расходы Ozon:</b> ${fmtMoney(m.financeOzonExpenses)} — по датам начислений Finance API; после Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
+    <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) фактически доставленных отправлений; СНГ-дополнение выручку не добавляет и поэтому не создаёт дублей. Будущие возвраты ретроспективно уменьшают исходную доставку.
+    <b>Расходы Ozon:</b> списания ${fmtMoney(m.financeOzonExpensesGross)} − возвраты/сторно ${fmtMoney(m.financeOzonRefunds)} = чистые ${fmtMoney(m.financeOzonExpenses)}; в том числе комиссии СНГ ${fmtMoney(m.marketplaceBuyoutExpenses)}. Стандартные расходы — по Finance-дате, валидированный отчёт «выкупы маркетплейсом» — целиком в августе по дате выкупа. После Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
     Даты доставки: точность ${exactDelivery} · покрытие ${q.realizationCoverage?.from||'нет'} — ${q.realizationCoverage?.to||'нет'} · контроль gross delivery закрытых месяцев: ${grossCtl}.
     Ретроспективно снято возвратами: ${fmtNum(q.retroReturnedUnits||0)} шт. · ${fmtMoney(q.retroReturnedRevenue||0)}.
     Заказы Ozon: ${q.orderSalePostings!=null?`${fmtNum(q.orderNumberResolved||0)}/${fmtNum(q.orderSalePostings)} номеров · ${fmtNum(q.orderDateResolved||0)}/${fmtNum(q.orderSalePostings)} дат`:'ожидается синхронизация v9'}. Период продаж фильтруется по <b>дате фактической доставки</b>; дата заказа показывается отдельно.
@@ -1212,7 +1216,8 @@ function renderKpis(){
   const normClass=m.rrpDelta==null?'warning':m.rrpDelta>=0?'positive':'negative';
   const cards=[
     ['Выручка Ozon',fmtMoney(m.totalRevenue),'фактически доставленные за период заказы; поздние возвраты снимаются ретроспективно','', 'revenue'],
-    ['После услуг Ozon',fmtMoney(m.afterOzon),`выручка по доставке − расходы Ozon по датам Finance API (${fmtMoney(m.financeOzonExpenses)})`,'', 'ozonNet'],
+    ['Все расходы Ozon',fmtMoney(m.financeOzonExpensesGross),`списания до возвратов/сторно · СНГ ${fmtMoney(m.marketplaceBuyoutExpenses)} · возвраты/сторно ${fmtMoney(m.financeOzonRefunds)}`,'', 'ozonNet'],
+    ['После услуг Ozon',fmtMoney(m.afterOzon),`выручка − чистые расходы Ozon ${fmtMoney(m.financeOzonExpenses)} (${fmtMoney(m.financeOzonExpensesGross)} − ${fmtMoney(m.financeOzonRefunds)})`,'', 'ozonNet'],
     ['Внешние расходы',ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),extSub,ext?.complete?'':'warning','external'],
     ['Управленческий остаток',m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),'до закупки и налога',ext?.complete?'':'warning','management'],
     ['Норматив РРЦ −10%',m.rrpTarget!=null?fmtMoney(m.rrpTarget):fmtMoney(m.rrpTargetKnown),`Σ(РРЦ × реализованное количество) × 90% · покрытие ${fmtPct(m.rrpCoverageUnits)}`,m.rrpComplete?'':'warning','rrpTarget'],
@@ -1480,7 +1485,7 @@ function renderSettings(){
   </div>
 
   <div class="card" style="margin-top:12px"><h3>Контроль источников</h3>
-    <div class="metric-row"><span>Политика данных Ozon</span><b>только Seller API</b></div>
+    <div class="metric-row"><span>Политика данных Ozon</span><b>Seller API + валидированные комиссии СНГ</b></div>
     <div class="metric-row"><span>Последняя синхронизация</span><span>${apiSyncStatus.loaded?new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU'):'API не разблокирован'}</span></div>
     <div class="metric-row"><span>Артикулов Ozon</span><span>${fmtNum(q.currentOzonArticles)}</span></div>
     <div class="metric-row"><span>Закупочная цена найдена</span><span>${fmtNum(q.ozonCostKnown)} / ${fmtNum(q.currentOzonArticles)} (${fmtPct(pct(q.ozonCostKnown,q.currentOzonArticles))})</span></div>
@@ -1490,7 +1495,10 @@ function renderSettings(){
     <div class="metric-row"><span>Конфликтов закупочной цены</span><span class="${q.ozonCostConflict?'negative':'positive'}">${fmtNum(q.ozonCostConflict)}</span></div>
     <div class="metric-row"><span>Выручка доставленных заказов (P&amp;L)</span><b>${fmtMoney(m.totalRevenue)}</b></div>
     <div class="metric-row"><span>Finance gross (только аудит, другой временной базис)</span><span>${fmtMoney(m.financeGrossAccrued)} · разница по времени ${fmtMoney(m.reconciliation?.financeRevenueTimingDelta)}</span></div>
-    <div class="metric-row"><span>Расходы Ozon по Finance-дате</span><b>${fmtMoney(m.financeOzonExpenses)}</b></div>
+    <div class="metric-row"><span>Все списания Ozon</span><b>${fmtMoney(m.financeOzonExpensesGross)}</b></div>
+    <div class="metric-row"><span>Возвраты / сторно комиссий и услуг</span><b>${fmtMoney(m.financeOzonRefunds)}</b></div>
+    <div class="metric-row"><span>Чистые расходы Ozon</span><b>${fmtMoney(m.financeOzonExpenses)}</b></div>
+    <div class="metric-row"><span>В т.ч. комиссии СНГ / выкуп маркетплейсом</span><b>${fmtMoney(m.marketplaceBuyoutExpenses)} · ${fmtNum(q.marketplaceBuyoutSupplementRows||0)} строк</b></div>
     <div class="metric-row"><span>Сверка расходов direct SKU + общие → Finance</span><span class="${Math.abs(safe(m.reconciliation?.expenseDiff))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(m.reconciliation?.expenseDiff)))}</span></div>
     <div class="metric-row"><span>Business ledger reconcile delta</span><span class="${Math.abs(safe(q.financeReconcileDelta))<1?'positive':'negative'}">${fmtMoney(Math.abs(safe(q.financeReconcileDelta)))}</span></div>
     <div class="metric-row"><span>Даты фактической доставки</span><span>${m.quantityComplete?`<span class="positive">контроль пройден · точность ${q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage)}</span>`:`<span class="warning">нет точной даты: ${fmtNum(q.unresolvedDeliveryDates??q.unresolvedSaleOps??0)} · резервных дат: ${fmtNum(q.inexactDeliveryRows||0)}</span>`}</span></div>
@@ -1510,7 +1518,7 @@ function renderSettings(){
   </div>
 
   <div class="card" style="margin-top:12px"><h3>Справочники 1С</h3>
-    <div class="footer-note" style="margin-bottom:8px">В расчётах Ozon Excel-файлы не используются. Здесь разрешены только закупочная цена и РРЦ. Ключ: Id товара → Артикул Ozon.</div>
+    <div class="footer-note" style="margin-bottom:8px">Операционные данные идут из Seller API. Исключение — один валидированный августовский источник «Выкупы маркетплейсом», из которого автоматически добавляются только комиссии СНГ (без выручки). Здесь вручную разрешены только закупочная цена и РРЦ. Ключ: Id товара → Артикул Ozon.</div>
     <div class="table-wrap"><table class="table" style="min-width:760px"><thead><tr><th>Справочник</th><th>Источник</th><th class="num">Идентификаторов</th><th>Срез</th></tr></thead><tbody>
       ${state.datasets.filter(d=>['cost','rrp'].includes(d.type)).map(d=>`<tr><td>${escapeHtml(d.label)}</td><td class="name">${escapeHtml(d.sourceName)}</td><td class="num">${fmtNum(d.rows.length)}</td><td>${d.snapshot?dateLabel(d.snapshot):'—'}</td></tr>`).join('')}
     </tbody></table></div>
@@ -1576,7 +1584,7 @@ function drillDefinition(type,payload={}){
   const percent=(key,label)=>({key,label,fmt:p=>fmtPct(typeof key==='function'?key(p):p[key]),cls:'num'});
   let def={type,title:'Детализация',subtitle:`Период: ${drillPeriodText()}`,kind:'products',rows:[],columns:cols,sort:'revenue',dir:-1,note:'',stats:[]};
   if(type==='revenue')Object.assign(def,{title:'Выручка Ozon — фактически доставленные товары',rows:m.products.filter(p=>Math.abs(safe(p.revenue))>.005),columns:[...cols,number('units','Реализовано, шт.'),money('revenue','Выручка'),percent('revenueShare','Доля')],sort:'revenue',stats:[{label:'Выручка доставок',value:fmtMoney(m.totalRevenue)},{label:'Уникальных SKU с выручкой',value:fmtNum(m.products.filter(p=>p.revenue>0).length)},{label:'Товарных строк доставок',value:fmtNum((m.orderRows||[]).filter(r=>safe(r.soldQty)>0).length)},{label:'Доставлено net, шт.',value:fmtNum(sum(m.products,p=>Math.max(0,safe(p.units))),0)},{label:'Отправлений с выручкой',value:fmtNum(new Set((m.orderRows||[]).filter(r=>safe(r.revenue)>0).map(r=>r.postingNumber).filter(Boolean)).size)},{label:'Период доставки',value:drillPeriodText()}]});
-  else if(type==='ozonNet')Object.assign(def,{title:'После услуг Ozon — расшифровка по товарам',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Выручка доставок',value:fmtMoney(m.totalRevenue)},{label:'Расходы Ozon по Finance-дате',value:fmtMoney(m.financeOzonExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Операции без SKU не распределяются по товарам и учитываются только в общем P&L. Товарная экономика использует только прямые SKU-начисления.'});
+  else if(type==='ozonNet')Object.assign(def,{title:'Расходы и результат после услуг Ozon',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Чистые расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Все списания Ozon',value:fmtMoney(m.financeOzonExpensesGross)},{label:'Возвраты / сторно',value:fmtMoney(m.financeOzonRefunds)},{label:'Чистые расходы Ozon',value:fmtMoney(m.financeOzonExpenses)},{label:'Комиссии СНГ',value:fmtMoney(m.marketplaceBuyoutExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Стандартные расходы признаются по датам Finance API. Валидированные комиссии из отчёта «Выкупы маркетплейсом» относятся к августу по дате выкупа и суммируются с Finance-комиссиями по совпадающим отправлениям; выручка из этого дополнения не добавляется. Операции без SKU учитываются только в общем P&L.'});
   else if(type==='external')Object.assign(def,{title:'Внешние расходы вне Ozon',kind:'external',stats:[{label:'Всего',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),cls:ext?.complete?'':'warning'},{label:'Репрайсер',value:fmtMoney(ext?.repricer)},{label:'Премии магазинам',value:fmtMoney(ext?.storeBonus)},{label:'Наёмная логистика',value:fmtMoney(ext?.hiredKnown)}],note:'Это расходы бизнеса, которых нет в кабинете Ozon. Они не распределяются на SKU и учитываются только на уровне общего P&L.'});
   else if(type==='management')Object.assign(def,{title:'Управленческий остаток — состав',kind:'management',stats:[{label:'После Ozon',value:fmtMoney(m.afterOzon)},{label:'Внешние расходы',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown)},{label:'Управленческий остаток',value:m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),cls:ext?.complete?'positive':'warning'}],note:'Управленческий остаток = выручка фактически доставленных и не возвращённых товаров − расходы Ozon, начисленные Finance API в выбранном периоде − внешние операционные расходы. Закупка и УСН здесь ещё не вычтены.'});
   else if(type==='rrpTarget')Object.assign(def,{title:'Норматив РРЦ −10% — из чего складывается',rows:m.products.filter(p=>productRrpTarget(p)!=null&&Math.abs(safe(p.units))>.0001),columns:[...cols,number('units','Net, шт.'),money('rrp','РРЦ'),money(p=>p.rrp*p.units,'База РРЦ'),money(p=>productRrpTarget(p),'90% РРЦ')],sort:'units',stats:[{label:'База РРЦ',value:fmtMoney(m.rrpBaseKnown)},{label:'Норматив 90%',value:fmtMoney(m.rrpTarget??m.rrpTargetKnown)},{label:'Покрытие движений',value:fmtPct(m.rrpCoverageUnits)}],note:'Это детализация вклада SKU в общий норматив. Статус «выполнен/не выполнен» по отдельному товару намеренно не рассчитывается.'});
@@ -1683,7 +1691,7 @@ function renderExternalDrill(def){
 function renderCategoriesDrill(def){const rows=currentModel.categories;return `${drillStatsHtml(def.stats)}<div class="table-wrap"><table class="table" style="min-width:760px"><thead><tr><th>Категория</th><th class="num">Товаров</th><th class="num">Выручка</th><th class="num">Товарная прибыль</th><th class="num">Маржа</th></tr></thead><tbody>${rows.map(r=>`<tr class="drill-row" data-category-drill="${escapeHtml(r.category)}"><td class="name"><span class="linkish">${escapeHtml(r.category)}</span></td><td class="num">${fmtNum(r.count)}</td><td class="num">${fmtMoney(r.revenue)}</td><td class="num">${fmtMoney(r.profit)}</td><td class="num">${fmtPct(r.margin)}</td></tr>`).join('')}</tbody></table></div>`}
 function renderSignalsDrill(def){const rows=currentModel.signals;return `${drillStatsHtml(def.stats)}${def.note?`<div class="drawer-note">${escapeHtml(def.note)}</div>`:''}<div class="table-wrap"><table class="table" style="min-width:900px"><thead><tr><th>Товар</th><th>Сигнал</th><th>Почему</th><th class="num">Потенциал</th></tr></thead><tbody>${rows.map(x=>`<tr class="drill-row" data-product-drill="${escapeHtml(x.product.key)}"><td class="name"><span class="linkish">${escapeHtml(x.product.article)} · ${escapeHtml(x.product.name)}</span></td><td>${escapeHtml(x.type)}</td><td class="name">${escapeHtml(x.detail)}</td><td class="num">${fmtMoney(x.potential)}</td></tr>`).join('')}</tbody></table></div>`}
 function renderBusinessDrill(def){
-  const m=currentModel,e=m.externalExpenses;const rows=[['Выручка доставленных заказов',m.totalRevenue],['Минус расходы Ozon по Finance-дате',-m.financeOzonExpenses],['После услуг Ozon',m.afterOzon],['Минус внешние расходы',-safe(e?.totalKnown)],['Управленческий остаток',m.managementRemainder??m.managementRemainderKnown],['Минус закупочную стоимость',-m.totalCogs],['Прибыль до УСН',m.profitBeforeTax],['Минус оценка УСН',m.estimatedTax!=null?-m.estimatedTax:null],['Результат после УСН',m.businessNetProfit]];
+  const m=currentModel,e=m.externalExpenses;const rows=[['Выручка доставленных заказов',m.totalRevenue],['Все списания Ozon',-m.financeOzonExpensesGross],['Плюс возвраты / сторно Ozon',m.financeOzonRefunds],['Чистые расходы Ozon',-m.financeOzonExpenses],['После услуг Ozon',m.afterOzon],['Минус внешние расходы',-safe(e?.totalKnown)],['Управленческий остаток',m.managementRemainder??m.managementRemainderKnown],['Минус закупочную стоимость',-m.totalCogs],['Прибыль до УСН',m.profitBeforeTax],['Минус оценка УСН',m.estimatedTax!=null?-m.estimatedTax:null],['Результат после УСН',m.businessNetProfit]];
   return `${drillStatsHtml(def.stats)}${def.note?`<div class="drawer-note">${escapeHtml(def.note)}</div>`:''}<div class="table-wrap"><table class="table" style="min-width:620px"><thead><tr><th>Этап</th><th class="num">Сумма</th></tr></thead><tbody>${rows.map(([n,v])=>`<tr><td>${escapeHtml(n)}</td><td class="num ${v!=null&&v<0?'negative':''}">${v==null?'нет данных':fmtMoney(v)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function renderProductDrill(def){const p=def.product;if(!p)return'<div class="empty">Товар не найден в текущем периоде.</div>';return `${drillStatsHtml(def.stats)}<div class="drawer-product-title"><div><div class="article">Артикул ${escapeHtml(p.article||'—')} · SKU ${escapeHtml(p.sku||'—')}</div><div class="muted tiny">${escapeHtml(p.category||'Без категории')} · ${escapeHtml(p.brand||'')}</div></div></div>${productDetail(p)}`}
