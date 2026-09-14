@@ -57,6 +57,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "mode=daily" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "37 2 * * *" ]; then
             echo "mode=daily" >> "$GITHUB_OUTPUT"
           else
@@ -72,6 +74,7 @@ jobs:
           SYNC_MODE: "${{ steps.sync_mode.outputs.mode }}"
           PREVIOUS_DATA_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/ozon-data.enc.json"
           FINANCE_LOOKBACK_DAYS: "3"
+          FINANCE_DAILY_LOOKBACK_DAYS: "62"
           ANALYTICS_MAX_CATCHUP_DAYS: "7"
           ANALYTICS_PAGE_DELAY_MS: "65000"
 
