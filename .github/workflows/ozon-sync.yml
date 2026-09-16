@@ -19,6 +19,8 @@ on:
       - "index.html"
       - "ozon-sync.mjs"
       - ".github/workflows/ozon-sync.yml"
+      - "data/1c-reference.json"
+      - "data/marketplace-buyout-2026-08.json"
 
   schedule:
     - cron: "17 * * * *"
