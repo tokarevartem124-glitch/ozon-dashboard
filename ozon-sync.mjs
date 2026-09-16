@@ -1,15 +1,16 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 /*
-  Ozon Seller Analytics — Seller API + validated supplements sync (v9.2)
+  Ozon Seller Analytics — Seller API + validated supplements sync (v9.3 Fast Load)
 
   Source policy:
     - operational Ozon data comes from Seller API;
     - one validated business supplement is allowed: marketplace-buyout/CIS commission rows converted to versioned JSON;
     - the supplement adds expenses only and NEVER adds revenue;
-    - purchase cost and RRP live in index.html/local browser state and are joined by offer_id/article.
+    - purchase cost and RRP are served as a separate cached browser reference and joined by offer_id/article.
 
   Modes:
     fast  — hourly: catalogue, prices, stocks, recent finance + recent postings;
@@ -107,21 +108,24 @@ function keyFromHex(hex){
   if(!/^[0-9a-f]{64}$/i.test(hex)) throw new Error('Invalid DASHBOARD_KEY');
   return Buffer.from(hex,'hex');
 }
-function encryptJson(obj,keyHex){
+function encryptJson(obj,keyHex,{gzip=true}={}){
   const iv=crypto.randomBytes(12);
   const key=keyFromHex(keyHex);
   const cipher=crypto.createCipheriv('aes-256-gcm',key,iv);
-  const plain=Buffer.from(JSON.stringify(obj),'utf8');
+  const json=Buffer.from(JSON.stringify(obj),'utf8');
+  const plain=gzip?zlib.gzipSync(json,{level:9}):json;
   const ciphertext=Buffer.concat([cipher.update(plain),cipher.final()]);
   const tag=cipher.getAuthTag();
-  return {v:2,alg:'AES-256-GCM',keyMode:'RAW-HEX-256',iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt};
+  return {v:3,alg:'AES-256-GCM',keyMode:'RAW-HEX-256',compression:gzip?'gzip':'none',iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt,originalBytes:json.length,compressedBytes:plain.length};
 }
 function decryptJson(env,keyHex){
   if(env?.keyMode!=='RAW-HEX-256') throw new Error('Previous encrypted state uses legacy password format; clean API-only backfill required');
   const iv=Buffer.from(env.iv,'base64'),data=Buffer.from(env.data,'base64');
   const ciphertext=data.subarray(0,data.length-16),tag=data.subarray(data.length-16);
   const decipher=crypto.createDecipheriv('aes-256-gcm',keyFromHex(keyHex),iv); decipher.setAuthTag(tag);
-  return JSON.parse(Buffer.concat([decipher.update(ciphertext),decipher.final()]).toString('utf8'));
+  let plain=Buffer.concat([decipher.update(ciphertext),decipher.final()]);
+  if(env.compression==='gzip')plain=zlib.gunzipSync(plain);
+  return JSON.parse(plain.toString('utf8'));
 }
 async function loadPreviousPayload(){
   if(!PREVIOUS_DATA_URL)return null;
@@ -1918,7 +1922,13 @@ const payload={
 };
 
 await fs.mkdir(path.join(process.cwd(),'data'),{recursive:true});
-await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(encryptJson(payload,DASHBOARD_KEY)));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement (expense only, no revenue). v9.2 P&L sales are sourced from FBS postings that reached delivered status, with an item-level guard for multi-product postings: a line is excluded only when Ozon API gives reverse/cancel evidence and no positive sale evidence. Revenue uses posting products.price × quantity and is timed by the exact delivered-status day. Later returns retroactively reduce the original delivery. Standard Ozon expenses remain on Finance API accrual dates; the validated marketplace-buyout/CIS commission supplement is allocated to August by buyout date.'},null,2));
-console.log(`Encrypted dashboard state written. sourcePolicy=${SOURCE_POLICY}; warnings=${warnings.length}`);
+// Full encrypted state remains the workflow-to-workflow persistence layer.
+const fullEnvelope=encryptJson(payload,DASHBOARD_KEY,{gzip:true});
+// The browser does not need postingMap/history/financeRowsAll. Serve a slim encrypted payload for fast startup.
+const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolicy,financeAttributionVersion:payload.financeAttributionVersion,generatedAt:payload.generatedAt,syncMode:payload.syncMode,clientId:payload.clientId,datasets:payload.datasets,diagnostics:payload.diagnostics};
+const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
+await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v9.3 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement (expense only, no revenue). P&L sales are sourced from FBS postings that reached delivered status, with an item-level guard for multi-product postings. Revenue uses posting products.price × quantity and is timed by the exact delivered-status day. Later returns retroactively reduce the original delivery. Standard Ozon expenses remain on Finance API accrual dates; the validated marketplace-buyout/CIS commission supplement is allocated to August by buyout date.'},null,2));
+console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
