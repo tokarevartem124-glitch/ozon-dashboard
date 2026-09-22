@@ -239,7 +239,10 @@ const ordinaryCandidates = allPostings
   })
   .sort((a, b) => String(a.posting_number).localeCompare(String(b.posting_number)));
 
-const ordinaryPosting = ordinaryCandidates[0] ?? null;
+const ordinaryTargetPostingNumber = '0116834127-0208-1';
+const ordinaryPosting = ordinaryCandidates.find(posting =>
+  String(posting?.posting_number ?? '') === ordinaryTargetPostingNumber
+) ?? null;
 const ordinaryPostingNumber = String(ordinaryPosting?.posting_number ?? '');
 const ordinaryOrderNumber = String(ordinaryPosting?.order_number ?? '');
 const ordinaryAccruals = allAccruals.filter(accrual => {
