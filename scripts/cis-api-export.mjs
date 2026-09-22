@@ -198,6 +198,53 @@ const matchingPostings = allPostings.filter(posting => {
   return buyoutPostingNumbers.has(number) || flagged;
 });
 
+function accrualPostingNumber(accrual) {
+  return String(accrual?.posting?.posting_number ?? accrual?.unit_number ?? '');
+}
+
+function moneyAmount(value) {
+  const raw = value && typeof value === 'object' ? value.amount : value;
+  const number = Number(raw ?? 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+const augustAccrualsByPosting = new Map();
+for (const accrual of allAccruals) {
+  if (String(accrual?.date ?? '').slice(0, 7) !== '2026-08') continue;
+  const number = accrualPostingNumber(accrual);
+  if (!number) continue;
+  const rows = augustAccrualsByPosting.get(number) ?? [];
+  rows.push(accrual);
+  augustAccrualsByPosting.set(number, rows);
+}
+
+const ordinaryCandidates = allPostings
+  .filter(posting => {
+    const number = String(posting?.posting_number ?? '');
+    const products = Array.isArray(posting?.products) ? posting.products : [];
+    const accruals = augustAccrualsByPosting.get(number) ?? [];
+    const isBuyout = products.some(product => product?.is_marketplace_buyout === true);
+    const hasCommission = accruals.some(accrual =>
+      (accrual?.posting?.products ?? []).some(product => product?.commission != null)
+    );
+    const hasDeliveryService = accruals.some(accrual =>
+      (accrual?.posting?.products ?? []).some(product =>
+        Array.isArray(product?.delivery?.services) && product.delivery.services.length > 0
+      )
+    );
+    const hasPositiveAccrual = accruals.some(accrual => moneyAmount(accrual?.total_amount) > 0);
+    return String(posting?.status ?? '').toLowerCase() === 'delivered' &&
+      !isBuyout && products.length === 1 && accruals.length > 0 &&
+      hasCommission && hasDeliveryService && hasPositiveAccrual;
+  })
+  .sort((a, b) => String(a.posting_number).localeCompare(String(b.posting_number)));
+
+const ordinaryPosting = ordinaryCandidates[0] ?? null;
+const ordinaryPostingNumber = String(ordinaryPosting?.posting_number ?? '');
+const ordinaryAccruals = ordinaryPostingNumber
+  ? (augustAccrualsByPosting.get(ordinaryPostingNumber) ?? [])
+  : [];
+
 const payload = {
   kind: 'ozon_cis_buyout_diagnostic',
   generatedAt: new Date().toISOString(),
@@ -217,6 +264,9 @@ const payload = {
     matchingAccrualRows: matchingAccruals.length,
     postingRowsScanned: allPostings.length,
     matchingPostingRows: matchingPostings.length,
+    ordinaryCandidates: ordinaryCandidates.length,
+    ordinaryPostingNumber,
+    ordinaryAccrualRows: ordinaryAccruals.length,
     fboError: fbo.error ?? null,
     fbsError: fbs.error ?? null,
     transactionErrors: transactionChunks.map(chunk => chunk.error ?? null),
@@ -227,7 +277,11 @@ const payload = {
   accrualTypes,
   matchingAccruals,
   matchingTransactions,
-  matchingPostings
+  matchingPostings,
+  ordinarySample: {
+    posting: ordinaryPosting,
+    accruals: ordinaryAccruals
+  }
 };
 
 const aesKey = crypto.randomBytes(32);
