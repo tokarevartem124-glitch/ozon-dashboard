@@ -1,0 +1,40 @@
+name: "Encrypted CIS API diagnostic"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/cis-api-export.yml"
+      - "scripts/cis-api-export.mjs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Fetch and encrypt CIS data
+        run: node scripts/cis-api-export.mjs
+        env:
+          OZON_CLIENT_ID: "${{ secrets.OZON_CLIENT_ID }}"
+          OZON_API_KEY: "${{ secrets.OZON_API_KEY }}"
+          EXPORT_PUBLIC_KEY_B64: "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQm9qQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FZOEFNSUlCaWdLQ0FZRUFtYVlBOWNiNWRBUXVlMVJSUVJVSQpRSndpMFl2MWZWRlM1dHBuVkZzZGRKSmZpaTRyczl4ZVpIdGx0WFBYWGtSRk1xcFRmRjUrZTBBVjVDd3Byd2RiCnFZTW1zdndPdXhob21WYWt2SHc2MWZOOXBMdXpCQW1WUGIrTWVndkVXbFdOa1NTOUtMMHQ5OXNxR2graXZRZnMKNVIwNXd5OHU2Y2k5YXFEbFRVd0k0bkllQ2ZyMHJnL21yY0dyemNUVGtaTmUzYzNDdmw0ZkNvMVAwYjBieHhaTQo0YklFSXYwZEhXamFoSWVHbG9TZzlhRFIveDljOXJEZnJscmFYMGJvZzJWeXhacHhzV1lwMEZBWjFjY24wNDIxCjFJWWlubHdsQlB1UDMwTCs0eWlsc2xncHovNHI1VU9QdzlnU21hbVgyVWRpWTNHTE1keStvRzJST0RqTUFKZXEKV3ovT21YaHBDL2lIeEs0Z05wRk9SYU9xQS9BWnJYSk9oWVhkR29KS3FKc2QvT0Qyb28yVDFpRGlhekZNSXhnMQpiTUpvT1lKNjZNUUFldCtyY1ZUZUVRbkdXdGdlck1pOWF2YmJSUUFBZWE3bStzY3FIMVNCUWdPWklNODBzL3RtCjRSRlM5MEdxWlBScEdrdXVuajUvR0kvelkxNHJKcWd5V2pvZ09QallyRVFaQWdNQkFBRT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg=="
+
+      - name: Upload encrypted diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: cis-api-export-encrypted
+          path: diagnostic-output/cis-api-export.enc.json
+          retention-days: 1
+          if-no-files-found: error
