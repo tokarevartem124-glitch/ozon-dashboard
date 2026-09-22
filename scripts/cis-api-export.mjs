@@ -73,6 +73,47 @@ async function fetchTransactions(dateFrom, dateTo) {
   return { dateFrom, dateTo, operations };
 }
 
+function addDays(day, amount) {
+  const date = new Date(`${day}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function dateRange(dateFrom, dateTo) {
+  const result = [];
+  for (let day = dateFrom; day <= dateTo; day = addDays(day, 1)) result.push(day);
+  return result;
+}
+
+async function fetchAccrualTypes() {
+  return post('/v1/finance/accrual/types', {}, { allowError: true });
+}
+
+async function fetchAccruals(dateFrom, dateTo) {
+  const rows = [];
+  const errors = [];
+  for (const date of dateRange(dateFrom, dateTo)) {
+    let lastId = '';
+    for (let page = 1; page <= 500; page++) {
+      const response = await post('/v1/finance/accrual/by-day', {
+        date,
+        last_id: lastId
+      }, { allowError: true });
+      if (response.__error) {
+        errors.push({ date, error: response.__error });
+        break;
+      }
+      const batch = Array.isArray(response.accruals) ? response.accruals : [];
+      rows.push(...batch);
+      const next = String(response.last_id ?? '');
+      if (!batch.length || !next || next === lastId) break;
+      lastId = next;
+      await sleep(350);
+    }
+  }
+  return { dateFrom, dateTo, rows, errors };
+}
+
 function rfcStart(day) { return `${day}T00:00:00.000Z`; }
 function rfcEnd(day) { return `${day}T23:59:59.999Z`; }
 
@@ -121,6 +162,17 @@ const transactionChunks = [
 const allTransactions = transactionChunks.flatMap(chunk => chunk.operations ?? []);
 const matchingTransactions = allTransactions.filter(operation => buyoutPostingNumbers.has(postingNumberFromTransaction(operation)));
 
+const accrualTypes = await fetchAccrualTypes();
+const accrualChunks = [
+  await fetchAccruals('2026-08-01', '2026-08-31'),
+  await fetchAccruals('2026-09-01', today)
+];
+const allAccruals = accrualChunks.flatMap(chunk => chunk.rows ?? []);
+const matchingAccruals = allAccruals.filter(accrual => {
+  const postingNumber = String(accrual?.posting?.posting_number ?? accrual?.unit_number ?? '');
+  return buyoutPostingNumbers.has(postingNumber);
+});
+
 const postingFrom = '2026-06-01';
 const fbo = await fetchPostingPages('/v3/posting/fbo/list', cursor => ({
   cursor,
@@ -161,14 +213,19 @@ const payload = {
     buyoutPostings: buyoutPostingNumbers.size,
     transactionRowsScanned: allTransactions.length,
     matchingTransactionRows: matchingTransactions.length,
+    accrualRowsScanned: allAccruals.length,
+    matchingAccrualRows: matchingAccruals.length,
     postingRowsScanned: allPostings.length,
     matchingPostingRows: matchingPostings.length,
     fboError: fbo.error ?? null,
     fbsError: fbs.error ?? null,
     transactionErrors: transactionChunks.map(chunk => chunk.error ?? null),
+    accrualErrors: accrualChunks.flatMap(chunk => chunk.errors ?? []),
     buyoutErrors: buyoutChunks.map(chunk => chunk.result?.__error ?? null)
   },
   buyouts,
+  accrualTypes,
+  matchingAccruals,
   matchingTransactions,
   matchingPostings
 };
