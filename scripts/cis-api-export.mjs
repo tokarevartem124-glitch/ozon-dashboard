@@ -241,9 +241,12 @@ const ordinaryCandidates = allPostings
 
 const ordinaryPosting = ordinaryCandidates[0] ?? null;
 const ordinaryPostingNumber = String(ordinaryPosting?.posting_number ?? '');
-const ordinaryAccruals = ordinaryPostingNumber
-  ? (augustAccrualsByPosting.get(ordinaryPostingNumber) ?? [])
-  : [];
+const ordinaryOrderNumber = String(ordinaryPosting?.order_number ?? '');
+const ordinaryAccruals = allAccruals.filter(accrual => {
+  if (String(accrual?.date ?? '').slice(0, 7) !== '2026-08') return false;
+  const unitNumber = accrualPostingNumber(accrual);
+  return unitNumber === ordinaryPostingNumber || unitNumber === ordinaryOrderNumber;
+});
 
 const payload = {
   kind: 'ozon_cis_buyout_diagnostic',
@@ -266,6 +269,7 @@ const payload = {
     matchingPostingRows: matchingPostings.length,
     ordinaryCandidates: ordinaryCandidates.length,
     ordinaryPostingNumber,
+    ordinaryOrderNumber,
     ordinaryAccrualRows: ordinaryAccruals.length,
     fboError: fbo.error ?? null,
     fbsError: fbs.error ?? null,
