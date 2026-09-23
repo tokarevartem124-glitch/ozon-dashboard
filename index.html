@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v10.1-order-economics-2026-09-23";
+    window.__OZON_DASHBOARD_BUILD__ = "v10.2-historical-price-date-audit-2026-09-23";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — v10.1</title>
+  <title>Ozon Seller Analytics — v10.2</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.1 · API + validated CIS</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.2 · API + validated CIS</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -456,7 +456,11 @@ function sum(arr,fn=x=>x){return arr.reduce((s,x)=>s+safe(fn(x)),0)}
 function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function showMessage(text,type='success'){const el=$('#messageBox');el.className=`notice ${type}`;el.textContent=text;el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),9000)}
 function uid(){return crypto?.randomUUID?.()||('d'+Date.now()+Math.random().toString(16).slice(2))}
-function currentMonth(){return new Date().toISOString().slice(0,7)}
+function yekaterinburgDate(d=new Date()){
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Yekaterinburg',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d).map(x=>[x.type,x.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+function currentMonth(){return yekaterinburgDate().slice(0,7)}
 function monthBounds(ym){const [y,m]=ym.split('-').map(Number);const start=`${ym}-01`;const last=new Date(y,m,0).getDate();return {start,end:`${ym}-${String(last).padStart(2,'0')}`,days:last}}
 function unionDays(ranges){
   const arr=ranges.filter(x=>x.start&&x.end).map(x=>[new Date(x.start),new Date(x.end)]).sort((a,b)=>a[0]-b[0]);
@@ -468,7 +472,9 @@ function hasAny(headers,aliases){return headerIdx(headers,aliases)>=0}
 function makeMap(headers,schema){const out={};for(const [k,aliases] of Object.entries(schema))out[k]=headerIdx(headers,aliases);return out}
 function missingRequired(map, required, schema){return required.filter(k=>map[k]<0).map(k=>schema[k][0])}
 function findRow(rows,predicate,max=25){for(let i=0;i<Math.min(rows.length,max);i++)if(predicate(rows[i]||[]))return i;return -1}
-function fileSnapshot(file){const d=file.lastModified?new Date(file.lastModified):new Date();return d.toISOString().slice(0,10)}
+// Agreed business rule: a newly uploaded 1C price starts on the upload day,
+// regardless of the file's filesystem "last modified" metadata.
+function fileSnapshot(){return yekaterinburgDate()}
 function productRowKey(r){return `${idNorm(r.article)}|${idNorm(r.sku)}`}
 function datasetRecordKey(ds,r){
   if(ds.type==='stock'||ds.type==='price')return productRowKey(r);
@@ -1380,7 +1386,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v10.1 Order Economics</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v10.2 Historical Price Dates</span>`;
   if(apiSyncStatus.loaded){const src=apiSyncStatus.source==='cache-fresh'?' · кэш, актуален':apiSyncStatus.source==='cache'?' · кэш':apiSyncStatus.source==='remote'?' · обновлено':'';const upd=apiSyncStatus.updateAvailable?' · есть обновление':'';const warn=apiSyncStatus.error?' warn':' ok';html+=`<span id="${apiSyncStatus.updateAvailable?'apiRetryChip':''}" class="chip${warn}" style="${apiSyncStatus.updateAvailable?'cursor:pointer':''}" title="${escapeHtml(apiSyncStatus.error||'')}">Данные: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}${src}${upd}</span>`}
   else if(apiSyncStatus.loading)html+=`<span class="chip">Данные: загрузка…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1418,7 +1424,7 @@ function renderQuality(){
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
   const exactDelivery=q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage);
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v10.1.</b> Ozon — <b>Seller API + валидированный слой комиссий СНГ</b>.
+  $('#dataQuality').innerHTML=`<b>Контроль данных v10.2.</b> Ozon — <b>Seller API + валидированный слой комиссий СНГ</b>.
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
     <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) фактически доставленных отправлений; СНГ-дополнение выручку не добавляет и поэтому не создаёт дублей. Будущие возвраты ретроспективно уменьшают исходную доставку.
     <b>Расходы Ozon:</b> списания ${fmtMoney(m.financeOzonExpensesGross)} − возвраты/сторно ${fmtMoney(m.financeOzonRefunds)} = чистые ${fmtMoney(m.financeOzonExpenses)}; в том числе комиссии СНГ ${fmtMoney(m.marketplaceBuyoutExpenses)}. Стандартные расходы — по Finance-дате, валидированный отчёт «выкупы маркетплейсом» — целиком в августе по дате выкупа. После Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
@@ -1526,7 +1532,7 @@ function categoryTable(rows){if(!rows.length)return`<div class="empty">Нет д
 function rankList(rows){if(!rows.length)return`<div class="empty">Нет товаров с полностью рассчитанной прибылью.</div>`;return rows.map((p,i)=>`<div class="metric-row clickable" data-product-drill="${escapeHtml(p.key)}"><div><b class="linkish">${i+1}. ${escapeHtml(p.article||p.sku)}</b><div class="muted tiny">${escapeHtml(p.name)}</div></div><div class="num ${p.cleanProfit>=0?'positive':'negative'}">${fmtMoney(p.cleanProfit)}</div></div>`).join('')}
 
 function renderPlan(){
-  const months=new Set(Object.keys(state.plans));months.add(currentMonth());const activePlanMonth=state.planMonth||currentMonth();state.planMonth=activePlanMonth;months.add(activePlanMonth);const plan=state.plans[activePlanMonth]||{revenue:null,profit:null,categories:{}};const b=monthBounds(activePlanMonth);const p=currentModel.period;const dataExact=p&&p.start>=b.start&&p.end<=b.end;const now=isoDate(new Date());const elapsed=now<b.start?0:now>b.end?b.days:Math.min(b.days,Math.max(0,new Date(now)-new Date(b.start))/86400000+1);const expected=100*elapsed/b.days;const factRevenue=dataExact?currentModel.totalRevenue:null;const factProfit=dataExact?currentModel.businessNetProfit:null;const avgPrice=dataExact?currentModel.totalRevenue/sum(currentModel.products,x=>x.units):null;const qtyPlan=plan.revenue&&avgPrice?plan.revenue/avgPrice:null;
+  const months=new Set(Object.keys(state.plans));months.add(currentMonth());const activePlanMonth=state.planMonth||currentMonth();state.planMonth=activePlanMonth;months.add(activePlanMonth);const plan=state.plans[activePlanMonth]||{revenue:null,profit:null,categories:{}};const b=monthBounds(activePlanMonth);const p=currentModel.period;const dataExact=p&&p.start>=b.start&&p.end<=b.end;const now=yekaterinburgDate();const elapsed=now<b.start?0:now>b.end?b.days:Math.min(b.days,Math.max(0,new Date(now)-new Date(b.start))/86400000+1);const expected=100*elapsed/b.days;const factRevenue=dataExact?currentModel.totalRevenue:null;const factProfit=dataExact?currentModel.businessNetProfit:null;const avgPrice=dataExact?currentModel.totalRevenue/sum(currentModel.products,x=>x.units):null;const qtyPlan=plan.revenue&&avgPrice?plan.revenue/avgPrice:null;
   const card=(label,fact,target)=>{const progress=target&&fact!=null?100*fact/target:null;const delta=progress!=null?progress-expected:null;const status=delta==null?'нет сопоставимого факта':delta>=-3?'по графику':delta>=-10?'немного отстаёт':'сильно отстаёт';const cls=delta==null?'':delta>=-3?'green':delta>=-10?'yellow':'red';return`<div class="card"><h3>${label}</h3><div class="big">${fact!=null?fmtMoney(fact):'нет сопоставимого факта'}</div><div class="muted">План: ${target?fmtMoney(target):'не задан'}</div>${progress!=null?`<div class="progress"><div class="fill" style="width:${clamp(progress,0,100)}%"></div><div class="expected" style="left:${clamp(expected,0,100)}%"></div></div><div class="progress-labels"><span>факт ${fmtPct(progress)}</span><span>ожидалось ${fmtPct(expected)}</span></div><div style="margin-top:8px"><span class="status-dot ${cls}"></span>${status}</div>`:`<div class="empty" style="margin-top:10px">${!target?'Сначала задайте план.':'Загруженный выбранный период не лежит внутри месяца плана, поэтому факт не обнуляется и не сравнивается некорректно.'}</div>`}</div>`};
   const daysLeft=Math.max(0,b.days-elapsed);const currentDaily=dataExact&&elapsed?currentModel.totalRevenue/Math.max(1,Math.min(elapsed,currentModel.periodDays||elapsed)):null;const needDaily=dataExact&&plan.revenue&&daysLeft?Math.max(0,plan.revenue-currentModel.totalRevenue)/daysLeft:null;
   $('#tab-plan').innerHTML=`<div class="card"><h3>План на месяц</h3><div class="plan-box"><div class="field"><label>Месяц плана</label><input class="input" id="planMonth" type="month" value="${activePlanMonth}"></div><div class="field"><label>Плановая выручка, ₽</label><input class="input" id="planRevenue" type="number" min="0" step="1000" value="${plan.revenue??''}"></div><div class="field"><label>Плановая прибыль, ₽</label><input class="input" id="planProfit" type="number" step="1000" value="${plan.profit??''}"></div><div class="field"><label>План продаж, шт. (авто)</label><input class="input" disabled value="${qtyPlan?fmtNum(qtyPlan,0):'нет фактической средней цены'}"></div></div></div>
