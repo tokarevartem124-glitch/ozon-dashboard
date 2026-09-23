@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v10.2-historical-price-date-audit-2026-09-23";
+    window.__OZON_DASHBOARD_BUILD__ = "v10.3-data-guard-export-columns-2026-09-23";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — v10.2</title>
+  <title>Ozon Seller Analytics — v10.3</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.2 · API + validated CIS</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.3 · Data Guard</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -325,7 +325,7 @@ function applyApiPayload(payload,{fromCache=false,silent=false}={}){
   try{
     rebuildPeriodSelect();
     renderAll();
-    if(!silent&&!fromCache)showMessage(`Данные обновлены: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}. Seller API дополнен валидированным слоем комиссий СНГ; выручка из него не добавляется.`,'success');
+    if(!silent&&!fromCache)showMessage(`Данные обновлены: ${new Date(payload.generatedAt).toLocaleString('ru-RU')}. Контроль качества пройден; подтверждённый СНГ-отчёт используется как резерв только для отсутствующих в API продаж.`,'success');
   }catch(e){
     state.datasets=previousDatasets;
     apiSyncStatus={...previousStatus,available:true,loaded:false,loading:false,generatedAt:payload.generatedAt,error:`Ошибка применения API-данных: ${e?.message||e}`};
@@ -1297,7 +1297,7 @@ function buildModel(){
       skuFinanceGross:diag.skuFinanceGross??null,skuFinanceNet:diag.skuFinanceNet??null,skuFinanceRevenueDelta:diag.skuFinanceRevenueDelta??null,
       skuFinanceReconcileDelta:diag.skuFinanceReconcileDelta??null,skuFinanceCoverageComplete:diag.skuFinanceCoverageComplete??false,
       orderMetaVersion:diag.orderMetaVersion??null,orderSalePostings:diag.orderSalePostings??null,orderNumberResolved:diag.orderNumberResolved??null,orderDateResolved:diag.orderDateResolved??null,
-      deliveryEngineVersion:diag.deliveryEngineVersion??null,deliveryDateExactCoverage:diag.deliveryDateExactCoverage??null,unresolvedDeliveryDates:diag.unresolvedDeliveryDates??null,inexactDeliveryRows:diag.inexactDeliveryRows??null,retroReturnedUnits:diag.retroReturnedUnits??0,retroReturnedRevenue:diag.retroReturnedRevenue??0,provisionalDeliveredSales:diag.provisionalDeliveredSales??0,provisionalDeliveredRevenue:diag.provisionalDeliveredRevenue??0,currentRealizationPostingAvailable:diag.currentRealizationPostingAvailable??null,deliveryGrossMonthlyValidation:diag.deliveryGrossMonthlyValidation||null,fbsDeliveryComplete:diag.fbsDeliveryComplete??null,fbsDeliveryMissingDays:diag.fbsDeliveryMissingDays??null,pAndLPriceMissing:diag.pAndLPriceMissing??0,deliveredPostingRows:diag.deliveredPostingRows??0,excludedDeliveredProductRows:diag.excludedDeliveredProductRows??0,excludedDeliveredProductUnits:diag.excludedDeliveredProductUnits??0,nonFbsDeliveredWithoutExactDate:diag.nonFbsDeliveredWithoutExactDate??0},
+      deliveryEngineVersion:diag.deliveryEngineVersion??null,deliveryDateExactCoverage:diag.deliveryDateExactCoverage??null,unresolvedDeliveryDates:diag.unresolvedDeliveryDates??null,inexactDeliveryRows:diag.inexactDeliveryRows??null,retroReturnedUnits:diag.retroReturnedUnits??0,retroReturnedRevenue:diag.retroReturnedRevenue??0,provisionalDeliveredSales:diag.provisionalDeliveredSales??0,provisionalDeliveredRevenue:diag.provisionalDeliveredRevenue??0,currentRealizationPostingAvailable:diag.currentRealizationPostingAvailable??null,deliveryGrossMonthlyValidation:diag.deliveryGrossMonthlyValidation||null,fbsDeliveryComplete:diag.fbsDeliveryComplete??null,fbsDeliveryMissingDays:diag.fbsDeliveryMissingDays??null,pAndLPriceMissing:diag.pAndLPriceMissing??0,deliveredPostingRows:diag.deliveredPostingRows??0,excludedDeliveredProductRows:diag.excludedDeliveredProductRows??0,excludedDeliveredProductUnits:diag.excludedDeliveredProductUnits??0,excludedDeliveredProductGross:diag.excludedDeliveredProductGross??0,marketplaceBuyoutSalesExpectedPostings:diag.marketplaceBuyoutSalesExpectedPostings??0,marketplaceBuyoutSalesCoveredPostings:diag.marketplaceBuyoutSalesCoveredPostings??0,marketplaceBuyoutSalesFallbackRows:diag.marketplaceBuyoutSalesFallbackRows??0,marketplaceBuyoutSalesFallbackRevenue:diag.marketplaceBuyoutSalesFallbackRevenue??0,marketplaceBuyoutSalesMissingPostings:diag.marketplaceBuyoutSalesMissingPostings||[],marketplaceBuyoutSalesInvalidRows:diag.marketplaceBuyoutSalesInvalidRows??0,publishQualityGate:diag.publishQualityGate||null,nonFbsDeliveredWithoutExactDate:diag.nonFbsDeliveredWithoutExactDate??0},
     funnelDs,realizedDs,stockDs,priceDs,financeDs,skuFinanceDs,adsDs,costDs,rrpDs,periodDays:p?daysInclusive(p.start,p.end):(businessPeriod?daysInclusive(businessPeriod.start,businessPeriod.end):null),period:p
   };
 }
@@ -1386,7 +1386,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v10.2 Historical Price Dates</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v10.3 Data Guard</span>`;
   if(apiSyncStatus.loaded){const src=apiSyncStatus.source==='cache-fresh'?' · кэш, актуален':apiSyncStatus.source==='cache'?' · кэш':apiSyncStatus.source==='remote'?' · обновлено':'';const upd=apiSyncStatus.updateAvailable?' · есть обновление':'';const warn=apiSyncStatus.error?' warn':' ok';html+=`<span id="${apiSyncStatus.updateAvailable?'apiRetryChip':''}" class="chip${warn}" style="${apiSyncStatus.updateAvailable?'cursor:pointer':''}" title="${escapeHtml(apiSyncStatus.error||'')}">Данные: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}${src}${upd}</span>`}
   else if(apiSyncStatus.loading)html+=`<span class="chip">Данные: загрузка…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1397,6 +1397,7 @@ function renderSourceChips(){
 }
 function renderQuality(){
   const m=currentModel,q=m.quality||{},issues=[];
+  const gate=q.publishQualityGate||null;
   if(!apiSyncStatus.loaded)issues.push('Ozon API не разблокирован');
   if(!m.financeDs.length)issues.push('нет финансов Ozon API');
   if(!m.realizedDs.length)issues.push('нет delivered-sales слоя');
@@ -1417,6 +1418,11 @@ function renderQuality(){
   if(q.orderSalePostings!=null&&q.orderNumberResolved!=null&&q.orderNumberResolved<q.orderSalePostings)issues.push(`номера заказов Ozon получены для ${fmtNum(q.orderNumberResolved)}/${fmtNum(q.orderSalePostings)} отправлений`);
   if((q.pAndLPriceMissing||0)>0)issues.push(`нет цены products.price у ${fmtNum(q.pAndLPriceMissing)} доставленных товарных строк`);
   if((q.nonFbsDeliveredWithoutExactDate||0)>0)issues.push(`есть ${fmtNum(q.nonFbsDeliveredWithoutExactDate)} delivered-отправлений не-FBS без подтверждённой точной даты доставки`);
+  if(gate&&gate.status!=='passed')issues.push(`контроль публикации: ${gate.criticalIssues?.join('; ')||gate.status}`);
+  if((gate?.duplicateRows||0)>0)issues.push(`дубли строк отправление + SKU: ${fmtNum(gate.duplicateRows)}`);
+  if((gate?.returnOverSaleRows||0)>0)issues.push(`нарушена связка продажа − возврат: ${fmtNum(gate.returnOverSaleRows)} строк`);
+  if((gate?.revenueBridgeRows||0)>0)issues.push(`выручка не равна net-количеству × цене: ${fmtNum(gate.revenueBridgeRows)} строк`);
+  if((q.marketplaceBuyoutSalesMissingPostings||[]).length)issues.push(`не попали в выручку подтверждённые СНГ-отправления: ${fmtNum(q.marketplaceBuyoutSalesMissingPostings.length)}`);
   if(m.externalExpenses?.missingHired?.length)issues.push(`наёмная логистика неполная: ${m.externalExpenses.missingHired.join(', ')}`);
   if(m.unclassifiedRevenue>0)issues.push(`не задана группа товара для выручки ${fmtMoney(m.unclassifiedRevenue)}`);
   if(!m.rrpComplete)issues.push(`норматив РРЦ × 0,92 предварительный: покрытие РРЦ по доставленным единицам ${fmtPct(m.rrpCoverageUnits)}`);
@@ -1424,10 +1430,13 @@ function renderQuality(){
   const rrpCatalogPct=q.currentOzonArticles?pct(q.ozonRrpKnown,q.currentOzonArticles):null;
   const exactDelivery=q.deliveryDateExactCoverage==null?'—':fmtPct(q.deliveryDateExactCoverage);
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v10.2.</b> Ozon — <b>Seller API + валидированный слой комиссий СНГ</b>.
+  const gateText=gate?`${gate.status==='passed'?'<span class="positive">пройден</span>':'<span class="warning">заблокирован</span>'} · ${fmtNum(gate.rowCount||0)} строк · дубли ${fmtNum(gate.duplicateRows||0)} · ошибки возвратов ${fmtNum(gate.returnOverSaleRows||0)} · ошибки выручки ${fmtNum(gate.revenueBridgeRows||0)}`:'ожидается следующая синхронизация';
+  const cisCoverage=q.marketplaceBuyoutSalesExpectedPostings?`${fmtNum(q.marketplaceBuyoutSalesCoveredPostings)}/${fmtNum(q.marketplaceBuyoutSalesExpectedPostings)} отправлений`:'нет подтверждённого слоя';
+  $('#dataQuality').innerHTML=`<b>Контроль данных v10.3.</b> Ozon — <b>Seller API + валидированный слой комиссий СНГ</b>.
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
-    <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) фактически доставленных отправлений; СНГ-дополнение выручку не добавляет и поэтому не создаёт дублей. Будущие возвраты ретроспективно уменьшают исходную доставку.
+    <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) фактически доставленных отправлений. Подтверждённый СНГ-отчёт добавляет продажу только если отправление полностью отсутствует в Seller API: покрытие ${cisCoverage}, fallback ${fmtNum(q.marketplaceBuyoutSalesFallbackRows)} строк на ${fmtMoney(q.marketplaceBuyoutSalesFallbackRevenue)}. Будущие возвраты ретроспективно уменьшают исходную доставку.
     <b>Расходы Ozon:</b> списания ${fmtMoney(m.financeOzonExpensesGross)} − возвраты/сторно ${fmtMoney(m.financeOzonRefunds)} = чистые ${fmtMoney(m.financeOzonExpenses)}; в том числе комиссии СНГ ${fmtMoney(m.marketplaceBuyoutExpenses)}. Стандартные расходы — по Finance-дате, валидированный отчёт «выкупы маркетплейсом» — целиком в августе по дате выкупа. После Ozon ${fmtMoney(m.afterOzon)}. Возврат основной суммы покупателю повторно расходом не считается.
+    Контроль публикации: ${gateText}.
     Даты доставки: точность ${exactDelivery} · покрытие ${q.realizationCoverage?.from||'нет'} — ${q.realizationCoverage?.to||'нет'} · контроль gross delivery закрытых месяцев: ${grossCtl}.
     Ретроспективно снято возвратами: ${fmtNum(q.retroReturnedUnits||0)} шт. · ${fmtMoney(q.retroReturnedRevenue||0)}.
     Заказы Ozon: ${q.orderSalePostings!=null?`${fmtNum(q.orderNumberResolved||0)}/${fmtNum(q.orderSalePostings)} номеров · ${fmtNum(q.orderDateResolved||0)}/${fmtNum(q.orderSalePostings)} дат`:'ожидается синхронизация v9'}. Период продаж фильтруется по <b>дате фактической доставки</b>; дата заказа показывается отдельно.
@@ -1622,6 +1631,14 @@ function uniqueProductOrders(p){
 }
 function orderSummaryHtml(p,max=2){const a=uniqueProductOrders(p);if(!a.length)return'<span class="muted">—</span>';const shown=a.slice(0,max).map(e=>`<div><b>${escapeHtml(e.orderNumber||'номер не получен')}</b>${e.orderDate?` · ${dateLabel(e.orderDate)}`:''}</div>`).join('');return `${shown}${a.length>max?`<div class="muted tiny">ещё ${a.length-max}</div>`:''}`}
 function orderSummaryText(p){return uniqueProductOrders(p).map(e=>`${e.orderNumber||'[нет номера]'}${e.orderDate?' | '+e.orderDate:''}${e.postingNumber?' | отправление '+e.postingNumber:''}`).join('; ')}
+function productOrderExportColumns(p){
+  const orders=uniqueProductOrders(p);
+  return {
+    'Номер заказа Ozon':orders.map(e=>e.orderNumber||'').join('; '),
+    'Дата заказа Ozon':orders.map(e=>e.orderDate||'').join('; '),
+    'Номер отправления Ozon':orders.map(e=>e.postingNumber||'').join('; ')
+  };
+}
 function productOrdersTable(p){
   const rows=[...(p?.orderEvents||[])].sort((a,b)=>(b.deliveryDate||b.orderDate||b.financeDates?.at(-1)||'').localeCompare(a.deliveryDate||a.orderDate||a.financeDates?.at(-1)||''));
   if(!rows.length)return'<div class="empty">Для товара в выбранном периоде нет заказов/финансовых событий с номером заказа.</div>';
@@ -1820,7 +1837,7 @@ function drillDefinition(type,payload={}){
   const percent=(key,label)=>({key,label,fmt:p=>fmtPct(typeof key==='function'?key(p):p[key]),cls:'num'});
   let def={type,title:'Детализация',subtitle:`Период: ${drillPeriodText()}`,kind:'products',rows:[],columns:cols,sort:'revenue',dir:-1,note:'',stats:[]};
   if(type==='revenue')Object.assign(def,{title:'Выручка Ozon — фактически доставленные товары',rows:m.products.filter(p=>Math.abs(safe(p.revenue))>.005),columns:[...cols,number('units','Реализовано, шт.'),money('revenue','Выручка'),percent('revenueShare','Доля')],sort:'revenue',stats:[{label:'Выручка доставок',value:fmtMoney(m.totalRevenue)},{label:'Уникальных SKU с выручкой',value:fmtNum(m.products.filter(p=>p.revenue>0).length)},{label:'Товарных строк доставок',value:fmtNum((m.orderRows||[]).filter(r=>safe(r.soldQty)>0).length)},{label:'Доставлено net, шт.',value:fmtNum(sum(m.products,p=>Math.max(0,safe(p.units))),0)},{label:'Отправлений с выручкой',value:fmtNum(new Set((m.orderRows||[]).filter(r=>safe(r.revenue)>0).map(r=>r.postingNumber).filter(Boolean)).size)},{label:'Период доставки',value:drillPeriodText()}]});
-  else if(type==='ozonNet')Object.assign(def,{title:'Расходы и результат после услуг Ozon',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Чистые расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Все списания Ozon',value:fmtMoney(m.financeOzonExpensesGross)},{label:'Возвраты / сторно',value:fmtMoney(m.financeOzonRefunds)},{label:'Чистые расходы Ozon',value:fmtMoney(m.financeOzonExpenses)},{label:'Комиссии СНГ',value:fmtMoney(m.marketplaceBuyoutExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Стандартные расходы признаются по датам Finance API. Валидированные комиссии из отчёта «Выкупы маркетплейсом» относятся к августу по дате выкупа и суммируются с Finance-комиссиями по совпадающим отправлениям; выручка из этого дополнения не добавляется. Операции без SKU учитываются только в общем P&L.'});
+  else if(type==='ozonNet')Object.assign(def,{title:'Расходы и результат после услуг Ozon',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money(p=>productOzonCost(p),'Чистые расходы Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Все списания Ozon',value:fmtMoney(m.financeOzonExpensesGross)},{label:'Возвраты / сторно',value:fmtMoney(m.financeOzonRefunds)},{label:'Чистые расходы Ozon',value:fmtMoney(m.financeOzonExpenses)},{label:'Комиссии СНГ',value:fmtMoney(m.marketplaceBuyoutExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Стандартные расходы признаются по датам Finance API. Валидированные комиссии из отчёта «Выкупы маркетплейсом» относятся к августу по дате выкупа и суммируются с Finance-комиссиями по совпадающим отправлениям. Цена продавца из отчёта СНГ используется как резерв выручки только для подтверждённого отправления, полностью отсутствующего среди доставленных продаж Seller API. Операции без SKU учитываются только в общем P&L.'});
   else if(type==='external')Object.assign(def,{title:'Внешние расходы вне Ozon',kind:'external',stats:[{label:'Всего',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),cls:ext?.complete?'':'warning'},{label:'Репрайсер',value:fmtMoney(ext?.repricer)},{label:'Премии магазинам',value:fmtMoney(ext?.storeBonus)},{label:'Наёмная логистика',value:fmtMoney(ext?.hiredKnown)}],note:'Это расходы бизнеса, которых нет в кабинете Ozon. Они не распределяются на SKU и учитываются только на уровне общего P&L.'});
   else if(type==='management')Object.assign(def,{title:'Управленческий остаток — состав',kind:'management',stats:[{label:'После Ozon',value:fmtMoney(m.afterOzon)},{label:'Внешние расходы',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown)},{label:'Управленческий остаток',value:m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),cls:ext?.complete?'positive':'warning'}],note:'Управленческий остаток = выручка фактически доставленных и не возвращённых товаров − расходы Ozon, начисленные Finance API в выбранном периоде − внешние операционные расходы. Закупка и УСН здесь ещё не вычтены.'});
   else if(type==='businessGroups')Object.assign(def,{title:'Нормативы двух товарных групп',kind:'groups',stats:[{label:'Покрытие групп',value:fmtPct(m.groupCoverage),cls:m.unclassifiedRevenue?'warning':'positive'},{label:'Общая цель',value:fmtMoney(m.combinedTarget)},{label:'Деньги после расходов',value:m.combinedCash!=null?fmtMoney(m.combinedCash):'нет итоговой оценки'},{label:'Выполнение плана',value:m.combinedPlanAttainment!=null?fmtPct(m.combinedPlanAttainment):'нет итоговой оценки',cls:m.combinedPlanAttainment!=null?(m.combinedPlanAttainment>=100?'positive':'negative'):'warning'}],note:'Расходы без связи с заказом и внешние расходы не попадают в заказы/SKU. Только для итоговых коэффициентов они распределяются между двумя группами пропорционально выручке, чтобы сумма сходилась с общим P&L.'});
@@ -1961,7 +1978,7 @@ function exportCurrentDrilldown(){
   let rows=[];
   if(cur.type==='missingCost')rows=def.rows.map(p=>({'Артикул Ozon':p.article||'',SKU:p.sku||'','Товар':p.name||'','Категория':p.category||'','Текущая цена Ozon':p.currentPrice,'Закупочная цена':p.cost,'Проблема':p.costConflict?'конфликт закупочных цен':'нет закупочной цены'}));
   else if(cur.type==='missingRrp')rows=def.rows.map(p=>({'Артикул Ozon':p.article||'',SKU:p.sku||'','Товар':p.name||'','Категория':p.category||'','Текущая цена Ozon':p.currentPrice,'РРЦ':p.rrp,'Проблема':p.rrpSource==='conflict'?'конфликт РРЦ':'нет РРЦ'}));
-  else if(def.kind==='products')rows=def.rows.map(p=>({'Артикул':p.article||'',SKU:p.sku||'','Товар':p.name||'','Категория':p.category||'','РРЦ, ₽/шт.':p.rrp,'РРЦ реализации':Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'Net, шт.':p.units,'Выручка':p.revenue,'После Ozon':p.netAfterOzon,'Расходы Ozon':productOzonCost(p),'Закупочная цена, ₽/шт.':p.cost,'Закупочная стоимость':p.cogs,'Товарная прибыль':p.operatingProfit,'Маржа, %':p.operatingMargin,'ROI, %':p.operatingRoi,'Остаток':p.stock,'Дней запаса':p.daysToZero===Infinity?null:p.daysToZero,'ABC прибыль':p.abcProfit,'ABC выручка':p.abcRevenue,'Причина внимания':p.attentionReason||'','Заказы Ozon (номер | дата | отправление)':orderSummaryText(p),'Вклад в общий норматив':productRrpTarget(p),'Вклад в разрыв до внешних расходов':productPreExternalGap(p)}));
+  else if(def.kind==='products')rows=def.rows.map(p=>({'Артикул':p.article||'',SKU:p.sku||'','Товар':p.name||'','Категория':p.category||'','РРЦ, ₽/шт.':p.rrp,'РРЦ реализации':Number.isFinite(p.rrp)&&p.units!=null?p.rrp*p.units:null,'Net, шт.':p.units,'Выручка':p.revenue,'После Ozon':p.netAfterOzon,'Расходы Ozon':productOzonCost(p),'Закупочная цена, ₽/шт.':p.cost,'Закупочная стоимость':p.cogs,'Товарная прибыль':p.operatingProfit,'Маржа, %':p.operatingMargin,'ROI, %':p.operatingRoi,'Остаток':p.stock,'Дней запаса':p.daysToZero===Infinity?null:p.daysToZero,'ABC прибыль':p.abcProfit,'ABC выручка':p.abcRevenue,'Причина внимания':p.attentionReason||'',...productOrderExportColumns(p),'Вклад в общий норматив':productRrpTarget(p),'Вклад в разрыв до внешних расходов':productPreExternalGap(p)}));
   else if(def.kind==='signals')rows=currentModel.signals.map(x=>({'Артикул':x.product.article,'Товар':x.product.name,'Категория':x.product.category,'Сигнал':x.type,'Почему':x.detail,'Потенциал, ₽':x.potential}));
   else rows=currentModel.categories.map(x=>({'Категория':x.category,'Товаров':x.count,'Выручка':x.revenue,'Товарная прибыль':x.profit,'Маржа, %':x.margin}));
   const ws=XLSX.utils.json_to_sheet(rows),wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Детализация');
