@@ -368,7 +368,7 @@ async function loadRemoteAutoData(force=false){
     let remember=!!localStorage.getItem(API_PW_REMEMBER);
     if(!keyHex){
       const ans=await apiPasswordDialog();
-      if(!ans){apiSyncStatus.loading=false;renderSourceChips();return}
+      if(!ans){apiSyncStatus.loading=false;rebuildPeriodSelect();renderAll();return}
       keyHex=normalizeDashboardKey(ans.password);remember=ans.remember;
     }
 
@@ -379,7 +379,7 @@ async function loadRemoteAutoData(force=false){
       if(hadLoaded&&!force){apiSyncStatus.loading=false;apiSyncStatus.updateAvailable=true;return}
       showMessage('Не удалось расшифровать актуальные данные. Проверьте DASHBOARD_KEY.','error');
       const ans=await apiPasswordDialog();
-      if(!ans?.password){apiSyncStatus.loading=false;renderSourceChips();return}
+      if(!ans?.password){apiSyncStatus.loading=false;rebuildPeriodSelect();renderAll();return}
       keyHex=normalizeDashboardKey(ans.password);remember=ans.remember;
       try{payload=await decryptApiEnvelope(env,keyHex)}catch(e2){apiSyncStatus.error='DASHBOARD_KEY не совпадает с текущим файлом';showMessage('DASHBOARD_KEY не совпадает с текущим зашифрованным файлом.','error');apiSyncStatus.loading=false;renderSourceChips();return}
     }
