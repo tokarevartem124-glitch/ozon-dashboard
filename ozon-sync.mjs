@@ -126,26 +126,6 @@ function encryptJson(obj,keyHex,{gzip=true}={}){
   const tag=cipher.getAuthTag();
   return {v:3,alg:'AES-256-GCM',keyMode:'RAW-HEX-256',compression:gzip?'gzip':'none',iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt,originalBytes:json.length,compressedBytes:plain.length};
 }
-// Temporary audit export: a random AES key protects the payload and only the
-// holder of the matching private key can unwrap it. The repository contains
-// only this disposable public key, never the private key or plaintext data.
-const AUGUST_AUDIT_PUBLIC_KEY=`-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1sVBbtILPVTlURrKIb7+
-lBA3SxnsDAAydimn63P8XcyaCxJDtENNnE6OHfcqkDNFjdoTM+EMa0JjQWoDWpev
-/6mNSUzM0DUdOwrkpsJW5zGvt+N5J7lhxHcY1m3k542/eCu9Tk1HoDXzCOM8O+lS
-ot4Yl80xXdJgBPBrhCwx+1bCMsJYoaQvqLNQ7DnTn10XuOXfIot/7nSvj98DQ5ZR
-+i/07LvXWm7TkdCrMQDYy3CS1c+OKTfuRicLex0g4Z+W1P/oa8aVEzBnmaXElg0i
-Eoghvv+RastSlRbfyBHP+Mwt8Ni6b1KZvq7paNJ0GZZBi7GOtew/TRWZal9tpeQ6
-YQIDAQAB
------END PUBLIC KEY-----`;
-function encryptAuditJson(obj){
-  const aesKey=crypto.randomBytes(32),iv=crypto.randomBytes(12);
-  const plain=zlib.gzipSync(Buffer.from(JSON.stringify(obj),'utf8'),{level:9});
-  const cipher=crypto.createCipheriv('aes-256-gcm',aesKey,iv);
-  const ciphertext=Buffer.concat([cipher.update(plain),cipher.final()]);
-  const wrappedKey=crypto.publicEncrypt({key:AUGUST_AUDIT_PUBLIC_KEY,padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},aesKey);
-  return {v:1,alg:'RSA-OAEP-SHA256+AES-256-GCM',compression:'gzip',wrappedKey:wrappedKey.toString('base64'),iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),data:ciphertext.toString('base64')};
-}
 function decryptJson(env,keyHex){
   if(env?.keyMode!=='RAW-HEX-256') throw new Error('Previous encrypted state uses legacy password format; clean API-only backfill required');
   const iv=Buffer.from(env.iv,'base64'),data=Buffer.from(env.data,'base64');
@@ -1984,30 +1964,8 @@ const fullEnvelope=encryptJson(payload,DASHBOARD_KEY,{gzip:true});
 // The browser does not need postingMap/history/financeRowsAll. Serve a slim encrypted payload for fast startup.
 const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolicy,financeAttributionVersion:payload.financeAttributionVersion,generatedAt:payload.generatedAt,syncMode:payload.syncMode,clientId:payload.clientId,datasets:payload.datasets,diagnostics:payload.diagnostics};
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
-let augustOfficialPostingRows=[];
-try{
-  const augustOfficialReport=await fetchPostingRealization('2026-08');
-  augustOfficialPostingRows=normalizePostingRealizationRows(augustOfficialReport.rows,'2026-08',maps);
-}catch(e){
-  warnings.push(`Temporary August audit realization/posting: ${e}`);
-}
-const augustAuditRows=realization.rows.filter(r=>asStr(r.deliveryDate).startsWith('2026-08-'));
-const augustAuditPostingNumbers=new Set(augustAuditRows.map(r=>asStr(r.postingNumber)).filter(Boolean));
-const augustAuditPostings=Object.fromEntries(Object.entries(postingMap).filter(([pn,p])=>augustAuditPostingNumbers.has(pn)||asStr(p?.observedDeliveredDate).startsWith('2026-08-')));
-const augustAuditFinance=financeRows.filter(r=>augustAuditPostingNumbers.has(asStr(r.postingNumber)));
-const augustAuditEnvelope=encryptAuditJson({
-  generatedAt,
-  basis:'Exact dataset used by dashboard v10.2 for August delivered-sales P&L',
-  period:{from:'2026-08-01',to:'2026-08-31'},
-  realizationRows:augustAuditRows,
-  officialPostingRows:augustOfficialPostingRows,
-  postingMap:augustAuditPostings,
-  financeRows:augustAuditFinance,
-  diagnostics:{realization:realization.diagnostics,financeAttribution:{financeReconcileDelta,skuFinanceRevenueDelta,skuFinanceReconcileDelta}}
-});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
-await fs.writeFile(path.join(process.cwd(),'data','august-audit-rsa.enc.json'),JSON.stringify(augustAuditEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v9.3 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement (expense only, no revenue). P&L sales are sourced from FBS postings that reached delivered status, with an item-level guard for multi-product postings. Revenue uses posting products.price × quantity and is timed by the exact delivered-status day. Later returns retroactively reduce the original delivery. Standard Ozon expenses remain on Finance API accrual dates; the validated marketplace-buyout/CIS commission supplement is allocated to August by buyout date.'},null,2));
-console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; augustAuditRows=${augustAuditRows.length}; augustAuditPostings=${Object.keys(augustAuditPostings).length}; warnings=${warnings.length}`);
+console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
