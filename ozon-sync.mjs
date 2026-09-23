@@ -127,6 +127,23 @@ function encryptJson(obj,keyHex,{gzip=true}={}){
   const tag=cipher.getAuthTag();
   return {v:3,alg:'AES-256-GCM',keyMode:'RAW-HEX-256',compression:gzip?'gzip':'none',iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt,originalBytes:json.length,compressedBytes:plain.length};
 }
+// Temporary, narrowly scoped recheck export. Only the disposable public key is
+// committed; the matching private key remains local and is removed after review.
+const RECHECK_PUBLIC_KEY=`-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApY9s9Ngv7a8UTIBVstwg
+V7VEruWEhfA/nziMqRvsCQ5Du5CE9ezrIJU7IZeO7yPdo0ygkP7GXkiEmS8gXdxo
+vomfvIOrDruVs2frSsn9ZODrV4yn0pHpmwT2vF3hWPxCdivXLokGxjzOU9Q/Ycz4
+GqjCtxUaoX+pjPgPuR0rO7JYmJ31BfXxT7h4SLQjZ6+R0fSPl6Km7ZEop9L/HVTQ
+WuqUaKNov77wKwoQEAZBNaDKwKlXj5CwKU0YpRlz/DPjSGVgRlhr2MWA/uUTQDzI
+mNQPUPji5NPbAJ+9nNBsz1ngcf4BW4HPCo+w2KW0l2a0asRRw8ETi7VPTroYcWZw
+QwIDAQAB
+-----END PUBLIC KEY-----`;
+function encryptRecheckJson(obj){
+  const aesKey=crypto.randomBytes(32),iv=crypto.randomBytes(12),plain=zlib.gzipSync(Buffer.from(JSON.stringify(obj),'utf8'),{level:9});
+  const cipher=crypto.createCipheriv('aes-256-gcm',aesKey,iv),ciphertext=Buffer.concat([cipher.update(plain),cipher.final()]);
+  const wrappedKey=crypto.publicEncrypt({key:RECHECK_PUBLIC_KEY,padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},aesKey);
+  return {v:1,alg:'RSA-OAEP-SHA256+AES-256-GCM',compression:'gzip',wrappedKey:wrappedKey.toString('base64'),iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),data:ciphertext.toString('base64')};
+}
 function decryptJson(env,keyHex){
   if(env?.keyMode!=='RAW-HEX-256') throw new Error('Previous encrypted state uses legacy password format; clean API-only backfill required');
   const iv=Buffer.from(env.iv,'base64'),data=Buffer.from(env.data,'base64');
@@ -2032,8 +2049,38 @@ const fullEnvelope=encryptJson(payload,DASHBOARD_KEY,{gzip:true});
 // The browser does not need postingMap/history/financeRowsAll. Serve a slim encrypted payload for fast startup.
 const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolicy,financeAttributionVersion:payload.financeAttributionVersion,generatedAt:payload.generatedAt,syncMode:payload.syncMode,clientId:payload.clientId,datasets:payload.datasets,diagnostics:payload.diagnostics};
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
+const recheckPostingNumbers=['0117367898-0030-1','0153848164-0007-1','0255156325-0006-2'];
+const recheckSet=new Set(recheckPostingNumbers);
+const recheckPostingDetails=[];
+for(const postingNumber of recheckPostingNumbers){
+  const fbs=await post('/v3/posting/fbs/get',{posting_number:postingNumber},{allowError:true,retries:3});
+  const fbo=fbs.__error?await post('/v2/posting/fbo/get',{posting_number:postingNumber},{allowError:true,retries:3}):null;
+  recheckPostingDetails.push({postingNumber,fbs,fbo});
+}
+const recheckAccrualPostings=await post('/v1/finance/accrual/postings',{posting_numbers:recheckPostingNumbers},{allowError:true,retries:4});
+const recheckAugustRealization=await fetchPostingRealization('2026-08').catch(e=>({error:String(e),rows:[]}));
+const recheckSeptemberRealization=await fetchPostingRealization('2026-09').catch(e=>({error:String(e),rows:[]}));
+const recheckDeliveryDays=[];
+for(const date of ['2026-08-31','2026-09-01']){
+  const scan=await fetchFbsDeliveredStatusDay(date).catch(e=>({error:String(e),rows:[]}));
+  recheckDeliveryDays.push({date,error:scan.error||null,rows:(scan.rows||[]).filter(r=>recheckSet.has(asStr(r.posting_number)))});
+}
+const recheckEnvelope=encryptRecheckJson({
+  generatedAt,timeZone:'Asia/Yekaterinburg',postingNumbers:recheckPostingNumbers,
+  postingDetails:recheckPostingDetails,accrualPostings:recheckAccrualPostings,
+  postingMap:Object.fromEntries(recheckPostingNumbers.map(pn=>[pn,postingMap[pn]||null])),
+  normalizedFinance:financeRows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
+  normalizedReturns:returnRows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
+  rawFreshReturns:freshReturns.filter(r=>recheckPostingNumbers.some(pn=>JSON.stringify(r).includes(pn))),
+  realizedRows:realization.rows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
+  buyoutRows:buyoutSupplement.rows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
+  augustRealizationRows:(recheckAugustRealization.rows||[]).filter(r=>recheckSet.has(asStr(r?.order?.posting_number))),
+  septemberRealizationRows:(recheckSeptemberRealization.rows||[]).filter(r=>recheckSet.has(asStr(r?.order?.posting_number))),
+  deliveryDayScans:recheckDeliveryDays
+});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
+await fs.writeFile(path.join(process.cwd(),'data','recheck-rsa.enc.json'),JSON.stringify(recheckEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.3 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement. P&L sales are sourced from delivered postings with an official item-composition guard for multi-product shipments. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. Later returns retroactively reduce the original delivery. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
 console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
