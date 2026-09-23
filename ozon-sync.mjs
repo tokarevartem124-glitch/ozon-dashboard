@@ -1984,6 +1984,13 @@ const fullEnvelope=encryptJson(payload,DASHBOARD_KEY,{gzip:true});
 // The browser does not need postingMap/history/financeRowsAll. Serve a slim encrypted payload for fast startup.
 const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolicy,financeAttributionVersion:payload.financeAttributionVersion,generatedAt:payload.generatedAt,syncMode:payload.syncMode,clientId:payload.clientId,datasets:payload.datasets,diagnostics:payload.diagnostics};
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
+let augustOfficialPostingRows=[];
+try{
+  const augustOfficialReport=await fetchPostingRealization('2026-08');
+  augustOfficialPostingRows=normalizePostingRealizationRows(augustOfficialReport.rows,'2026-08',maps);
+}catch(e){
+  warnings.push(`Temporary August audit realization/posting: ${e}`);
+}
 const augustAuditRows=realization.rows.filter(r=>asStr(r.deliveryDate).startsWith('2026-08-'));
 const augustAuditPostingNumbers=new Set(augustAuditRows.map(r=>asStr(r.postingNumber)).filter(Boolean));
 const augustAuditPostings=Object.fromEntries(Object.entries(postingMap).filter(([pn,p])=>augustAuditPostingNumbers.has(pn)||asStr(p?.observedDeliveredDate).startsWith('2026-08-')));
@@ -1993,6 +2000,7 @@ const augustAuditEnvelope=encryptAuditJson({
   basis:'Exact dataset used by dashboard v10.2 for August delivered-sales P&L',
   period:{from:'2026-08-01',to:'2026-08-31'},
   realizationRows:augustAuditRows,
+  officialPostingRows:augustOfficialPostingRows,
   postingMap:augustAuditPostings,
   financeRows:augustAuditFinance,
   diagnostics:{realization:realization.diagnostics,financeAttribution:{financeReconcileDelta,skuFinanceRevenueDelta,skuFinanceReconcileDelta}}
