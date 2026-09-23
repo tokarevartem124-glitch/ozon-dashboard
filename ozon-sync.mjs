@@ -40,6 +40,9 @@ const DAILY_QTY_VERSION = 6;
 const QUANTITY_ENGINE_VERSION = 12;
 const FINANCE_ATTRIBUTION_VERSION = 8;
 const DELIVERY_STATUS_DATE_VERSION = 4;
+// Increment when posting-derived order metadata changes. This forces a one-time
+// full posting refresh so historical orders do not keep stale/fallback dates.
+const ORDER_META_VERSION = 3;
 const DELIVERY_STATUS_SCAN_PAUSE_MS = Math.max(900, Number(process.env.DELIVERY_STATUS_SCAN_PAUSE_MS || 1150));
 const DELIVERY_STATUS_REFRESH_DAYS = Math.max(2, Number(process.env.DELIVERY_STATUS_REFRESH_DAYS || 3));
 const PREMIUM_DAILY_LOOKBACK_DAYS = Math.max(7, Math.min(31, Number(process.env.PREMIUM_DAILY_LOOKBACK_DAYS || 31)));
@@ -51,6 +54,10 @@ if (!CLIENT_ID || !API_KEY) throw new Error('Missing OZON_CLIENT_ID or OZON_API_
 if (!['fast','daily'].includes(SYNC_MODE)) throw new Error(`Unknown SYNC_MODE=${SYNC_MODE}`);
 
 const isoDate = d => d.toISOString().slice(0,10);
+const dateInTimeZone = (d,timeZone) => {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d).map(x=>[x.type,x.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+};
 const asNum = (v, fallback=0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
 const asStr = v => v == null ? '' : String(v);
 // Ozon can return order dates without zero-padding (for example 2026-2-15).
@@ -65,7 +72,7 @@ const sleep = ms => new Promise(r => setTimeout(r,ms));
 const addDays = (dateStr,days) => { const d=new Date(`${dateStr}T00:00:00Z`); d.setUTCDate(d.getUTCDate()+days); return isoDate(d); };
 const minDateStr = (...x) => x.filter(Boolean).sort()[0] || null;
 const maxDateStr = (...x) => x.filter(Boolean).sort().at(-1) || null;
-const TODAY = isoDate(new Date());
+const TODAY = dateInTimeZone(new Date(),'Asia/Yekaterinburg');
 const YESTERDAY = addDays(TODAY,-1);
 // The dashboard must retain every day from the business baseline, even after the rolling lookback moves forward.
 const HISTORY_START = minDateStr(BUSINESS_START, addDays(TODAY,-(HISTORY_DAYS-1)));
@@ -775,8 +782,8 @@ function normalizePostingMap(postings,previousMap={}){
       ...prev,postingNumber:num,status,
       orderId:asStr(first(p.order_id,prev.orderId)),
       orderNumber:asStr(first(p.order_number,p.external_order?.number,prev.orderNumber)),
-      orderDate:dateOnly(first(p.created_at,prev.orderDate)),
-      orderDateSource:first(p.created_at,prev.orderDate)?'posting-created-at':asStr(prev.orderDateSource),
+      orderDate:dateOnly(first(p.created_at,p.in_process_at,prev.orderDate)),
+      orderDateSource:p.created_at?'posting-created-at':(p.in_process_at?'posting-in-process-at':asStr(prev.orderDateSource)),
       orderSchema:asStr(first(p.delivery_schema,p.scheme,p.tpl_integration_type,prev.orderSchema)),
       postingSource:asStr(first(p.__postingSource,prev.postingSource)),
       observedDeliveredDate,observedDeliveredDateSource,
@@ -1824,9 +1831,9 @@ if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kep
 const financeAttributionUpgrade=previous?.financeAttributionVersion!==FINANCE_ATTRIBUTION_VERSION;
 const dailyQuantityUpgrade=previous?.diagnostics?.dailyQuantityVersion!==DAILY_QTY_VERSION||previous?.diagnostics?.quantityEngineVersion!==QUANTITY_ENGINE_VERSION;
 const previousDailyComplete=Boolean(previous?.diagnostics?.realizationCoverage?.complete);
-const needsPostingBackfill=false;
-const postingFrom=maxDateStr(addDays(BUSINESS_START,-7),addDays(TODAY,-POSTING_LOOKBACK_DAYS));
-console.log(`Posting recent audit refresh ${postingFrom}..${TODAY}; quantityEngineUpgrade=${dailyQuantityUpgrade}; historicalPostingBackfill=false`);
+const needsPostingBackfill=previous?.diagnostics?.orderMetaVersion!==ORDER_META_VERSION;
+const postingFrom=needsPostingBackfill?BUSINESS_START:maxDateStr(addDays(BUSINESS_START,-7),addDays(TODAY,-POSTING_LOOKBACK_DAYS));
+console.log(`Posting audit refresh ${postingFrom}..${TODAY}; quantityEngineUpgrade=${dailyQuantityUpgrade}; historicalPostingBackfill=${needsPostingBackfill}`);
 let freshFbo=[],freshFbs=[];
 try{freshFbo=await fetchFboPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBO postings: ${e}`)}
 try{freshFbs=await fetchFbsPostings(postingFrom,TODAY)}catch(e){warnings.push(`FBS postings: ${e}`)}
@@ -1943,7 +1950,7 @@ const payload={
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
     marketplaceBuyoutSupplementRows:buyoutSupplement.rows.length,marketplaceBuyoutSupplementCommission:buyoutSupplement.total,marketplaceBuyoutSupplementSource:buyoutSupplement.meta?.sourceFile||null,
     postingRefreshFrom:postingFrom,postingFullBackfill:needsPostingBackfill,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
-    orderMetaVersion:2,orderSalePostings:Object.values(postingMap).filter(p=>p.status==='delivered').length,orderNumberResolved:Object.values(postingMap).filter(p=>p.orderNumber).length,orderDateResolved:Object.values(postingMap).filter(p=>p.orderDate).length,deliveryEngineVersion:12,deliveryStatusDateVersion:DELIVERY_STATUS_DATE_VERSION,fbsDeliveryComplete:fbsDeliveryHistory.complete,fbsDeliveryMissingDays:fbsDeliveryHistory.missingDays.length,fbsDeliveryScannedDays:fbsDeliveryHistory.scannedDays.length,fbsDeliveryBackfill:fbsDeliveryHistory.fullBackfill,fbsExactDeliveryPostingsRefresh:fbsDeliveryHistory.rows.length,deliveryDateExactCoverage:realization.rows.length?100*realization.rows.filter(r=>r.deliveryDateExact===true).length/realization.rows.length:null,unresolvedDeliveryDates:realization.rows.filter(r=>!r.deliveryDate).length,inexactDeliveryRows:realization.diagnostics.inexactDeliveryRows||0,retroReturnedUnits:realization.diagnostics.retroReturnedUnits||0,retroReturnedRevenue:realization.diagnostics.retroReturnedRevenue||0,provisionalDeliveredSales:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.soldQty,0),0),provisionalDeliveredRevenue:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.revenue,0),0),currentRealizationPostingAvailable:realization.diagnostics.currentRealizationPostingAvailable,currentPostingError:realization.diagnostics.currentPostingError||'',currentFallbackValidation:realization.diagnostics.currentFallbackValidation||null,currentOfficialCoverage:realization.diagnostics.currentOfficialCoverage||null,currentFallbackPriceMissing:realization.diagnostics.currentFallbackPriceMissing||0,pAndLPriceMissing:realization.diagnostics.pAndLPriceMissing||0,deliveredPostingRows:realization.diagnostics.deliveredPostingRows||0,excludedDeliveredProductRows:realization.diagnostics.excludedDeliveredProductRows||0,excludedDeliveredProductUnits:realization.diagnostics.excludedDeliveredProductUnits||0,excludedDeliveredProductGross:realization.diagnostics.excludedDeliveredProductGross||0,excludedDeliveredProductSample:realization.diagnostics.excludedDeliveredProductSample||[],nonFbsDeliveredWithoutExactDate:realization.diagnostics.nonFbsDeliveredWithoutExactDate||0,deliveryGrossMonthlyValidation:realization.diagnostics.monthlyValidation,unmatchedReturnUnits:realization.diagnostics.orphanReturnUnits||0,prePeriodReturnUnits:realization.diagnostics.prePeriodReturnUnits||0,
+    orderMetaVersion:ORDER_META_VERSION,orderSalePostings:Object.values(postingMap).filter(p=>p.status==='delivered').length,orderNumberResolved:Object.values(postingMap).filter(p=>p.orderNumber).length,orderDateResolved:Object.values(postingMap).filter(p=>p.orderDate).length,deliveryEngineVersion:12,deliveryStatusDateVersion:DELIVERY_STATUS_DATE_VERSION,fbsDeliveryComplete:fbsDeliveryHistory.complete,fbsDeliveryMissingDays:fbsDeliveryHistory.missingDays.length,fbsDeliveryScannedDays:fbsDeliveryHistory.scannedDays.length,fbsDeliveryBackfill:fbsDeliveryHistory.fullBackfill,fbsExactDeliveryPostingsRefresh:fbsDeliveryHistory.rows.length,deliveryDateExactCoverage:realization.rows.length?100*realization.rows.filter(r=>r.deliveryDateExact===true).length/realization.rows.length:null,unresolvedDeliveryDates:realization.rows.filter(r=>!r.deliveryDate).length,inexactDeliveryRows:realization.diagnostics.inexactDeliveryRows||0,retroReturnedUnits:realization.diagnostics.retroReturnedUnits||0,retroReturnedRevenue:realization.diagnostics.retroReturnedRevenue||0,provisionalDeliveredSales:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.soldQty,0),0),provisionalDeliveredRevenue:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.revenue,0),0),currentRealizationPostingAvailable:realization.diagnostics.currentRealizationPostingAvailable,currentPostingError:realization.diagnostics.currentPostingError||'',currentFallbackValidation:realization.diagnostics.currentFallbackValidation||null,currentOfficialCoverage:realization.diagnostics.currentOfficialCoverage||null,currentFallbackPriceMissing:realization.diagnostics.currentFallbackPriceMissing||0,pAndLPriceMissing:realization.diagnostics.pAndLPriceMissing||0,deliveredPostingRows:realization.diagnostics.deliveredPostingRows||0,excludedDeliveredProductRows:realization.diagnostics.excludedDeliveredProductRows||0,excludedDeliveredProductUnits:realization.diagnostics.excludedDeliveredProductUnits||0,excludedDeliveredProductGross:realization.diagnostics.excludedDeliveredProductGross||0,excludedDeliveredProductSample:realization.diagnostics.excludedDeliveredProductSample||[],nonFbsDeliveredWithoutExactDate:realization.diagnostics.nonFbsDeliveredWithoutExactDate||0,deliveryGrossMonthlyValidation:realization.diagnostics.monthlyValidation,unmatchedReturnUnits:realization.diagnostics.orphanReturnUnits||0,prePeriodReturnUnits:realization.diagnostics.prePeriodReturnUnits||0,
     returnRefreshFrom:returnFrom,returnsApiComplete:returnsComplete,returnsComplete:realization.coverage.complete,returnsFresh:freshReturnRows.length,fbsReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBS').length,fboReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBO').length,returnRows:returnRows.length,
     realizedRows:realization.rows.length,unresolvedSaleOps:realization.diagnostics.fallbackUnresolvedSaleOps,unresolvedReturnOps:realization.diagnostics.fallbackUnresolvedReturnOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,quantityMonths:realization.diagnostics.quantityMonths,accrualPostingBatches:realization.diagnostics.accrualPostingBatches,accrualPostingFailedBatches:realization.diagnostics.accrualPostingFailedBatches,currentOfficialDays:realization.diagnostics.currentOfficialDays,currentMissingDays:realization.diagnostics.currentMissingDays,dailyQuantityMonthlyValidation:realization.diagnostics.monthlyValidation,
     analyticsSegments:analyticsSegments.length,analyticsCoverage:{from:salesStart,to:salesEnd},analyticsRows:salesRows.length,analyticsSegmentRows:funnelRows.length,analyticsLatestSkuDetailTruncated:Boolean(analyticsSegments.at(-1)?.skuDetailTruncated),
