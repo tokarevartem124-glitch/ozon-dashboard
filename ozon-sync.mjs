@@ -38,6 +38,7 @@ const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
 const DAILY_QTY_VERSION = 6;
 const QUANTITY_ENGINE_VERSION = 12;
+const FINANCE_ATTRIBUTION_VERSION = 8;
 const DELIVERY_STATUS_DATE_VERSION = 4;
 const DELIVERY_STATUS_SCAN_PAUSE_MS = Math.max(900, Number(process.env.DELIVERY_STATUS_SCAN_PAUSE_MS || 1150));
 const DELIVERY_STATUS_REFRESH_DAYS = Math.max(2, Number(process.env.DELIVERY_STATUS_REFRESH_DAYS || 3));
@@ -363,11 +364,22 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
     for COGS/RRP. /v1/finance/accrual/postings is deliberately not used for bulk history.
   */
   const rows=[];
+  const postingsByOrder=new Map();
+  for(const meta of Object.values(postingMap||{})){
+    const orderNumber=asStr(meta?.orderNumber);if(!orderNumber)continue;
+    const list=postingsByOrder.get(orderNumber)||[];list.push(meta);postingsByOrder.set(orderNumber,list);
+  }
   for(const acc of accruals||[]){
     const products=Array.isArray(acc?.posting?.products)?acc.posting.products:[];
     const feeGroups=Array.isArray(acc?.item_fees?.fees)?acc.item_fees.fees:[];
     const date=asStr(acc.date).slice(0,10);
-    const postingNumber=asStr(first(acc?.posting?.posting_number,acc.unit_number));
+    const unitNumber=asStr(acc.unit_number);
+    const explicitPostingNumber=asStr(acc?.posting?.posting_number);
+    const postingMeta=postingMap?.[explicitPostingNumber||unitNumber]||null;
+    const orderCandidates=postingsByOrder.get(unitNumber)||[];
+    const postingNumber=explicitPostingNumber||(postingMeta?unitNumber:'');
+    const orderNumber=asStr(first(postingMeta?.orderNumber,orderCandidates.length?unitNumber:''));
+    const orderMeta=postingMeta||orderCandidates[0]||{};
     const stable=crypto.createHash('sha1').update(JSON.stringify(acc)).digest('hex').slice(0,16);
     const operation=asStr(typeNames.get(asNum(first(acc.accrual_id,acc.type_id),NaN))||`Accrual ${first(acc.accrual_id,acc.type_id)}`);
     const group=asStr(acc.accrued_category);
@@ -380,8 +392,8 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         date,
         article:asStr(maps.articleBySku.get(sku)),
         sku,
-        postingNumber,
-        orderId:asStr(postingMap?.[postingNumber]?.orderId),orderNumber:asStr(postingMap?.[postingNumber]?.orderNumber),orderDate:asStr(postingMap?.[postingNumber]?.orderDate),orderDateSource:asStr(postingMap?.[postingNumber]?.orderDateSource),orderSchema:asStr(postingMap?.[postingNumber]?.orderSchema),
+        postingNumber,financeUnitNumber:unitNumber,
+        orderId:asStr(orderMeta.orderId),orderNumber,orderDate:asStr(orderMeta.orderDate),orderDateSource:asStr(orderMeta.orderDateSource),orderSchema:asStr(orderMeta.orderSchema),
         itemSkus:[sku],
         group,
         operation,
@@ -393,6 +405,8 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         rawAmount:0,
         financeSource:'accrual/by-day',
         financeAttribution:'direct_sku',
+        financeScope:postingNumber?'posting_item':(orderNumber?'order_item':'item'),
+        feeQuantity:0,chargeLines:[],
         parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}`
       });
       return bySku.get(sku);
@@ -412,6 +426,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       row.saleAmount+=saleAmount;
       row.bonus+=bonus;
       row.coinvestment+=coinvestment;
+      row.feeQuantity+=Math.max(0,asNum(prod?.quantity,0));
       const economicGross=saleAmount;
       row.grossRevenue+=Math.abs(economicGross)>0.0005?economicGross:sellerPrice;
 
@@ -439,7 +454,9 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         if(qty!=null){row.returnedQty+=qty;row.financeQtyResolved++}
         else row.financeQtyUnresolved++;
       }
-      row.commission+=-money(comm.sale_commission);
+      const saleCommission=-money(comm.sale_commission);
+      row.commission+=saleCommission;
+      if(Math.abs(saleCommission)>.0005)row.chargeLines.push({typeId:null,typeName:'Вознаграждение за продажу',component:'commission',amount:saleCommission});
 
       const delivery=prod?.delivery||{};
       let serviceCount=0;
@@ -448,27 +465,33 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         const a=money(srv.accrued);serviceCount++;
         const tid=asNum(first(srv.accrual_id,srv.type_id),NaN);
         const name=typeNames.get(tid)||`type ${tid}`;
-        row[classifyService(name)]+=-a;
+        const component=classifyService(name),amount=-a;
+        row[component]+=amount;
+        row.chargeLines.push({typeId:tid,typeName:name,component,amount});
       }
       if(!serviceCount){
         const a=money(delivery.total_accrued);
-        if(a)row.logistics+=-a;
+        if(a){row.logistics+=-a;row.chargeLines.push({typeId:null,typeName:'Логистика',component:'logistics',amount:-a})}
       }
     }
 
     for(const grp of feeGroups){
       const row=ensureSku(grp?.sku);
       if(!row)continue;
+      row.feeQuantity+=Math.max(0,asNum(grp?.quantity,0));
       for(const fee of grp.fees||[]){
         const a=money(fee.accrued);
         const tid=asNum(first(fee.accrual_id,fee.type_id),NaN);
         const name=typeNames.get(tid)||`type ${tid}`;
-        row[classifyService(name)]+=-a;
+        const component=classifyService(name),amount=-a;
+        row[component]+=amount;
+        row.chargeLines.push({typeId:tid,typeName:name,component,amount});
       }
     }
 
     const unallocated={
-      date,article:'',sku:'',postingNumber,
+      date,article:'',sku:'',postingNumber,financeUnitNumber:unitNumber,
+      orderId:asStr(orderMeta.orderId),orderNumber,orderDate:asStr(orderMeta.orderDate),orderDateSource:asStr(orderMeta.orderDateSource),orderSchema:asStr(orderMeta.orderSchema),
       itemSkus:[...bySku.keys()],
       group,operation,
       transactionId:`accrual:${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}:unallocated`,
@@ -476,6 +499,8 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       ...emptyFinanceComponents(),
       rawAmount:0,financeSource:'accrual/by-day',
       financeAttribution:'unallocated',
+      financeScope:(postingNumber||orderNumber)?'order':'period',
+      chargeLines:[],
       parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}`
     };
     let hasUnallocated=false;
@@ -484,7 +509,9 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       const a=money(nif.accrued);
       const tid=asNum(first(nif.accrual_id,nif.type_id),NaN);
       const name=typeNames.get(tid)||`type ${tid}`;
-      unallocated[classifyService(name)]+=-a;
+      const component=classifyService(name),amount=-a;
+      unallocated[component]+=amount;
+      unallocated.chargeLines.push({typeId:tid,typeName:name,component,amount});
       hasUnallocated=true;
     }
     // container_fees (introduced in July 2026) are seller/container-level.
@@ -492,7 +519,9 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       const a=money(fee.accrued);
       const tid=asNum(first(fee.accrual_id,fee.type_id),NaN);
       const name=typeNames.get(tid)||`type ${tid}`;
-      unallocated[classifyService(name)]+=-a;
+      const component=classifyService(name),amount=-a;
+      unallocated[component]+=amount;
+      unallocated.chargeLines.push({typeId:tid,typeName:name,component,amount});
       hasUnallocated=true;
     }
 
@@ -512,6 +541,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
     if(Math.abs(delta)>0.005){
       unallocated.other-=delta;
       unallocated.rawAmount+=delta;
+      unallocated.chargeLines.push({typeId:null,typeName:'Корректировка сверки начисления',component:'other',amount:-delta});
       hasUnallocated=true;
     }
 
@@ -1791,7 +1821,7 @@ if(!freshPrice.length)warnings.push('Price refresh empty; previous API price kep
 /* v7.0: FBO/FBS shipment lists are no longer the historical quantity authority.
    Keep only a recent posting cache for open-month provisional fallback/audit. Closed
    months use official realization/posting quantities. */
-const financeAttributionUpgrade=previous?.financeAttributionVersion!==7;
+const financeAttributionUpgrade=previous?.financeAttributionVersion!==FINANCE_ATTRIBUTION_VERSION;
 const dailyQuantityUpgrade=previous?.diagnostics?.dailyQuantityVersion!==DAILY_QTY_VERSION||previous?.diagnostics?.quantityEngineVersion!==QUANTITY_ENGINE_VERSION;
 const previousDailyComplete=Boolean(previous?.diagnostics?.realizationCoverage?.complete);
 const needsPostingBackfill=false;
@@ -1904,12 +1934,12 @@ if(buyoutSupplement.rows.length){
 const persistedDailyQuantityVersion=realization.coverage.complete?DAILY_QTY_VERSION:(previous?.diagnostics?.dailyQuantityVersion||0);
 
 const payload={
-  version:4,sourcePolicy:SOURCE_POLICY,financeAttributionVersion:7,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
+  version:4,sourcePolicy:SOURCE_POLICY,financeAttributionVersion:FINANCE_ATTRIBUTION_VERSION,generatedAt,syncMode:SYNC_MODE,clientId:CLIENT_ID,datasets,
   history:{analyticsSegments,postingMap,returnRows,fbsDeliveredDays:fbsDeliveryHistory.scannedDays,realizationSegments:realization.officialSegments,quantityMonthSegments:realization.quantityMonthSegments,financeRowsAll:financeRows,skuFinanceRowsAll:skuFinanceRows},
   diagnostics:{
     mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,businessStart:BUSINESS_START,dailyQuantityVersion:persistedDailyQuantityVersion,dailyQuantityUpgrade,quantityEngineVersion:QUANTITY_ENGINE_VERSION,needsPostingBackfill,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
-    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:7,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
+    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:FINANCE_ATTRIBUTION_VERSION,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
     marketplaceBuyoutSupplementRows:buyoutSupplement.rows.length,marketplaceBuyoutSupplementCommission:buyoutSupplement.total,marketplaceBuyoutSupplementSource:buyoutSupplement.meta?.sourceFile||null,
     postingRefreshFrom:postingFrom,postingFullBackfill:needsPostingBackfill,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
