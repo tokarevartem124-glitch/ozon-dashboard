@@ -127,23 +127,6 @@ function encryptJson(obj,keyHex,{gzip=true}={}){
   const tag=cipher.getAuthTag();
   return {v:3,alg:'AES-256-GCM',keyMode:'RAW-HEX-256',compression:gzip?'gzip':'none',iv:iv.toString('base64'),data:Buffer.concat([ciphertext,tag]).toString('base64'),generatedAt:obj.generatedAt,originalBytes:json.length,compressedBytes:plain.length};
 }
-// Temporary, narrowly scoped recheck export. Only the disposable public key is
-// committed; the matching private key remains local and is removed after review.
-const RECHECK_PUBLIC_KEY=`-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApY9s9Ngv7a8UTIBVstwg
-V7VEruWEhfA/nziMqRvsCQ5Du5CE9ezrIJU7IZeO7yPdo0ygkP7GXkiEmS8gXdxo
-vomfvIOrDruVs2frSsn9ZODrV4yn0pHpmwT2vF3hWPxCdivXLokGxjzOU9Q/Ycz4
-GqjCtxUaoX+pjPgPuR0rO7JYmJ31BfXxT7h4SLQjZ6+R0fSPl6Km7ZEop9L/HVTQ
-WuqUaKNov77wKwoQEAZBNaDKwKlXj5CwKU0YpRlz/DPjSGVgRlhr2MWA/uUTQDzI
-mNQPUPji5NPbAJ+9nNBsz1ngcf4BW4HPCo+w2KW0l2a0asRRw8ETi7VPTroYcWZw
-QwIDAQAB
------END PUBLIC KEY-----`;
-function encryptRecheckJson(obj){
-  const aesKey=crypto.randomBytes(32),iv=crypto.randomBytes(12),plain=zlib.gzipSync(Buffer.from(JSON.stringify(obj),'utf8'),{level:9});
-  const cipher=crypto.createCipheriv('aes-256-gcm',aesKey,iv),ciphertext=Buffer.concat([cipher.update(plain),cipher.final()]);
-  const wrappedKey=crypto.publicEncrypt({key:RECHECK_PUBLIC_KEY,padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},aesKey);
-  return {v:1,alg:'RSA-OAEP-SHA256+AES-256-GCM',compression:'gzip',wrappedKey:wrappedKey.toString('base64'),iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),data:ciphertext.toString('base64')};
-}
 function decryptJson(env,keyHex){
   if(env?.keyMode!=='RAW-HEX-256') throw new Error('Previous encrypted state uses legacy password format; clean API-only backfill required');
   const iv=Buffer.from(env.iv,'base64'),data=Buffer.from(env.data,'base64');
@@ -408,6 +391,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
     const stable=crypto.createHash('sha1').update(JSON.stringify(acc)).digest('hex').slice(0,16);
     const operation=asStr(typeNames.get(asNum(first(acc.accrual_id,acc.type_id),NaN))||`Accrual ${first(acc.accrual_id,acc.type_id)}`);
     const group=asStr(acc.accrued_category);
+    const isPeriodAdjustment=/компенсац|декомпенсац|начислени.{0,8}по спору|compensation|dispute/i.test(`${group} ${operation}`);
     const bySku=new Map();
 
     const ensureSku=(sku)=>{
@@ -524,7 +508,10 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       ...emptyFinanceComponents(),
       rawAmount:0,financeSource:'accrual/by-day',
       financeAttribution:'unallocated',
-      financeScope:(postingNumber||orderNumber)?'order':'period',
+      // Compensation/dispute adjustments are seller-level accounting events even
+      // when Ozon leaves a posting number in unit_number. They affect only the
+      // period result and must not be allocated into order/SKU unit economics.
+      financeScope:isPeriodAdjustment?'period':((postingNumber||orderNumber)?'order':'period'),
       chargeLines:[],
       parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}`
     };
@@ -1147,6 +1134,47 @@ function financePositiveRevenueIndex(financeRows){
     const key=`${pn}|${sku||article}`,o=idx.get(key)||{gross:0,dates:new Set()};o.gross+=v;if(f.date)o.dates.add(asStr(f.date));idx.set(key,o);
   }
   return idx;
+}
+function applyFinanceRecognitionDates(rows,financeRows){
+  const idx=new Map();
+  for(const f of financeRows||[]){
+    const amount=asNum(first(f.saleAmount,f.grossRevenue),0);if(amount<=0.00001)continue;
+    const pn=asStr(f.postingNumber),sku=asStr(f.sku),article=asStr(f.article),date=dateOnly(f.date);if(!pn||(!sku&&!article)||!date)continue;
+    for(const productId of [sku,article].filter(Boolean)){
+      const key=`${pn}|${productId}`,dates=idx.get(key)||new Set();dates.add(date);idx.set(key,dates);
+    }
+  }
+  let financeDated=0,fallbackDated=0,ambiguous=0;
+  const recognized=(rows||[]).map(r=>{
+    const pn=asStr(r.postingNumber),sku=asStr(r.sku),article=asStr(r.article);
+    const dates=[...(idx.get(`${pn}|${sku}`)||idx.get(`${pn}|${article}`)||[])].sort();
+    if(dates.length){
+      financeDated++;if(dates.length>1)ambiguous++;
+      return {...r,date:dates[0],recognitionDate:dates[0],recognitionDateSource:dates.length===1?'finance-positive-sale-accrual':'finance-positive-sale-accrual-first',financeSaleDates:dates,dateAttribution:'finance-positive-sale-accrual'};
+    }
+    fallbackDated++;
+    const fallback=dateOnly(r.date||r.deliveryDate);
+    return {...r,date:fallback,recognitionDate:fallback,recognitionDateSource:asStr(r.source).includes('marketplace-buyout')?'validated-marketplace-buyout-date':'delivery-date-fallback-no-positive-finance-sale',financeSaleDates:[]};
+  });
+  return {rows:recognized,financeDated,fallbackDated,ambiguous};
+}
+function supplementReturnsFromReturnsApi(returnEvents,returnRows,deliveredRows,postingMap,maps){
+  const out=[...(returnEvents||[])],soldKeys=new Set((deliveredRows||[]).map(r=>postingSkuKey(r.postingNumber,r.sku,r.article)));
+  const existing=new Map();
+  for(const r of out){const key=postingSkuKey(r.postingNumber,r.sku,r.article);existing.set(key,(existing.get(key)||0)+Math.max(0,asNum(r.returnedQty,0)))}
+  const grouped=new Map();
+  for(const r of returnRows||[]){
+    const key=postingSkuKey(r.postingNumber,r.sku,r.article);if(!soldKeys.has(key))continue;
+    const g=grouped.get(key)||{qty:0,dates:[],sample:r};g.qty+=Math.max(0,asNum(r.quantity,0));if(r.date)g.dates.push(dateOnly(r.date));grouped.set(key,g);
+  }
+  let addedRows=0,addedUnits=0;
+  for(const [key,g] of grouped){
+    const missing=Math.max(0,g.qty-(existing.get(key)||0));if(missing<=0.00001)continue;
+    const r=g.sample,pm=postingMap?.[asStr(r.postingNumber)]||{},date=g.dates.filter(Boolean).sort().at(-1)||dateOnly(r.date);
+    out.push({date,deliveryDate:'',deliveryDateExact:null,deliveryDateSource:'',returnDate:date,article:asStr(first(r.article,maps.articleBySku.get(asStr(r.sku)))),sku:asStr(r.sku),name:asStr(first(r.name,maps.nameBySku.get(asStr(r.sku)))),soldQty:0,returnedQty:missing,netQty:-missing,postingNumber:asStr(r.postingNumber),orderId:asStr(pm.orderId),orderNumber:asStr(pm.orderNumber),orderDate:dateOnly(pm.orderDate),orderDateSource:asStr(pm.orderDateSource),orderSchema:asStr(first(pm.orderSchema,r.schema)),unitPrice:null,source:'returns-api-supplement',officialQuantity:true,dateAttribution:'returns-api-return-date'});
+    addedRows++;addedUnits+=missing;
+  }
+  return {rows:out,addedRows,addedUnits};
 }
 function buildOpenMonthSalesFromPostings(postingMap,start,end,financeRows,maps){
   const revenueIdx=financePositiveRevenueIndex(financeRows),rows=[];
@@ -1781,15 +1809,21 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   }
   if(buyoutSales.invalid.length)warnings.push(`Validated marketplace-buyout sale fallback: ${buyoutSales.invalid.length} row(s) have invalid quantity or seller price.`);
   if(buyoutSales.missingPostings.length)warnings.push(`Validated marketplace-buyout sale coverage: ${buyoutSales.missingPostings.length} posting(s) are still missing: ${buyoutSales.missingPostings.slice(0,10).join(', ')}`);
-  const returnEvents=[...quantityMonthSegments.flatMap(s=>s.returnRows||[]),...currentEventRows.filter(r=>asNum(r.returnedQty,0)>0)]
+  const recognition=applyFinanceRecognitionDates(deliveredSales.rows,financeRows);
+  deliveredSales.rows=recognition.rows;
+  console.log(`Sale recognition date v10.4: finance=${recognition.financeDated}; fallback=${recognition.fallbackDated}; ambiguous=${recognition.ambiguous}`);
+  const baseReturnEvents=[...quantityMonthSegments.flatMap(s=>s.returnRows||[]),...currentEventRows.filter(r=>asNum(r.returnedQty,0)>0)]
     .map(r=>({...r,soldQty:0,netQty:-Math.abs(asNum(r.returnedQty,0)),deliveryDate:'',deliveryDateExact:null,deliveryDateSource:''}));
+  const returnSupplement=supplementReturnsFromReturnsApi(baseReturnEvents,returnRows,deliveredSales.rows,postingMap,maps);
+  const returnEvents=returnSupplement.rows;
+  if(returnSupplement.addedRows)console.log(`Returns API supplement v10.4: rows=${returnSupplement.addedRows}; units=${returnSupplement.addedUnits}`);
   const pAndLEvents=[...deliveredSales.rows,...returnEvents];
   const retro=applyRetroactiveReturns(pAndLEvents,postingMap,BUSINESS_START,{historyStart:HISTORY_START,fbsComplete:deliveryHistoryContext?.fbsComplete===true},returnRows);
-  let rows=retro.rows.filter(r=>r.deliveryDate&&r.deliveryDate>=BUSINESS_START&&r.deliveryDate<=targetEnd);
+  let rows=retro.rows.filter(r=>r.date&&r.date>=BUSINESS_START&&r.date<=targetEnd);
   logUserPostingAudit(postingMap);
 
   for(const ym of closedMonthKeys(BUSINESS_START,TODAY)){
-    const monthRows=rows.filter(r=>monthKey(r.deliveryDate)===ym);
+    const monthRows=rows.filter(r=>monthKey(r.date)===ym);
     const deliveredRevenue=monthRows.reduce((z,r)=>z+asNum(r.revenue,0),0);
     const deliveredUnits=monthRows.reduce((z,r)=>z+asNum(r.netQty,0),0);
     const revenueSkus=new Set(monthRows.filter(r=>asNum(r.revenue,0)>0).map(r=>asStr(r.sku)||asStr(r.article)).filter(Boolean)).size;
@@ -1836,15 +1870,15 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   if(orphanReturnDiagnostics.length)logOrphanReturnDiagnostics(orphanReturnDiagnostics);
   if(retro.orphanReturns.length)warnings.push(`Delivered P&L: ${retro.orphanReturns.length} return event rows (${orphanReturnUnits} units) cannot be matched to a delivered sale or proven to be pre-period; principal is not double-counted. See UNMATCHED RETURN DIAGNOSTIC v9.0 lines above.`);
   if(prePeriodReturnUnits)console.log(`Delivered P&L pre-period return context: ${retro.prePeriodReturns.length} row(s), ${prePeriodReturnUnits} unit(s); original delivery is before ${BUSINESS_START}, so current-period revenue is not reduced again.`);
-  console.log(`Delivered-order engine v9.1 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; closedComplete=${closedComplete}; currentPosting=${currentRealizationPostingAvailable}; currentFallback=${!currentRealizationPostingAvailable}; currentUnresolved=${currentUnresolved}; sourceMonthlyReconcile=${sourceMonthlyOk}; currentDailyTimingAudit=${finalCurrentDailyValidation.ok}; retroReturnedUnits=${retro.retroReturnedUnits}; prePeriodReturnUnits=${prePeriodReturnUnits}; inexactDeliveryRows=${inexactDeliveryRows}; complete=${complete}`);
+  console.log(`Delivered-order engine v10.4 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; closedComplete=${closedComplete}; currentPosting=${currentRealizationPostingAvailable}; currentFallback=${!currentRealizationPostingAvailable}; currentUnresolved=${currentUnresolved}; sourceMonthlyReconcile=${sourceMonthlyOk}; currentDailyTimingAudit=${finalCurrentDailyValidation.ok}; financeRecognition=${recognition.financeDated}; recognitionFallback=${recognition.fallbackDated}; returnsApiSupplement=${returnSupplement.addedUnits}; retroReturnedUnits=${retro.retroReturnedUnits}; prePeriodReturnUnits=${prePeriodReturnUnits}; inexactDeliveryRows=${inexactDeliveryRows}; complete=${complete}`);
   for(const m of sourceMonthlyValidation.months)console.log(`Source quantity reconcile ${m.month}: sold=${m.dailySold}/${m.officialSold}; returns=${m.dailyReturned}/${m.officialReturned}; net=${m.dailyNet}/${m.officialNet}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
 
   return {
     rows,
-    segments:[{key:`Q9:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'v9.1 exact delivered FBS postings with item-level realization guard (products.price × quantity); future returns applied retroactively; Ozon expenses stay on Finance accrual dates',rows}],
+    segments:[{key:`Q10.4:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'v10.4 delivered FBS postings with item-level guard; sales recognized on positive Finance accrual date; Returns API supplements missing return events; products.price × quantity; future returns applied retroactively',rows}],
     officialSegments:controls.segments,quantityMonthSegments,
     coverage:{start:BUSINESS_START,end:targetEnd,complete,gaps:[]},
-    diagnostics:{monthlyLoaded:controls.diagnostics.monthlyLoaded,dailyLoaded:controls.diagnostics.dailyLoaded,dailyPremiumAvailable:controls.diagnostics.dailyPremiumAvailable,dailyErrors:controls.diagnostics.dailyErrors,quantityEngineVersion:QUANTITY_ENGINE_VERSION,quantityMonths:monthDiagnostics,ambiguousPartsBeforeAccrual:accrualNeed.parts,accrualPostingsRequested:accrualNeed.postingNumbers.length,accrualPostingBatches:accrualFetch.batches,accrualPostingFailedBatches:accrualFetch.failedBatches,currentOfficialDays:officialDaily.filter(s=>monthKey(s.start)===currentYm).length,currentMissingDays:currentOfficialCoverage?.missingDays?.length||0,fallbackUnresolvedSaleOps:currentUnresolved,fallbackUnresolvedReturnOps:currentFallbackReturnUnresolved,currentFallbackPriceMissing,pAndLPriceMissing,deliveredPostingRows:deliveredSales.rows.length,excludedDeliveredProductRows:deliveredSales.excludedDeliveredProductRows,excludedDeliveredProductUnits:deliveredSales.excludedDeliveredProductUnits,excludedDeliveredProductGross:deliveredSales.excludedDeliveredProductGross,excludedDeliveredProductSample:deliveredSales.excludedRows.slice(0,25),marketplaceBuyoutSalesExpectedPostings:buyoutSales.expectedPostings,marketplaceBuyoutSalesCoveredPostings:buyoutSales.coveredPostings,marketplaceBuyoutSalesFallbackRows:buyoutSales.added.length,marketplaceBuyoutSalesFallbackRevenue:buyoutSales.added.reduce((z,r)=>z+asNum(r.soldQty,0)*asNum(r.unitPrice,0),0),marketplaceBuyoutSalesMissingPostings:buyoutSales.missingPostings,marketplaceBuyoutSalesInvalidRows:buyoutSales.invalid.length,nonFbsDeliveredWithoutExactDate:deliveredSales.nonFbsDeliveredWithoutExactDate,retroReturnedUnits:retro.retroReturnedUnits,retroReturnedRevenue:retro.retroReturnedRevenue,inexactDeliveryRows,unresolvedDeliveryDates,orphanReturnRows:retro.orphanReturns.length,orphanReturnUnits,orphanReturnDiagnostics,prePeriodReturnRows:retro.prePeriodReturns.length,prePeriodReturnUnits,currentRealizationPostingAvailable,currentPostingError,currentFallbackValidation,currentOfficialCoverage,finalCurrentDailyValidation,monthlyValidation:sourceMonthlyValidation}
+    diagnostics:{monthlyLoaded:controls.diagnostics.monthlyLoaded,dailyLoaded:controls.diagnostics.dailyLoaded,dailyPremiumAvailable:controls.diagnostics.dailyPremiumAvailable,dailyErrors:controls.diagnostics.dailyErrors,quantityEngineVersion:QUANTITY_ENGINE_VERSION,quantityMonths:monthDiagnostics,ambiguousPartsBeforeAccrual:accrualNeed.parts,accrualPostingsRequested:accrualNeed.postingNumbers.length,accrualPostingBatches:accrualFetch.batches,accrualPostingFailedBatches:accrualFetch.failedBatches,currentOfficialDays:officialDaily.filter(s=>monthKey(s.start)===currentYm).length,currentMissingDays:currentOfficialCoverage?.missingDays?.length||0,fallbackUnresolvedSaleOps:currentUnresolved,fallbackUnresolvedReturnOps:currentFallbackReturnUnresolved,currentFallbackPriceMissing,pAndLPriceMissing,deliveredPostingRows:deliveredSales.rows.length,excludedDeliveredProductRows:deliveredSales.excludedDeliveredProductRows,excludedDeliveredProductUnits:deliveredSales.excludedDeliveredProductUnits,excludedDeliveredProductGross:deliveredSales.excludedDeliveredProductGross,excludedDeliveredProductSample:deliveredSales.excludedRows.slice(0,25),marketplaceBuyoutSalesExpectedPostings:buyoutSales.expectedPostings,marketplaceBuyoutSalesCoveredPostings:buyoutSales.coveredPostings,marketplaceBuyoutSalesFallbackRows:buyoutSales.added.length,marketplaceBuyoutSalesFallbackRevenue:buyoutSales.added.reduce((z,r)=>z+asNum(r.soldQty,0)*asNum(r.unitPrice,0),0),marketplaceBuyoutSalesMissingPostings:buyoutSales.missingPostings,marketplaceBuyoutSalesInvalidRows:buyoutSales.invalid.length,financeRecognitionRows:recognition.financeDated,financeRecognitionFallbackRows:recognition.fallbackDated,financeRecognitionAmbiguousRows:recognition.ambiguous,returnsApiSupplementRows:returnSupplement.addedRows,returnsApiSupplementUnits:returnSupplement.addedUnits,nonFbsDeliveredWithoutExactDate:deliveredSales.nonFbsDeliveredWithoutExactDate,retroReturnedUnits:retro.retroReturnedUnits,retroReturnedRevenue:retro.retroReturnedRevenue,inexactDeliveryRows,unresolvedDeliveryDates,orphanReturnRows:retro.orphanReturns.length,orphanReturnUnits,orphanReturnDiagnostics,prePeriodReturnRows:retro.prePeriodReturns.length,prePeriodReturnUnits,currentRealizationPostingAvailable,currentPostingError,currentFallbackValidation,currentOfficialCoverage,finalCurrentDailyValidation,monthlyValidation:sourceMonthlyValidation}
   };
 }
 /* ------------------------------- analytics ---------------------------- */
@@ -2005,7 +2039,7 @@ const dailyRealizationSegments=realization.segments.filter(s=>s.kind==='daily'&&
 const dailyRealizationStart=dailyRealizationSegments.map(s=>s.start).filter(Boolean).sort()[0]||null;
 const dailyRealizationEnd=dailyRealizationSegments.map(s=>s.end).filter(Boolean).sort().at(-1)||null;
 if(funnelRows.length)datasets.push({id:`api-funnel-${salesStart}_${salesEnd}`,apiAuto:true,type:'funnel',label:'Воронка Ozon API',sheetName:'analytics/data',sourceName:'Ozon Seller API',start:salesStart,end:salesEnd,snapshot:null,importedAt:generatedAt,capabilities:{funnel:true,api:true,topTrafficDetail:true,periodSegmented:true,note:'Для SKU детализация до 1000 товаров с наибольшим трафиком на каждом сегменте.'},rows:funnelRows});
-if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Доставленные продажи Ozon API',sheetName:'delivered orders v9.1: item-verified FBS delivered postings + posting price revenue + retro returns',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,officialMonthlyValidation:true,officialPostingQuantities:true,dailyArbitrary:true,quantityEngineVersion:QUANTITY_ENGINE_VERSION,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
+if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Продажи Ozon по дате Finance',sheetName:'sales v10.4: delivered postings recognized by positive Finance accrual date + Returns API',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,financeRecognitionDate:true,officialMonthlyValidation:true,officialPostingQuantities:true,dailyArbitrary:true,quantityEngineVersion:QUANTITY_ENGINE_VERSION,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
 if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'stock',label:'Остатки Ozon API',sheetName:stockComplete?stockResult.source:(previousStock?.sheetName||'previous API snapshot'),sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{stock:true,prices:true,api:true,complete:stockComplete},rows:stockRows});
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
@@ -2035,7 +2069,7 @@ const payload={
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
     marketplaceBuyoutSupplementRows:buyoutSupplement.rows.length,marketplaceBuyoutSupplementCommission:buyoutSupplement.total,marketplaceBuyoutSupplementSource:buyoutSupplement.meta?.sourceFile||null,marketplaceBuyoutSalesExpectedPostings:realization.diagnostics.marketplaceBuyoutSalesExpectedPostings||0,marketplaceBuyoutSalesCoveredPostings:realization.diagnostics.marketplaceBuyoutSalesCoveredPostings||0,marketplaceBuyoutSalesFallbackRows:realization.diagnostics.marketplaceBuyoutSalesFallbackRows||0,marketplaceBuyoutSalesFallbackRevenue:realization.diagnostics.marketplaceBuyoutSalesFallbackRevenue||0,marketplaceBuyoutSalesMissingPostings:realization.diagnostics.marketplaceBuyoutSalesMissingPostings||[],marketplaceBuyoutSalesInvalidRows:realization.diagnostics.marketplaceBuyoutSalesInvalidRows||0,publishQualityGate,
     postingRefreshFrom:postingFrom,postingFullBackfill:needsPostingBackfill,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
-    orderMetaVersion:ORDER_META_VERSION,orderSalePostings:Object.values(postingMap).filter(p=>p.status==='delivered').length,orderNumberResolved:Object.values(postingMap).filter(p=>p.orderNumber).length,orderDateResolved:Object.values(postingMap).filter(p=>p.orderDate).length,deliveryEngineVersion:13,deliveryStatusDateVersion:DELIVERY_STATUS_DATE_VERSION,fbsDeliveryComplete:fbsDeliveryHistory.complete,fbsDeliveryMissingDays:fbsDeliveryHistory.missingDays.length,fbsDeliveryScannedDays:fbsDeliveryHistory.scannedDays.length,fbsDeliveryBackfill:fbsDeliveryHistory.fullBackfill,fbsExactDeliveryPostingsRefresh:fbsDeliveryHistory.rows.length,deliveryDateExactCoverage:realization.rows.length?100*realization.rows.filter(r=>r.deliveryDateExact===true).length/realization.rows.length:null,unresolvedDeliveryDates:realization.rows.filter(r=>!r.deliveryDate).length,inexactDeliveryRows:realization.diagnostics.inexactDeliveryRows||0,retroReturnedUnits:realization.diagnostics.retroReturnedUnits||0,retroReturnedRevenue:realization.diagnostics.retroReturnedRevenue||0,provisionalDeliveredSales:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.soldQty,0),0),provisionalDeliveredRevenue:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.revenue,0),0),currentRealizationPostingAvailable:realization.diagnostics.currentRealizationPostingAvailable,currentPostingError:realization.diagnostics.currentPostingError||'',currentFallbackValidation:realization.diagnostics.currentFallbackValidation||null,currentOfficialCoverage:realization.diagnostics.currentOfficialCoverage||null,currentFallbackPriceMissing:realization.diagnostics.currentFallbackPriceMissing||0,pAndLPriceMissing:realization.diagnostics.pAndLPriceMissing||0,deliveredPostingRows:realization.diagnostics.deliveredPostingRows||0,excludedDeliveredProductRows:realization.diagnostics.excludedDeliveredProductRows||0,excludedDeliveredProductUnits:realization.diagnostics.excludedDeliveredProductUnits||0,excludedDeliveredProductGross:realization.diagnostics.excludedDeliveredProductGross||0,excludedDeliveredProductSample:realization.diagnostics.excludedDeliveredProductSample||[],nonFbsDeliveredWithoutExactDate:realization.diagnostics.nonFbsDeliveredWithoutExactDate||0,deliveryGrossMonthlyValidation:realization.diagnostics.monthlyValidation,unmatchedReturnUnits:realization.diagnostics.orphanReturnUnits||0,prePeriodReturnUnits:realization.diagnostics.prePeriodReturnUnits||0,
+    orderMetaVersion:ORDER_META_VERSION,orderSalePostings:Object.values(postingMap).filter(p=>p.status==='delivered').length,orderNumberResolved:Object.values(postingMap).filter(p=>p.orderNumber).length,orderDateResolved:Object.values(postingMap).filter(p=>p.orderDate).length,deliveryEngineVersion:14,deliveryStatusDateVersion:DELIVERY_STATUS_DATE_VERSION,fbsDeliveryComplete:fbsDeliveryHistory.complete,fbsDeliveryMissingDays:fbsDeliveryHistory.missingDays.length,fbsDeliveryScannedDays:fbsDeliveryHistory.scannedDays.length,fbsDeliveryBackfill:fbsDeliveryHistory.fullBackfill,fbsExactDeliveryPostingsRefresh:fbsDeliveryHistory.rows.length,deliveryDateExactCoverage:realization.rows.length?100*realization.rows.filter(r=>r.deliveryDateExact===true).length/realization.rows.length:null,unresolvedDeliveryDates:realization.rows.filter(r=>!r.deliveryDate).length,inexactDeliveryRows:realization.diagnostics.inexactDeliveryRows||0,financeRecognitionRows:realization.diagnostics.financeRecognitionRows||0,financeRecognitionFallbackRows:realization.diagnostics.financeRecognitionFallbackRows||0,financeRecognitionAmbiguousRows:realization.diagnostics.financeRecognitionAmbiguousRows||0,returnsApiSupplementRows:realization.diagnostics.returnsApiSupplementRows||0,returnsApiSupplementUnits:realization.diagnostics.returnsApiSupplementUnits||0,retroReturnedUnits:realization.diagnostics.retroReturnedUnits||0,retroReturnedRevenue:realization.diagnostics.retroReturnedRevenue||0,provisionalDeliveredSales:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.soldQty,0),0),provisionalDeliveredRevenue:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.revenue,0),0),currentRealizationPostingAvailable:realization.diagnostics.currentRealizationPostingAvailable,currentPostingError:realization.diagnostics.currentPostingError||'',currentFallbackValidation:realization.diagnostics.currentFallbackValidation||null,currentOfficialCoverage:realization.diagnostics.currentOfficialCoverage||null,currentFallbackPriceMissing:realization.diagnostics.currentFallbackPriceMissing||0,pAndLPriceMissing:realization.diagnostics.pAndLPriceMissing||0,deliveredPostingRows:realization.diagnostics.deliveredPostingRows||0,excludedDeliveredProductRows:realization.diagnostics.excludedDeliveredProductRows||0,excludedDeliveredProductUnits:realization.diagnostics.excludedDeliveredProductUnits||0,excludedDeliveredProductGross:realization.diagnostics.excludedDeliveredProductGross||0,excludedDeliveredProductSample:realization.diagnostics.excludedDeliveredProductSample||[],nonFbsDeliveredWithoutExactDate:realization.diagnostics.nonFbsDeliveredWithoutExactDate||0,deliveryGrossMonthlyValidation:realization.diagnostics.monthlyValidation,unmatchedReturnUnits:realization.diagnostics.orphanReturnUnits||0,prePeriodReturnUnits:realization.diagnostics.prePeriodReturnUnits||0,
     returnRefreshFrom:returnFrom,returnsApiComplete:returnsComplete,returnsComplete:realization.coverage.complete,returnsFresh:freshReturnRows.length,fbsReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBS').length,fboReturnsFresh:freshReturnRows.filter(r=>r.schema==='FBO').length,returnRows:returnRows.length,
     realizedRows:realization.rows.length,unresolvedSaleOps:realization.diagnostics.fallbackUnresolvedSaleOps,unresolvedReturnOps:realization.diagnostics.fallbackUnresolvedReturnOps,realizationSegments:realization.segments.length,realizationCoverage:{from:realizedRange.start,to:realizedRange.end,complete:realization.coverage.complete,gaps:realization.coverage.gaps},realizationMonthlyLoaded:realization.diagnostics.monthlyLoaded,realizationDailyLoaded:realization.diagnostics.dailyLoaded,realizationDailyPremiumAvailable:realization.diagnostics.dailyPremiumAvailable,quantityMonths:realization.diagnostics.quantityMonths,accrualPostingBatches:realization.diagnostics.accrualPostingBatches,accrualPostingFailedBatches:realization.diagnostics.accrualPostingFailedBatches,currentOfficialDays:realization.diagnostics.currentOfficialDays,currentMissingDays:realization.diagnostics.currentMissingDays,dailyQuantityMonthlyValidation:realization.diagnostics.monthlyValidation,
     analyticsSegments:analyticsSegments.length,analyticsCoverage:{from:salesStart,to:salesEnd},analyticsRows:salesRows.length,analyticsSegmentRows:funnelRows.length,analyticsLatestSkuDetailTruncated:Boolean(analyticsSegments.at(-1)?.skuDetailTruncated),
@@ -2049,38 +2083,8 @@ const fullEnvelope=encryptJson(payload,DASHBOARD_KEY,{gzip:true});
 // The browser does not need postingMap/history/financeRowsAll. Serve a slim encrypted payload for fast startup.
 const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolicy,financeAttributionVersion:payload.financeAttributionVersion,generatedAt:payload.generatedAt,syncMode:payload.syncMode,clientId:payload.clientId,datasets:payload.datasets,diagnostics:payload.diagnostics};
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
-const recheckPostingNumbers=['0117367898-0030-1','0153848164-0007-1','0255156325-0006-2'];
-const recheckSet=new Set(recheckPostingNumbers);
-const recheckPostingDetails=[];
-for(const postingNumber of recheckPostingNumbers){
-  const fbs=await post('/v3/posting/fbs/get',{posting_number:postingNumber},{allowError:true,retries:3});
-  const fbo=fbs.__error?await post('/v2/posting/fbo/get',{posting_number:postingNumber},{allowError:true,retries:3}):null;
-  recheckPostingDetails.push({postingNumber,fbs,fbo});
-}
-const recheckAccrualPostings=await post('/v1/finance/accrual/postings',{posting_numbers:recheckPostingNumbers},{allowError:true,retries:4});
-const recheckAugustRealization=await fetchPostingRealization('2026-08').catch(e=>({error:String(e),rows:[]}));
-const recheckSeptemberRealization=await fetchPostingRealization('2026-09').catch(e=>({error:String(e),rows:[]}));
-const recheckDeliveryDays=[];
-for(const date of ['2026-08-31','2026-09-01']){
-  const scan=await fetchFbsDeliveredStatusDay(date).catch(e=>({error:String(e),rows:[]}));
-  recheckDeliveryDays.push({date,error:scan.error||null,rows:(scan.rows||[]).filter(r=>recheckSet.has(asStr(r.posting_number)))});
-}
-const recheckEnvelope=encryptRecheckJson({
-  generatedAt,timeZone:'Asia/Yekaterinburg',postingNumbers:recheckPostingNumbers,
-  postingDetails:recheckPostingDetails,accrualPostings:recheckAccrualPostings,
-  postingMap:Object.fromEntries(recheckPostingNumbers.map(pn=>[pn,postingMap[pn]||null])),
-  normalizedFinance:financeRows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
-  normalizedReturns:returnRows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
-  rawFreshReturns:freshReturns.filter(r=>recheckPostingNumbers.some(pn=>JSON.stringify(r).includes(pn))),
-  realizedRows:realization.rows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
-  buyoutRows:buyoutSupplement.rows.filter(r=>recheckSet.has(asStr(r.postingNumber))),
-  augustRealizationRows:(recheckAugustRealization.rows||[]).filter(r=>recheckSet.has(asStr(r?.order?.posting_number))),
-  septemberRealizationRows:(recheckSeptemberRealization.rows||[]).filter(r=>recheckSet.has(asStr(r?.order?.posting_number))),
-  deliveryDayScans:recheckDeliveryDays
-});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
-await fs.writeFile(path.join(process.cwd(),'data','recheck-rsa.enc.json'),JSON.stringify(recheckEnvelope));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.3 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement. P&L sales are sourced from delivered postings with an official item-composition guard for multi-product shipments. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. Later returns retroactively reduce the original delivery. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.4 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Returns API supplements return events missing from realization reports. Compensation and dispute adjustments stay at period level and are never allocated into order or SKU unit economics. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
 console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);

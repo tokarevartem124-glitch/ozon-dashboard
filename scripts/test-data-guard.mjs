@@ -5,7 +5,7 @@ import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../ozon-sync.mjs',import.meta.url),'utf8');
 function extractFunction(name){
   const start=source.indexOf(`function ${name}(`);assert.ok(start>=0,`function ${name} not found`);
-  const bodyStart=source.indexOf('{',start);let depth=0,inString=null,escaped=false;
+  const bodyStart=source.indexOf('){',start)+1;assert.ok(bodyStart>0,`function ${name} body not found`);let depth=0,inString=null,escaped=false;
   for(let i=bodyStart;i<source.length;i++){
     const ch=source[i];
     if(inString){if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch===inString)inString=null;continue}
@@ -26,7 +26,7 @@ const context={
   monthKey:v=>String(v||'').slice(0,7),
 };
 vm.createContext(context);
-for(const name of ['postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','validateRealizationPublishGate']){
+for(const name of ['postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
   vm.runInContext(`${extractFunction(name)};this.${name}=${name};`,context);
 }
 
@@ -51,6 +51,20 @@ assert.equal(cis.missingPostings.length,0);
 
 const noDuplicate=context.appendMissingMarketplaceBuyoutSales(cis.rows,cisFinance,{},'2026-08-01','2026-08-31',maps);
 assert.equal(noDuplicate.added.length,0);
+
+const septemberSale=[{...guarded.rows[0],postingNumber:'0255156325-0006-2',sku:'sku-sep',article:'87004',date:'2026-08-31',deliveryDate:'2026-08-31'}];
+const recognized=context.applyFinanceRecognitionDates(septemberSale,[{postingNumber:'0255156325-0006-2',sku:'sku-sep',article:'87004',date:'2026-09-01',saleAmount:6845}]);
+assert.equal(recognized.rows[0].date,'2026-09-01');
+assert.equal(recognized.rows[0].deliveryDate,'2026-08-31');
+assert.equal(recognized.rows[0].recognitionDateSource,'finance-positive-sale-accrual');
+
+const returnedSale=[{...guarded.rows[0],postingNumber:'0153848164-0007-1',sku:'sku-return',article:'49638',soldQty:1,unitPrice:1205,date:'2026-08-21',deliveryDate:'2026-08-21'}];
+const supplemented=context.supplementReturnsFromReturnsApi([], [{postingNumber:'0153848164-0007-1',sku:'sku-return',article:'49638',quantity:1,date:'2026-08-21',name:'Возвращённый товар',schema:'FBS'}], returnedSale, {}, maps);
+assert.equal(supplemented.addedUnits,1);
+const retro=context.applyRetroactiveReturns([...returnedSale,...supplemented.rows],{},'2026-08-01',{historyStart:'2026-01-01',fbsComplete:true},[]);
+assert.equal(retro.rows[0].netQty,0);
+assert.equal(retro.rows[0].revenue,0);
+assert.equal(retro.rows[0].returnStatus,'full');
 
 const realizedRows=cis.rows.map(r=>({...r,returnedQty:0,netQty:r.soldQty,originalRevenue:r.soldQty*r.unitPrice,revenue:r.soldQty*r.unitPrice,retroReturnedRevenue:0}));
 const passed=context.validateRealizationPublishGate({rows:realizedRows,diagnostics:{pAndLPriceMissing:0,marketplaceBuyoutSalesExpectedPostings:1,marketplaceBuyoutSalesCoveredPostings:1,marketplaceBuyoutSalesMissingPostings:[],marketplaceBuyoutSalesInvalidRows:0}});
