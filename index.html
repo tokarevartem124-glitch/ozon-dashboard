@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — v10.5</title>
+  <title>Ozon Seller Analytics — v10.6</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.5 · Compensation Links</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.6 · Compensation Reconciliation</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -1410,7 +1410,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v10.5 Compensation Links</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v10.6 Compensation Reconciliation</span>`;
   if(apiSyncStatus.loaded){const src=apiSyncStatus.source==='cache-fresh'?' · кэш, актуален':apiSyncStatus.source==='cache'?' · кэш':apiSyncStatus.source==='remote'?' · обновлено':'';const upd=apiSyncStatus.updateAvailable?' · есть обновление':'';const warn=apiSyncStatus.error?' warn':' ok';html+=`<span id="${apiSyncStatus.updateAvailable?'apiRetryChip':''}" class="chip${warn}" style="${apiSyncStatus.updateAvailable?'cursor:pointer':''}" title="${escapeHtml(apiSyncStatus.error||'')}">Данные: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}${src}${upd}</span>`}
   else if(apiSyncStatus.loading)html+=`<span class="chip">Данные: загрузка…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1456,7 +1456,7 @@ function renderQuality(){
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
   const gateText=gate?`${gate.status==='passed'?'<span class="positive">пройден</span>':'<span class="warning">заблокирован</span>'} · ${fmtNum(gate.rowCount||0)} строк · дубли ${fmtNum(gate.duplicateRows||0)} · ошибки возвратов ${fmtNum(gate.returnOverSaleRows||0)} · ошибки выручки ${fmtNum(gate.revenueBridgeRows||0)}`:'ожидается следующая синхронизация';
   const cisCoverage=q.marketplaceBuyoutSalesExpectedPostings?`${fmtNum(q.marketplaceBuyoutSalesCoveredPostings)}/${fmtNum(q.marketplaceBuyoutSalesExpectedPostings)} отправлений`:'нет подтверждённого слоя';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v10.5.</b> Ozon — <b>Seller API + валидированный слой комиссий СНГ</b>.
+  $('#dataQuality').innerHTML=`<b>Контроль данных v10.6.</b> Ozon — <b>Seller API + валидированные слои комиссий СНГ и связей компенсаций</b>.
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
     <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) подтверждённых доставок, отнесённых в период по дате положительного Finance-начисления. Подтверждённый СНГ-отчёт добавляет продажу только если отправление полностью отсутствует в Seller API: покрытие ${cisCoverage}, резерв ${fmtNum(q.marketplaceBuyoutSalesFallbackRows)} строк на ${fmtMoney(q.marketplaceBuyoutSalesFallbackRevenue)}. Будущие возвраты ретроспективно уменьшают исходную продажу.
     <b>Доходы Ozon:</b> продажи ${fmtMoney(m.totalRevenue)} + компенсации ${fmtMoney(m.compensationIncome)} + другие положительные начисления ${fmtMoney(m.otherPositiveAccruals)} = ${fmtMoney(m.totalOzonIncome)}. <b>Расходы Ozon:</b> валовые списания ${fmtMoney(m.financeOzonExpensesGross)}; в том числе комиссии СНГ ${fmtMoney(m.marketplaceBuyoutExpenses)}. После Ozon ${fmtMoney(m.afterOzon)}.
