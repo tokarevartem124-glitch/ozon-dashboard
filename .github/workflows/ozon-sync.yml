@@ -21,6 +21,7 @@ on:
       - ".github/workflows/ozon-sync.yml"
       - "data/1c-reference.json"
       - "data/marketplace-buyout-2026-08.json"
+      - "data/compensation-links.json"
 
   schedule:
     - cron: "17 * * * *"

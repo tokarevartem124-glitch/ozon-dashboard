@@ -4,11 +4,12 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
 /*
-  Ozon Seller Analytics — Seller API + validated supplements sync (v10.5 Compensation Links)
+  Ozon Seller Analytics — Seller API + validated supplements sync (v10.6 Compensation Reconciliation)
 
   Source policy:
     - operational Ozon data comes from Seller API;
-    - one validated business supplement is allowed: marketplace-buyout/CIS commission rows converted to versioned JSON;
+    - validated business supplements are allowed for marketplace-buyout/CIS commission rows
+      and for compensation-to-posting links that Ozon omits from Seller API;
     - the supplement adds commission expenses and may supply revenue only for a
       validated CIS posting that is completely absent from Seller API delivered sales;
     - purchase cost and RRP are served as a separate cached browser reference and joined by offer_id/article.
@@ -39,7 +40,7 @@ const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
 const DAILY_QTY_VERSION = 6;
 const QUANTITY_ENGINE_VERSION = 12;
-const FINANCE_ATTRIBUTION_VERSION = 9;
+const FINANCE_ATTRIBUTION_VERSION = 10;
 const DELIVERY_STATUS_DATE_VERSION = 4;
 // Increment when posting-derived order metadata changes. This forces a one-time
 // full posting refresh so historical orders do not keep stale/fallback dates.
@@ -678,6 +679,91 @@ async function loadMarketplaceBuyoutSupplement(maps){
     if(e?.code==='ENOENT')return {rows:[],meta:null,total:0};
     throw new Error(`Marketplace buyout supplement: ${e?.message||e}`);
   }
+}
+
+async function loadCompensationLinkSupplement(){
+  const file=path.join(process.cwd(),'data','compensation-links.json');
+  try{
+    const doc=JSON.parse(await fs.readFile(file,'utf8'));
+    if(doc?.kind!=='ozon_compensation_link_supplement'||!Array.isArray(doc?.rows))throw new Error('unexpected supplement schema');
+    const rows=doc.rows.map((r,i)=>({
+      id:asStr(r.id||`compensation-${i+1}`),period:asStr(r.period),postingNumber:asStr(r.postingNumber),
+      amount:Math.abs(asNum(r.amount,0)),name:asStr(r.name),source:asStr(r.source||doc.sourceFile)
+    })).filter(r=>/^\d{4}-\d{2}$/.test(r.period)&&r.postingNumber&&r.amount>0);
+    if(rows.length!==doc.rows.length)throw new Error(`invalid rows: ${doc.rows.length-rows.length}`);
+    return {rows,meta:doc,total:rows.reduce((z,r)=>z+r.amount,0)};
+  }catch(e){
+    if(e?.code==='ENOENT')return {rows:[],meta:null,total:0};
+    throw new Error(`Compensation link supplement: ${e?.message||e}`);
+  }
+}
+
+function applyValidatedCompensationLinks(financeRows,supplement,postingMap,maps){
+  const componentKeys=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
+  const rows=(financeRows||[]).map(r=>({...r,chargeLines:Array.isArray(r.chargeLines)?r.chargeLines.map(x=>({...x})):[]}));
+  const diagnostics={linked:0,alreadyLinked:0,sourceRowsConsumed:0,total:0,links:[]};
+  for(const spec of supplement?.rows||[]){
+    const prior=rows.filter(r=>r.validatedCompensationId===spec.id);
+    if(prior.length){
+      diagnostics.alreadyLinked++;
+      diagnostics.total+=prior.reduce((z,r)=>z+asNum(r.compensationIncome,0),0);
+      continue;
+    }
+    const natural=rows.filter(r=>asStr(r.postingNumber)===spec.postingNumber&&asNum(r.compensationIncome,0)>0);
+    const naturalTotal=natural.reduce((z,r)=>z+asNum(r.compensationIncome,0),0);
+    if(Math.abs(naturalTotal-spec.amount)<=0.01){
+      diagnostics.alreadyLinked++;
+      diagnostics.total+=naturalTotal;
+      continue;
+    }
+    const candidates=rows.filter(r=>{
+      if(monthKey(r.date)!==spec.period||r.postingNumber||r.orderNumber||r.article||r.sku||asNum(r.compensationIncome,0))return false;
+      const positive=componentKeys.reduce((z,k)=>z+Math.max(0,-asNum(r[k],0)),0);
+      return Math.abs(asNum(r.rawAmount,0)-spec.amount)<=0.01&&Math.abs(positive-spec.amount)<=0.01;
+    });
+    if(candidates.length!==1)throw new Error(`Compensation ${spec.id}: expected one unlinked positive Finance row ${spec.amount.toFixed(2)} in ${spec.period}, found ${candidates.length}`);
+    const source=candidates[0],meta=postingMap?.[spec.postingNumber];
+    const products=(meta?.products||[]).map(p=>({
+      sku:asStr(p.sku),article:asStr(first(p.article,maps?.articleBySku?.get(asStr(p.sku)))),
+      name:asStr(first(p.name,spec.name,maps?.nameBySku?.get(asStr(p.sku)))),quantity:Math.max(0,asNum(p.quantity,0)),price:Math.max(0,asNum(p.price,0))
+    })).filter(p=>p.sku||p.article);
+    if(!products.length)throw new Error(`Compensation ${spec.id}: posting ${spec.postingNumber} has no product composition in Posting API history`);
+
+    // Remove only the matched positive amount from the anonymous period row. The
+    // same amount is recreated below with the posting/SKU link, so the Finance
+    // ledger total stays exactly unchanged.
+    source.rawAmount=asNum(source.rawAmount,0)-spec.amount;
+    let remaining=spec.amount;
+    for(const k of componentKeys){
+      const available=Math.max(0,-asNum(source[k],0));
+      const take=Math.min(available,remaining);
+      if(take>0){source[k]=asNum(source[k],0)+take;remaining-=take}
+      if(remaining<=0.005)break;
+    }
+    if(remaining>0.01)throw new Error(`Compensation ${spec.id}: anonymous Finance components do not cover ${spec.amount.toFixed(2)}`);
+    source.chargeLines=[];
+    diagnostics.sourceRowsConsumed++;
+
+    const weights=products.map(p=>Math.max(0,p.price*p.quantity)||Math.max(0,p.quantity)||1);
+    const weightTotal=weights.reduce((z,x)=>z+x,0)||products.length;
+    products.forEach((p,i)=>{
+      const share=spec.amount*weights[i]/weightTotal;
+      rows.push({
+        date:source.date,article:p.article,sku:p.sku,name:p.name,postingNumber:spec.postingNumber,financeUnitNumber:spec.postingNumber,
+        orderId:asStr(meta?.orderId),orderNumber:asStr(meta?.orderNumber),orderDate:asStr(meta?.orderDate),orderDateSource:asStr(meta?.orderDateSource),orderSchema:asStr(meta?.orderSchema),
+        itemSkus:[p.sku].filter(Boolean),group:'Компенсации Ozon',operation:'Компенсация по валидированному отчёту Ozon',
+        transactionId:`validated-compensation-${spec.id}-${i+1}`,grossRevenue:null,sellerPriceRaw:0,salePriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,
+        soldQty:0,returnedQty:0,financeQtyResolved:0,financeQtyUnresolved:0,...emptyFinanceComponents(),other:-share,rawAmount:share,
+        compensationIncome:share,financeIncomeKind:'compensation',financeSource:'finance/accrual/by-day + validated compensation link',financeAttribution:'direct_sku',financeScope:'posting_item',
+        feeQuantity:0,chargeLines:[{typeId:null,typeName:'Компенсация Ozon',component:'other',amount:-share,incomeKind:'compensation'}],
+        parentAccrualId:source.parentAccrualId||source.transactionId,validatedCompensationId:spec.id,manualSupplement:true,sourceReference:spec.source
+      });
+    });
+    diagnostics.linked++;
+    diagnostics.total+=spec.amount;
+    diagnostics.links.push({id:spec.id,postingNumber:spec.postingNumber,date:source.date,amount:spec.amount,products:products.length});
+  }
+  return {rows:rows.filter(r=>Math.abs(asNum(r.rawAmount,0))>0.005||componentKeys.some(k=>Math.abs(asNum(r[k],0))>0.005)||asNum(r.grossRevenue,0)),diagnostics};
 }
 
 
@@ -2007,8 +2093,12 @@ const financeFrom=financeAttributionUpgrade?HISTORY_START:(previous?maxDateStr(H
 console.log(`Finance refresh ${financeFrom}..${TODAY}; mode=${SYNC_MODE}; fastLookback=${FINANCE_LOOKBACK_DAYS}; dailyLookback=${FINANCE_DAILY_LOOKBACK_DAYS}; previous rows=${prevFinanceRows.length}; attributionUpgrade=${financeAttributionUpgrade}; quantityEngine=v11`);
 let financeRefresh={rows:[],source:'none'};
 try{financeRefresh=await fetchFinanceNormalized(financeFrom,TODAY,maps,postingMap)}catch(e){warnings.push(`Finance: ${e}`)}
-const financeRows=financeRefresh.rows.length?replaceFinanceWindow(prevFinanceRows,financeRefresh.rows,financeFrom,TODAY):prevFinanceRows;
+let financeRows=financeRefresh.rows.length?replaceFinanceWindow(prevFinanceRows,financeRefresh.rows,financeFrom,TODAY):prevFinanceRows;
 for(const r of financeRows){const pm=postingMap?.[asStr(r.postingNumber)]||{};if(!r.orderNumber)r.orderNumber=asStr(pm.orderNumber);if(!r.orderId)r.orderId=asStr(pm.orderId);if(!r.orderDate)r.orderDate=asStr(pm.orderDate);if(!r.orderDateSource)r.orderDateSource=asStr(pm.orderDateSource);if(!r.orderSchema)r.orderSchema=asStr(pm.orderSchema)}
+const compensationSupplement=await loadCompensationLinkSupplement();
+const compensationLinkResult=applyValidatedCompensationLinks(financeRows,compensationSupplement,postingMap,maps);
+financeRows=compensationLinkResult.rows;
+if(compensationSupplement.rows.length)console.log(`Validated compensation links: linked=${compensationLinkResult.diagnostics.linked}; already=${compensationLinkResult.diagnostics.alreadyLinked}; amount=${compensationLinkResult.diagnostics.total.toFixed(2)}; ${compensationLinkResult.diagnostics.links.map(x=>`${x.postingNumber}@${x.date}`).join(',')}`);
 const finTotalsAll=financeTotals(financeRows);
 console.log(`Finance fresh rows: ${financeRefresh.rows.length}; source=${financeRefresh.source}; merged rows=${financeRows.length}; gross(all)=${finTotalsAll.grossRevenue.toFixed(2)}; net(all)=${finTotalsAll.netAfterOzon.toFixed(2)}`);
 
@@ -2104,6 +2194,7 @@ const payload={
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
     financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:FINANCE_ATTRIBUTION_VERSION,financeAttributionUpgrade,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
+    compensationLinkSupplementRows:compensationSupplement.rows.length,compensationLinkSupplementTotal:compensationSupplement.total,compensationLinkDiagnostics:compensationLinkResult.diagnostics,
     marketplaceBuyoutSupplementRows:buyoutSupplement.rows.length,marketplaceBuyoutSupplementCommission:buyoutSupplement.total,marketplaceBuyoutSupplementSource:buyoutSupplement.meta?.sourceFile||null,marketplaceBuyoutSalesExpectedPostings:realization.diagnostics.marketplaceBuyoutSalesExpectedPostings||0,marketplaceBuyoutSalesCoveredPostings:realization.diagnostics.marketplaceBuyoutSalesCoveredPostings||0,marketplaceBuyoutSalesFallbackRows:realization.diagnostics.marketplaceBuyoutSalesFallbackRows||0,marketplaceBuyoutSalesFallbackRevenue:realization.diagnostics.marketplaceBuyoutSalesFallbackRevenue||0,marketplaceBuyoutSalesMissingPostings:realization.diagnostics.marketplaceBuyoutSalesMissingPostings||[],marketplaceBuyoutSalesInvalidRows:realization.diagnostics.marketplaceBuyoutSalesInvalidRows||0,publishQualityGate,
     postingRefreshFrom:postingFrom,postingFullBackfill:needsPostingBackfill,postingMapSize:Object.keys(postingMap).length,fboPostingsFresh:freshFbo.length,fbsPostingsFresh:freshFbs.length,
     orderMetaVersion:ORDER_META_VERSION,orderSalePostings:Object.values(postingMap).filter(p=>p.status==='delivered').length,orderNumberResolved:Object.values(postingMap).filter(p=>p.orderNumber).length,orderDateResolved:Object.values(postingMap).filter(p=>p.orderDate).length,deliveryEngineVersion:14,deliveryStatusDateVersion:DELIVERY_STATUS_DATE_VERSION,fbsDeliveryComplete:fbsDeliveryHistory.complete,fbsDeliveryMissingDays:fbsDeliveryHistory.missingDays.length,fbsDeliveryScannedDays:fbsDeliveryHistory.scannedDays.length,fbsDeliveryBackfill:fbsDeliveryHistory.fullBackfill,fbsExactDeliveryPostingsRefresh:fbsDeliveryHistory.rows.length,deliveryDateExactCoverage:realization.rows.length?100*realization.rows.filter(r=>r.deliveryDateExact===true).length/realization.rows.length:null,unresolvedDeliveryDates:realization.rows.filter(r=>!r.deliveryDate).length,inexactDeliveryRows:realization.diagnostics.inexactDeliveryRows||0,financeRecognitionRows:realization.diagnostics.financeRecognitionRows||0,financeRecognitionFallbackRows:realization.diagnostics.financeRecognitionFallbackRows||0,financeRecognitionAmbiguousRows:realization.diagnostics.financeRecognitionAmbiguousRows||0,returnsApiSupplementRows:realization.diagnostics.returnsApiSupplementRows||0,returnsApiSupplementUnits:realization.diagnostics.returnsApiSupplementUnits||0,retroReturnedUnits:realization.diagnostics.retroReturnedUnits||0,retroReturnedRevenue:realization.diagnostics.retroReturnedRevenue||0,provisionalDeliveredSales:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.soldQty,0),0),provisionalDeliveredRevenue:realization.rows.filter(r=>r.provisional).reduce((z,r)=>z+asNum(r.revenue,0),0),currentRealizationPostingAvailable:realization.diagnostics.currentRealizationPostingAvailable,currentPostingError:realization.diagnostics.currentPostingError||'',currentFallbackValidation:realization.diagnostics.currentFallbackValidation||null,currentOfficialCoverage:realization.diagnostics.currentOfficialCoverage||null,currentFallbackPriceMissing:realization.diagnostics.currentFallbackPriceMissing||0,pAndLPriceMissing:realization.diagnostics.pAndLPriceMissing||0,deliveredPostingRows:realization.diagnostics.deliveredPostingRows||0,excludedDeliveredProductRows:realization.diagnostics.excludedDeliveredProductRows||0,excludedDeliveredProductUnits:realization.diagnostics.excludedDeliveredProductUnits||0,excludedDeliveredProductGross:realization.diagnostics.excludedDeliveredProductGross||0,excludedDeliveredProductSample:realization.diagnostics.excludedDeliveredProductSample||[],nonFbsDeliveredWithoutExactDate:realization.diagnostics.nonFbsDeliveredWithoutExactDate||0,deliveryGrossMonthlyValidation:realization.diagnostics.monthlyValidation,unmatchedReturnUnits:realization.diagnostics.orphanReturnUnits||0,prePeriodReturnUnits:realization.diagnostics.prePeriodReturnUnits||0,
@@ -2122,6 +2213,6 @@ const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolic
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.5 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Returns API supplements return events missing from realization reports. Compensation and dispute income remains separate from sales revenue: when Ozon supplies an order or posting link it is attributed only inside that order by item value and appears in order/SKU unit economics; seller-level adjustments remain separate period rows. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.6 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus validated supplements for August marketplace-buyout/CIS commissions and compensation-to-posting links omitted by Seller API. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Returns API supplements return events missing from realization reports. Compensation remains separate from sales revenue and appears in linked order/SKU unit economics without changing the Finance ledger total; seller-level adjustments remain separate period rows. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
 console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);

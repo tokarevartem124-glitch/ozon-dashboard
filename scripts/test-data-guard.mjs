@@ -30,7 +30,7 @@ const context={
   classifyService:()=> 'other',
 };
 vm.createContext(context);
-for(const name of ['emptyFinanceComponents','normalizeAccrualFinance','postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
+for(const name of ['emptyFinanceComponents','normalizeAccrualFinance','applyValidatedCompensationLinks','postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
   vm.runInContext(`${extractFunction(name)};this.${name}=${name};`,context);
 }
 
@@ -86,6 +86,22 @@ assert.equal(compensationRows[0].compensationIncome,6795);
 assert.equal(compensationRows[0].other,-6795);
 assert.equal(compensationRows[0].rawAmount,6795);
 
+const anonymousCompensation=[{
+  date:'2026-08-07',article:'',sku:'',postingNumber:'',orderNumber:'',financeScope:'period',financeAttribution:'unallocated',
+  transactionId:'anonymous-6795',grossRevenue:null,rawAmount:6795,compensationIncome:0,...context.emptyFinanceComponents(),other:-6795,
+  chargeLines:[{typeName:'Корректировка сверки начисления',component:'other',amount:-6795}]
+}];
+const linkedCompensation=context.applyValidatedCompensationLinks(anonymousCompensation,{rows:[{id:'aug-claim-6795',period:'2026-08',postingNumber:compensationPosting,amount:6795,name:'Компенсированный товар'}]}, {
+  [compensationPosting]:{postingNumber:compensationPosting,orderNumber:'order-compensation',orderDate:'2026-07-17',orderSchema:'FBS',products:[{sku:'sku-main',article:'4466',name:'Компенсированный товар',quantity:1,price:6795}]}
+},maps);
+assert.equal(linkedCompensation.rows.length,1);
+assert.equal(linkedCompensation.rows[0].postingNumber,compensationPosting);
+assert.equal(linkedCompensation.rows[0].financeIncomeKind,'compensation');
+assert.equal(linkedCompensation.rows[0].compensationIncome,6795);
+assert.equal(linkedCompensation.rows[0].rawAmount,6795);
+assert.equal(linkedCompensation.rows[0].other,-6795);
+assert.equal(linkedCompensation.diagnostics.total,6795);
+
 const realizedRows=cis.rows.map(r=>({...r,returnedQty:0,netQty:r.soldQty,originalRevenue:r.soldQty*r.unitPrice,revenue:r.soldQty*r.unitPrice,retroReturnedRevenue:0}));
 const passed=context.validateRealizationPublishGate({rows:realizedRows,diagnostics:{pAndLPriceMissing:0,marketplaceBuyoutSalesExpectedPostings:1,marketplaceBuyoutSalesCoveredPostings:1,marketplaceBuyoutSalesMissingPostings:[],marketplaceBuyoutSalesInvalidRows:0}});
 assert.equal(passed.status,'passed');
@@ -102,6 +118,6 @@ assert.match(dashboardSource,/'Номер отправления Ozon':orders\.m
 assert.match(dashboardSource,/\.\.\.productOrderExportColumns\(p\)/);
 assert.match(dashboardSource,/Доходы от Ozon всего/);
 assert.match(dashboardSource,/'Компенсация Ozon':safe\(r\.compensationIncome\)/);
-assert.match(dashboardSource,/v10\.5-compensation-links/);
+assert.match(dashboardSource,/v10\.6-compensation-reconciliation/);
 
 console.log('Data Guard regression tests passed.');
