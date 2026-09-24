@@ -1,6 +1,6 @@
 name: Temporary compensation API check
 
-# fixed cash flow rerun
+# daily cash flow rerun
 on:
   push:
     paths:
