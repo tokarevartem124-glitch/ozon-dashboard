@@ -73,7 +73,7 @@ async function dailyAccrualMatches(from,to){
 }
 
 async function cashFlow(from,to){
-  return post('/v1/finance/cash-flow-statement/list',{date:{from,to},page:1,page_size:1000,with_details:true});
+  return post('/v1/finance/cash-flow-statement/list',{date:{from:from+'T00:00:00.000Z',to:to+'T23:59:59.999Z'},page:1,page_size:1000,with_details:true});
 }
 
 const payload={
