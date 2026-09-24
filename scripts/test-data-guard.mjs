@@ -30,7 +30,7 @@ const context={
   classifyService:()=> 'other',
 };
 vm.createContext(context);
-for(const name of ['emptyFinanceComponents','normalizeAccrualFinance','applyValidatedCompensationLinks','postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
+for(const name of ['emptyFinanceComponents','normalizeAccrualFinance','applyValidatedCompensationLinks','financeTotals','attributeOrderFinanceToSaleDate','postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
   vm.runInContext(`${extractFunction(name)};this.${name}=${name};`,context);
 }
 
@@ -102,6 +102,30 @@ assert.equal(linkedCompensation.rows[0].rawAmount,6795);
 assert.equal(linkedCompensation.rows[0].other,-6795);
 assert.equal(linkedCompensation.diagnostics.total,6795);
 
+const augustRealized=[{
+  date:'2026-08-22',recognitionDate:'2026-08-22',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',soldQty:1,originalRevenue:2000
+}];
+const rawPeriodFinance=[
+  {...context.emptyFinanceComponents(),date:'2026-09-02',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Вознаграждение за продажу',rawAmount:-300,commission:300},
+  {...context.emptyFinanceComponents(),date:'2026-09-05',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Обработка возврата',rawAmount:-140,returns:140},
+  {...context.emptyFinanceComponents(),date:'2026-09-06',postingNumber:'',orderNumber:'',sku:'',article:'',operation:'Premium подписка',rawAmount:-990,other:990},
+  {...context.emptyFinanceComponents(),date:'2026-09-07',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Компенсация Ozon',financeIncomeKind:'compensation',rawAmount:200,other:-200}
+];
+const attributed=context.attributeOrderFinanceToSaleDate(rawPeriodFinance,augustRealized);
+assert.equal(attributed.rows[0].date,'2026-08-22');
+assert.equal(attributed.rows[0].financeDate,'2026-09-02');
+assert.equal(attributed.rows[0].accountingDateSource,'order-sale-date');
+assert.equal(attributed.rows[1].date,'2026-09-05');
+assert.equal(attributed.rows[1].returnDatePolicy,'finance-date');
+assert.equal(attributed.rows[2].date,'2026-09-06');
+assert.equal(attributed.rows[2].accountingDateSource,'finance-date');
+assert.equal(attributed.rows[3].date,'2026-09-07');
+assert.equal(attributed.rows[3].accountingDateSource,'finance-date');
+assert.equal(attributed.diagnostics.shiftedRows,1);
+assert.equal(attributed.diagnostics.returnRowsKeptOnFinanceDate,1);
+assert.equal(attributed.diagnostics.positiveIncomeRowsKeptOnFinanceDate,1);
+assert.equal(attributed.diagnostics.totalDelta,0);
+
 const realizedRows=cis.rows.map(r=>({...r,returnedQty:0,netQty:r.soldQty,originalRevenue:r.soldQty*r.unitPrice,revenue:r.soldQty*r.unitPrice,retroReturnedRevenue:0}));
 const passed=context.validateRealizationPublishGate({rows:realizedRows,diagnostics:{pAndLPriceMissing:0,marketplaceBuyoutSalesExpectedPostings:1,marketplaceBuyoutSalesCoveredPostings:1,marketplaceBuyoutSalesMissingPostings:[],marketplaceBuyoutSalesInvalidRows:0}});
 assert.equal(passed.status,'passed');
@@ -118,6 +142,6 @@ assert.match(dashboardSource,/'Номер отправления Ozon':orders\.m
 assert.match(dashboardSource,/\.\.\.productOrderExportColumns\(p\)/);
 assert.match(dashboardSource,/Доходы от Ozon всего/);
 assert.match(dashboardSource,/'Компенсация Ozon':safe\(r\.compensationIncome\)/);
-assert.match(dashboardSource,/v10\.6-compensation-reconciliation/);
+assert.match(dashboardSource,/v10\.7-order-period-expenses/);
 
 console.log('Data Guard regression tests passed.');

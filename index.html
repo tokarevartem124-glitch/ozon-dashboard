@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <script>
-    window.__OZON_DASHBOARD_BUILD__ = "v10.6-compensation-reconciliation-2026-09-24";
+    window.__OZON_DASHBOARD_BUILD__ = "v10.7-order-period-expenses-2026-09-24";
     window.addDays = function(iso, delta){
       if(!iso) return null;
       const d = new Date(String(iso).slice(0,10) + "T00:00:00Z");
@@ -17,7 +17,7 @@
     };
   </script>
   <meta name="color-scheme" content="dark" />
-  <title>Ozon Seller Analytics — v10.6</title>
+  <title>Ozon Seller Analytics — v10.7</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
@@ -50,7 +50,7 @@
 <div class="app">
   <header class="topbar">
     <div class="top-inner">
-      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.6 · Compensation Reconciliation</span></div></div>
+      <div class="brand"><div class="logo">O₃</div><div>Ozon Seller Analytics <span class="muted tiny">v10.7 · Order-period Expenses</span></div></div>
       <label class="btn primary file-btn">Загрузить цены 1С<input id="fileInput" type="file" accept=".xlsx,.xls" multiple></label>
       <button class="btn" id="saveSnapshotBtn">Сохранить срез</button>
       <div class="spacer"></div>
@@ -859,10 +859,10 @@ function buildModel(){
     if(!postingNumber&&!orderNumber)return;
     const deliveryDate=withQty?(canonicalDate(r.deliveryDate)||''):'';
     const recognitionDate=withQty?(canonicalDate(r.recognitionDate||r.date)||''):'';
-    const orderDate=canonicalDate(r.orderDate)||'',financeDate=!withQty?(canonicalDate(r.date)||''):'';
+    const orderDate=canonicalDate(r.orderDate)||'',financeDate=!withQty?(canonicalDate(r.financeDate||r.date)||''):'';
     let e=null,key='';
-    // A Finance row is an expense event on its own accrual date. It may enrich an
-    // already-present delivered order, but must never overwrite/create a fake delivery date.
+    // A Finance row may use the linked sale date for management accounting. Its
+    // original Ozon accrual date remains in financeDate and never becomes delivery date.
     if(!withQty){
       for(const [k,v] of o._orderEventMap){if((postingNumber&&v.postingNumber===postingNumber)||(orderNumber&&v.orderNumber===orderNumber)){e=v;key=k;break}}
       if(!e)key=`FIN:${postingNumber||orderNumber}`;
@@ -1040,7 +1040,7 @@ function buildModel(){
     const totalWeight=sum(weights,x=>x)||candidates.length;
     candidates.forEach((e,i)=>{
       const share=weights[i]/totalWeight;
-      if(r.date)e.financeDates=[...new Set([...(e.financeDates||[]),canonicalDate(r.date)])].filter(Boolean).sort();
+      if(r.financeDate||r.date)e.financeDates=[...new Set([...(e.financeDates||[]),canonicalDate(r.financeDate||r.date)])].filter(Boolean).sort();
       e.financeComponents=e.financeComponents||Object.fromEntries(orderExpenseKeys.map(k=>[k,0]));
       for(const k of orderExpenseKeys)e.financeComponents[k]+=safe(r[k])*share;
       const positive=orderExpenseKeys.reduce((z,k)=>z+Math.max(0,-safe(r[k])),0)*share;
@@ -1049,7 +1049,7 @@ function buildModel(){
       e.compensationIncome=safe(e.compensationIncome)+compensation;
       e.otherPositiveIncome=safe(e.otherPositiveIncome)+positive-compensation;
       const lines=Array.isArray(r.chargeLines)&&r.chargeLines.length?r.chargeLines:orderExpenseKeys.filter(k=>Math.abs(safe(r[k]))>.0005).map(k=>({typeName:k,component:k,amount:safe(r[k])}));
-      for(const line of lines)e.financeLines.push({...line,amount:safe(line.amount)*share,financeDate:canonicalDate(r.date),allocationShare:share,financeScope:r.financeScope||'item'});
+      for(const line of lines)e.financeLines.push({...line,amount:safe(line.amount)*share,financeDate:canonicalDate(r.financeDate||r.date),accountingDate:canonicalDate(r.accountingDate||r.date),allocationShare:share,financeScope:r.financeScope||'item'});
     });
   }
   function allocateFinanceRowToProductEvents(o,r){
@@ -1167,7 +1167,8 @@ function buildModel(){
   const costRev={report:0,manual:0,missing:0};
   for(const o of products)costRev[o.costSource]+=safe(o.revenue);
 
-  // Standard Ozon expenses are recognized on the Finance API accrual date.
+  // Order-linked Ozon expenses use the order sale-recognition date; return-related
+  // charges and seller-level rows without an order stay on their Ozon Finance date.
   // Validated marketplace-buyout/CIS commissions and compensation-to-posting links
   // omitted by Seller API are the only business supplements:
   // they contribute EXPENSES ONLY, are allocated inside August by buyout date and never add revenue.
@@ -1255,7 +1256,7 @@ function buildModel(){
     g.rrpBase+=eventRrp;
     if(o.businessGroup==='goods'&&o.revenue>0&&eventRrp<=0)g.missingBaseRevenue+=o.revenue;
     for(const e of o.orderEvents)for(const line of e.financeLines||[]){
-      if(filterDatedRow({date:line.financeDate},p))g.directOzon+=safe(line.amount);
+      if(filterDatedRow({date:line.accountingDate||line.financeDate},p))g.directOzon+=safe(line.amount);
     }
   }
   const groupDirectOzon=sum(Object.values(groupDefs),g=>g.directOzon);
@@ -1410,7 +1411,7 @@ function renderSourceChips(){
   const counts={};for(const d of state.datasets)counts[d.type]=(counts[d.type]||0)+1;
   const labels={finance:'Финансы API',skuFinance:'SKU-финансы API',realized:'Реализация API',stock:'Остатки API',price:'Цены API',funnel:'Воронка API',cost:'Закупка 1С',rrp:'РРЦ 1С'};
   let html=Object.entries(labels).map(([k,l])=>`<span class="chip ${counts[k]?'ok':'warn'}">${l}: ${counts[k]||0}</span>`).join('');
-  html+=`<span class="chip" title="Версия интерфейса">Build: v10.6 Compensation Reconciliation</span>`;
+  html+=`<span class="chip" title="Версия интерфейса">Build: v10.7 Order-period Expenses</span>`;
   if(apiSyncStatus.loaded){const src=apiSyncStatus.source==='cache-fresh'?' · кэш, актуален':apiSyncStatus.source==='cache'?' · кэш':apiSyncStatus.source==='remote'?' · обновлено':'';const upd=apiSyncStatus.updateAvailable?' · есть обновление':'';const warn=apiSyncStatus.error?' warn':' ok';html+=`<span id="${apiSyncStatus.updateAvailable?'apiRetryChip':''}" class="chip${warn}" style="${apiSyncStatus.updateAvailable?'cursor:pointer':''}" title="${escapeHtml(apiSyncStatus.error||'')}">Данные: ${new Date(apiSyncStatus.generatedAt).toLocaleString('ru-RU')}${src}${upd}</span>`}
   else if(apiSyncStatus.loading)html+=`<span class="chip">Данные: загрузка…</span>`;
   else if(apiSyncStatus.error)html+=`<span id="apiRetryChip" class="chip bad" style="cursor:pointer" title="${escapeHtml(apiSyncStatus.error)}">API: ошибка · повторить</span>`;
@@ -1456,7 +1457,7 @@ function renderQuality(){
   const grossCtl=q.deliveryGrossMonthlyValidation?`${q.deliveryGrossMonthlyValidation.ok?'<span class="positive">OK</span>':'<span class="warning">не сошлась</span>'}`:'нет контроля';
   const gateText=gate?`${gate.status==='passed'?'<span class="positive">пройден</span>':'<span class="warning">заблокирован</span>'} · ${fmtNum(gate.rowCount||0)} строк · дубли ${fmtNum(gate.duplicateRows||0)} · ошибки возвратов ${fmtNum(gate.returnOverSaleRows||0)} · ошибки выручки ${fmtNum(gate.revenueBridgeRows||0)}`:'ожидается следующая синхронизация';
   const cisCoverage=q.marketplaceBuyoutSalesExpectedPostings?`${fmtNum(q.marketplaceBuyoutSalesCoveredPostings)}/${fmtNum(q.marketplaceBuyoutSalesExpectedPostings)} отправлений`:'нет подтверждённого слоя';
-  $('#dataQuality').innerHTML=`<b>Контроль данных v10.6.</b> Ozon — <b>Seller API + валидированные слои комиссий СНГ и связей компенсаций</b>.
+  $('#dataQuality').innerHTML=`<b>Контроль данных v10.7.</b> Ozon — <b>Seller API + валидированные слои комиссий СНГ и связей компенсаций</b>.
     Каталог: ${fmtNum(q.currentOzonArticles)} артикулов · закупка ${fmtPct(costCatalogPct)} · РРЦ ${fmtPct(rrpCatalogPct)}.
     <b>Выручка:</b> ${fmtMoney(m.totalRevenue)} — Σ(products.price × quantity) подтверждённых доставок, отнесённых в период по дате положительного Finance-начисления. Подтверждённый СНГ-отчёт добавляет продажу только если отправление полностью отсутствует в Seller API: покрытие ${cisCoverage}, резерв ${fmtNum(q.marketplaceBuyoutSalesFallbackRows)} строк на ${fmtMoney(q.marketplaceBuyoutSalesFallbackRevenue)}. Будущие возвраты ретроспективно уменьшают исходную продажу.
     <b>Доходы Ozon:</b> продажи ${fmtMoney(m.totalRevenue)} + компенсации ${fmtMoney(m.compensationIncome)} + другие положительные начисления ${fmtMoney(m.otherPositiveAccruals)} = ${fmtMoney(m.totalOzonIncome)}. <b>Расходы Ozon:</b> валовые списания ${fmtMoney(m.financeOzonExpensesGross)}; в том числе комиссии СНГ ${fmtMoney(m.marketplaceBuyoutExpenses)}. После Ozon ${fmtMoney(m.afterOzon)}.
@@ -1555,7 +1556,7 @@ function financeQualityStatus(){
 function renderOverview(){
   const m=currentModel,top=[...m.complete].sort((a,b)=>b.cleanProfit-a.cleanProfit).slice(0,5),bottom=[...m.complete].sort((a,b)=>a.cleanProfit-b.cleanProfit).slice(0,5),fq=financeQualityStatus(),q=m.quality||{};
   $('#tab-overview').innerHTML=`
-  <div class="card clickable" data-drill="auditSample" style="margin-bottom:12px"><h3>Контроль качества товарной экономики</h3><div class="grid g4" style="margin-top:8px"><div><div class="muted tiny">точность даты доставки</div><div class="big ${fq.deliveryOk?'positive':'warning'}">${fq.deliveryCoverage==null?'—':fmtPct(fq.deliveryCoverage)}</div></div><div><div class="muted tiny">дельта расходов Finance</div><div class="big ${fq.expenseReconcile<1?'positive':'negative'}">${fmtMoney(fq.expenseReconcile)}</div></div><div><div class="muted tiny">дельта direct SKU net</div><div class="big ${fq.skuReconcile<1?'positive':'negative'}">${fmtMoney(fq.skuReconcile)}</div></div><div><div class="muted tiny">статус</div><div class="big ${fq.ok?'positive':'warning'}">${fq.ok?'контроль пройден':'нужна проверка'}</div></div></div><div class="muted tiny" style="margin-top:8px">Выручка/количество/закупка/РРЦ — по дате Finance-начисления продажи. Дата доставки хранится для аудита. Расходы Ozon — по дате начисления Finance API. Общие расходы Ozon без SKU: ${fmtNum(fq.unallocatedRows)} строк · ${fmtMoney(fq.unallocatedExpenses)}; по товарам не распределяются.</div><div class="drill-hint">Открыть контрольную выборку 20 SKU →</div></div>
+  <div class="card clickable" data-drill="auditSample" style="margin-bottom:12px"><h3>Контроль качества товарной экономики</h3><div class="grid g4" style="margin-top:8px"><div><div class="muted tiny">точность даты доставки</div><div class="big ${fq.deliveryOk?'positive':'warning'}">${fq.deliveryCoverage==null?'—':fmtPct(fq.deliveryCoverage)}</div></div><div><div class="muted tiny">дельта расходов Finance</div><div class="big ${fq.expenseReconcile<1?'positive':'negative'}">${fmtMoney(fq.expenseReconcile)}</div></div><div><div class="muted tiny">дельта direct SKU net</div><div class="big ${fq.skuReconcile<1?'positive':'negative'}">${fmtMoney(fq.skuReconcile)}</div></div><div><div class="muted tiny">статус</div><div class="big ${fq.ok?'positive':'warning'}">${fq.ok?'контроль пройден':'нужна проверка'}</div></div></div><div class="muted tiny" style="margin-top:8px">Продажа и обычные расходы связанного заказа учитываются по дате Finance-начисления продажи. Возвратные списания и общие расходы без заказа — по фактической Finance-дате. Дата доставки хранится для аудита. Общие расходы Ozon без SKU: ${fmtNum(fq.unallocatedRows)} строк · ${fmtMoney(fq.unallocatedExpenses)}; по товарам не распределяются.</div><div class="drill-hint">Открыть контрольную выборку 20 SKU →</div></div>
   <div class="card" style="margin-bottom:12px"><h3>Начисления Ozon без связи с заказом</h3><div class="muted tiny" style="margin-bottom:8px">Эти начисления не распределяются между заказами и товарами. Они уменьшают только итог бизнеса за выбранный период.</div>${periodChargesTable(m.periodChargeRows,m.periodOzonExpenses)}</div>
   <div class="grid g2"><div class="card"><h3>Что важно по выбранному периоду</h3><div class="insights">${insightCards(m).map(([h,t])=>{const d=insightDrillType(h);return`<div class="insight ${d?'clickable':''}" ${d?`data-drill="${d}"`:''}><strong>${escapeHtml(h)}</strong><span class="muted">${escapeHtml(t)}</span>${d?'<div class="drill-hint">Показать детализацию →</div>':''}</div>`}).join('')}</div></div><div class="card"><h3>Нитка результата бизнеса</h3><div id="waterfallNote" class="muted tiny" style="margin-bottom:8px"></div><div id="waterfallEmpty" class="empty hidden"></div><div class="chartbox"><canvas id="waterfallChart"></canvas></div></div></div>
   <div class="grid g2" style="margin-top:12px"><div class="card"><h3>Тренд сохранённых срезов</h3><div class="muted tiny" style="margin-bottom:8px">История строится только по кнопке «Сохранить срез» и не подменяет фактическую дневную историю API.</div><div id="trendEmpty" class="empty hidden"></div><div class="chartbox small"><canvas id="trendChart"></canvas></div></div><div class="card"><h3>ABC по товарной прибыли</h3><div id="abcEmpty" class="empty hidden"></div><div class="chartbox small"><canvas id="abcChart"></canvas></div></div></div>
@@ -1869,7 +1870,7 @@ function drillDefinition(type,payload={}){
   let def={type,title:'Детализация',subtitle:`Период: ${drillPeriodText()}`,kind:'products',rows:[],columns:cols,sort:'revenue',dir:-1,note:'',stats:[]};
   if(type==='revenue')Object.assign(def,{title:'Выручка Ozon — продажи по дате Finance',rows:m.products.filter(p=>Math.abs(safe(p.revenue))>.005),columns:[...cols,number('units','Реализовано, шт.'),money('revenue','Выручка'),percent('revenueShare','Доля')],sort:'revenue',stats:[{label:'Выручка',value:fmtMoney(m.totalRevenue)},{label:'Уникальных SKU с выручкой',value:fmtNum(m.products.filter(p=>p.revenue>0).length)},{label:'Товарных строк продаж',value:fmtNum((m.orderRows||[]).filter(r=>safe(r.soldQty)>0).length)},{label:'Реализовано net, шт.',value:fmtNum(sum(m.products,p=>Math.max(0,safe(p.units))),0)},{label:'Отправлений с выручкой',value:fmtNum(new Set((m.orderRows||[]).filter(r=>safe(r.revenue)>0).map(r=>r.postingNumber).filter(Boolean)).size)},{label:'Finance-период',value:drillPeriodText()}]});
   else if(type==='ozonIncome')Object.assign(def,{title:'Доходы от Ozon — продажи и положительные начисления',kind:'ozonIncome',stats:[{label:'Выручка от продаж',value:fmtMoney(m.totalRevenue)},{label:'Компенсации',value:fmtMoney(m.compensationIncome)},{label:'Другие положительные начисления',value:fmtMoney(m.otherPositiveAccruals)},{label:'Доходы от Ozon всего',value:fmtMoney(m.totalOzonIncome),cls:'positive'}],note:'Компенсация не увеличивает количество проданных товаров и выручку от продаж. Связь с отправлением берётся из Seller API либо из валидированного отчёта Ozon, если API возвращает только обезличенное начисление. Начисления без подтверждённой связи остаются на уровне периода.'});
-  else if(type==='ozonNet')Object.assign(def,{title:'Расходы и результат после услуг Ozon',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money('positiveOzonAccruals','Положительные начисления'),money(p=>productOzonCost(p),'Чистые начисления Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Доходы от Ozon всего',value:fmtMoney(m.totalOzonIncome)},{label:'Все списания Ozon',value:fmtMoney(m.financeOzonExpensesGross)},{label:'Положительные начисления',value:fmtMoney(m.financeOzonRefunds)},{label:'Комиссии СНГ',value:fmtMoney(m.marketplaceBuyoutExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Доходы от Ozon всего включают выручку от продаж, компенсации и другие положительные начисления. Чистые начисления по товару = списания минус положительные начисления; отрицательное значение означает, что положительных начислений больше. Валовые списания признаются по датам Finance API. Операции без связи с заказом учитываются только в общем P&L.'});
+  else if(type==='ozonNet')Object.assign(def,{title:'Расходы и результат после услуг Ozon',rows:m.products.filter(p=>Math.abs(safe(p.revenue))+Math.abs(safe(p.netAfterOzon))>.005),columns:[...cols,money('revenue','Выручка'),money('positiveOzonAccruals','Положительные начисления'),money(p=>productOzonCost(p),'Чистые начисления Ozon'),money('netAfterOzon','После Ozon'),number('units','Net, шт.')],sort:'netAfterOzon',stats:[{label:'Доходы от Ozon всего',value:fmtMoney(m.totalOzonIncome)},{label:'Все списания Ozon',value:fmtMoney(m.financeOzonExpensesGross)},{label:'Положительные начисления',value:fmtMoney(m.financeOzonRefunds)},{label:'Комиссии СНГ',value:fmtMoney(m.marketplaceBuyoutExpenses)},{label:'После Ozon',value:fmtMoney(m.afterOzon)}],note:'Доходы от Ozon всего включают выручку от продаж, компенсации и другие положительные начисления. Обычные списания связанного заказа относятся к периоду его продажи. Возвратные списания и операции без связи с заказом учитываются по фактической Finance-дате; общие операции не распределяются по SKU.'});
   else if(type==='external')Object.assign(def,{title:'Внешние расходы вне Ozon',kind:'external',stats:[{label:'Всего',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown),cls:ext?.complete?'':'warning'},{label:'Репрайсер',value:fmtMoney(ext?.repricer)},{label:'Премии магазинам',value:fmtMoney(ext?.storeBonus)},{label:'Наёмная логистика',value:fmtMoney(ext?.hiredKnown)}],note:'Это расходы бизнеса, которых нет в кабинете Ozon. Они не распределяются на SKU и учитываются только на уровне общего P&L.'});
   else if(type==='management')Object.assign(def,{title:'Управленческий остаток — состав',kind:'management',stats:[{label:'После Ozon',value:fmtMoney(m.afterOzon)},{label:'Внешние расходы',value:ext?.complete?fmtMoney(ext.total):fmtMoney(ext?.totalKnown)},{label:'Управленческий остаток',value:m.managementRemainder!=null?fmtMoney(m.managementRemainder):fmtMoney(m.managementRemainderKnown),cls:ext?.complete?'positive':'warning'}],note:'Управленческий остаток = доходы от Ozon всего − валовые списания Ozon − внешние операционные расходы. Закупка и УСН здесь ещё не вычтены.'});
   else if(type==='businessGroups')Object.assign(def,{title:'Нормативы двух товарных групп',kind:'groups',stats:[{label:'Покрытие групп',value:fmtPct(m.groupCoverage),cls:m.unclassifiedRevenue?'warning':'positive'},{label:'Общая цель',value:fmtMoney(m.combinedTarget)},{label:'Деньги после расходов',value:m.combinedCash!=null?fmtMoney(m.combinedCash):'нет итоговой оценки'},{label:'Выполнение плана',value:m.combinedPlanAttainment!=null?fmtPct(m.combinedPlanAttainment):'нет итоговой оценки',cls:m.combinedPlanAttainment!=null?(m.combinedPlanAttainment>=100?'positive':'negative'):'warning'}],note:'Расходы без связи с заказом и внешние расходы не попадают в заказы/SKU. Только для итоговых коэффициентов они распределяются между двумя группами пропорционально выручке, чтобы сумма сходилась с общим P&L.'});
@@ -2032,7 +2033,7 @@ const chartDefaults={responsive:true,maintainAspectRatio:false,plugins:{legend:{
 function renderChartsForTab(tab){requestAnimationFrame(()=>{if(tab==='overview')renderOverviewCharts();if(tab==='ads')renderFunnelChart();if(tab==='stock')renderStockChart()})}
 function renderOverviewCharts(){
   const m=currentModel,ext=m.externalExpenses,note=$('#waterfallNote');
-  if(note)note.textContent=`Источники Ozon: выручка — подтверждённые продажи по дате Finance-начисления; расходы — Finance API по дате начисления. Дата доставки хранится отдельно для аудита. Нитка: выручка → расходы Ozon → внешние расходы → управленческий остаток → закупка → УСН. Норматив РРЦ × 0,92 показан отдельным KPI и не вычитается из прибыли.${ext?.missingHired.length?' Наёмная логистика неполная: '+ext.missingHired.join(', ')+'.':''}`;
+  if(note)note.textContent=`Источники Ozon: выручка — подтверждённые продажи по дате Finance-начисления; обычные расходы заказа — по периоду этой продажи; возвратные и общие списания — по фактической Finance-дате. Дата доставки хранится отдельно для аудита. Нитка: выручка → расходы Ozon → внешние расходы → управленческий остаток → закупка → УСН. Норматив РРЦ × 0,92 показан отдельным KPI и не вычитается из прибыли.${ext?.missingHired.length?' Наёмная логистика неполная: '+ext.missingHired.join(', ')+'.':''}`;
   if(!m.financeDs.length){
     $('#waterfallEmpty')?.classList.remove('hidden');if($('#waterfallEmpty'))$('#waterfallEmpty').textContent='Нет финансового ledger Ozon API.';destroyChart('waterfallChart');
   }else{
