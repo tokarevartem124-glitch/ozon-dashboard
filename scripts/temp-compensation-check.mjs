@@ -76,11 +76,24 @@ async function cashFlow(from,to){
   return post('/v1/finance/cash-flow-statement/list',{date:{from:from+'T00:00:00.000Z',to:to+'T23:59:59.999Z'},page:1,page_size:1000,with_details:true});
 }
 
+async function dailyCashFlow(from,to){
+  const rows=[];
+  for(let day=from;day<=to;day=addDay(day)){
+    rows.push({day,response:await cashFlow(day,day)});
+    await sleep(120);
+  }
+  return rows;
+}
+
 const payload={
   generatedAt:new Date().toISOString(),
   postingNumber:POSTING,claimNumber:CLAIM,sku:SKU,
   posting:await post('/v3/posting/fbs/get',{posting_number:POSTING,with:{analytics_data:true,barcodes:false,financial_data:true,legal_info:false,translit:false}}),
   accrualPostings:await post('/v1/finance/accrual/postings',{posting_numbers:[POSTING]}),
+  dailyCashFlow:{
+    july:await dailyCashFlow('2026-07-01','2026-07-31'),
+    august:await dailyCashFlow('2026-08-01','2026-08-31')
+  },
   cashFlow:{
     june:await cashFlow('2026-06-01','2026-06-30'),
     july:await cashFlow('2026-07-01','2026-07-31'),
