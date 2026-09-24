@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
 /*
-  Ozon Seller Analytics — Seller API + validated supplements sync (v9.3 Fast Load)
+  Ozon Seller Analytics — Seller API + validated supplements sync (v10.5 Compensation Links)
 
   Source policy:
     - operational Ozon data comes from Seller API;
@@ -39,7 +39,7 @@ const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
 const DAILY_QTY_VERSION = 6;
 const QUANTITY_ENGINE_VERSION = 12;
-const FINANCE_ATTRIBUTION_VERSION = 8;
+const FINANCE_ATTRIBUTION_VERSION = 9;
 const DELIVERY_STATUS_DATE_VERSION = 4;
 // Increment when posting-derived order metadata changes. This forces a one-time
 // full posting refresh so historical orders do not keep stale/fallback dates.
@@ -392,6 +392,8 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
     const operation=asStr(typeNames.get(asNum(first(acc.accrual_id,acc.type_id),NaN))||`Accrual ${first(acc.accrual_id,acc.type_id)}`);
     const group=asStr(acc.accrued_category);
     const isPeriodAdjustment=/компенсац|декомпенсац|начислени.{0,8}по спору|compensation|dispute/i.test(`${group} ${operation}`);
+    const amount=money(acc.total_amount);
+    const isCompensationIncome=isPeriodAdjustment&&amount>0;
     const bySku=new Map();
 
     const ensureSku=(sku)=>{
@@ -400,7 +402,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       if(!bySku.has(sku))bySku.set(sku,{
         date,
         article:asStr(maps.articleBySku.get(sku)),
-        sku,
+        sku,name:asStr(maps.nameBySku.get(sku)),
         postingNumber,financeUnitNumber:unitNumber,
         orderId:asStr(orderMeta.orderId),orderNumber,orderDate:asStr(orderMeta.orderDate),orderDateSource:asStr(orderMeta.orderDateSource),orderSchema:asStr(orderMeta.orderSchema),
         itemSkus:[sku],
@@ -412,6 +414,7 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         soldQty:0,returnedQty:0,financeQtyResolved:0,financeQtyUnresolved:0,
         ...emptyFinanceComponents(),
         rawAmount:0,
+        compensationIncome:0,financeIncomeKind:'',
         financeSource:'accrual/by-day',
         financeAttribution:'direct_sku',
         financeScope:postingNumber?'posting_item':(orderNumber?'order_item':'item'),
@@ -498,6 +501,9 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       }
     }
 
+    const linkedProducts=(orderMeta?.products||[]).map(x=>({
+      article:asStr(x.article),sku:asStr(x.sku),name:asStr(x.name),quantity:Math.max(0,asNum(x.quantity,0)),price:asNum(x.price,0)
+    })).filter(x=>x.article||x.sku);
     const unallocated={
       date,article:'',sku:'',postingNumber,financeUnitNumber:unitNumber,
       orderId:asStr(orderMeta.orderId),orderNumber,orderDate:asStr(orderMeta.orderDate),orderDateSource:asStr(orderMeta.orderDateSource),orderSchema:asStr(orderMeta.orderSchema),
@@ -507,11 +513,11 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       grossRevenue:0,sellerPriceRaw:0,salePriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,soldQty:0,returnedQty:0,financeQtyResolved:0,financeQtyUnresolved:0,
       ...emptyFinanceComponents(),
       rawAmount:0,financeSource:'accrual/by-day',
+      compensationIncome:0,financeIncomeKind:isCompensationIncome?'compensation':'',linkedProducts,
       financeAttribution:'unallocated',
-      // Compensation/dispute adjustments are seller-level accounting events even
-      // when Ozon leaves a posting number in unit_number. They affect only the
-      // period result and must not be allocated into order/SKU unit economics.
-      financeScope:isPeriodAdjustment?'period':((postingNumber||orderNumber)?'order':'period'),
+      // A compensation keeps the order/posting link when Ozon supplies one. Only
+      // truly seller-level adjustments remain at period level.
+      financeScope:(postingNumber||orderNumber)?'order':'period',
       chargeLines:[],
       parentAccrualId:`${date}:${asStr(acc.unit_number)}:${asStr(first(acc.accrual_id,acc.type_id))}:${stable}`
     };
@@ -547,7 +553,6 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       unallocated.rawAmount=-costs;
     }
 
-    const amount=money(acc.total_amount);
     const currentNet=[...bySku.values()].reduce((sum,r)=>sum+asNum(r.rawAmount,0),0)+asNum(unallocated.rawAmount,0);
     const delta=amount-currentNet;
     if(Math.abs(delta)>0.005){
@@ -555,6 +560,38 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
       unallocated.rawAmount+=delta;
       unallocated.chargeLines.push({typeId:null,typeName:'Корректировка сверки начисления',component:'other',amount:-delta});
       hasUnallocated=true;
+    }
+
+    // Link compensation/dispute income to the products of its order. It is still
+    // not sales revenue and does not add sold quantity, but it becomes visible in
+    // order/SKU drill-down and is shared only inside that order by item value.
+    const compensationTargets=linkedProducts.map(prod=>{
+      const sku=prod.sku||asStr([...bySku.keys()].find(x=>asStr(maps.articleBySku.get(x))===prod.article));
+      const row=ensureSku(sku);
+      return row?{prod,row,weight:Math.max(0,prod.price*prod.quantity)||Math.max(0,prod.quantity)||1}:null;
+    }).filter(Boolean);
+    if(isPeriodAdjustment&&(postingNumber||orderNumber)&&compensationTargets.length&&Math.abs(unallocated.rawAmount)>0.005){
+      const weightTotal=compensationTargets.reduce((z,x)=>z+x.weight,0)||compensationTargets.length;
+      const baseComponents=Object.fromEntries(compKeys.map(k=>[k,asNum(unallocated[k],0)]));
+      const baseNet=asNum(unallocated.rawAmount,0);
+      compensationTargets.forEach(({prod,row,weight})=>{
+        if(!row.article&&prod.article)row.article=prod.article;
+        if(!row.name&&prod.name)row.name=prod.name;
+        const share=weight/weightTotal;
+        for(const k of compKeys)row[k]+=baseComponents[k]*share;
+        row.rawAmount+=baseNet*share;
+        row.compensationIncome+=Math.max(0,amount)*share;
+        row.financeIncomeKind=isCompensationIncome?'compensation':'';
+        row.financeAttribution='direct_sku';
+        row.financeScope=postingNumber?'posting_item':'order_item';
+        row.chargeLines.push(...unallocated.chargeLines.map(line=>({...line,amount:asNum(line.amount,0)*share,incomeKind:'compensation'})));
+      });
+      for(const k of compKeys)unallocated[k]=0;
+      unallocated.rawAmount=0;
+      unallocated.compensationIncome=0;
+      hasUnallocated=Math.abs(unallocated.rawAmount)>0.005||compKeys.some(k=>Math.abs(asNum(unallocated[k],0))>0.005);
+    }else if(isCompensationIncome){
+      unallocated.compensationIncome=amount;
     }
 
     for(const row of bySku.values()){
@@ -1811,12 +1848,12 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   if(buyoutSales.missingPostings.length)warnings.push(`Validated marketplace-buyout sale coverage: ${buyoutSales.missingPostings.length} posting(s) are still missing: ${buyoutSales.missingPostings.slice(0,10).join(', ')}`);
   const recognition=applyFinanceRecognitionDates(deliveredSales.rows,financeRows);
   deliveredSales.rows=recognition.rows;
-  console.log(`Sale recognition date v10.4: finance=${recognition.financeDated}; fallback=${recognition.fallbackDated}; ambiguous=${recognition.ambiguous}`);
+  console.log(`Sale recognition date v10.5: finance=${recognition.financeDated}; fallback=${recognition.fallbackDated}; ambiguous=${recognition.ambiguous}`);
   const baseReturnEvents=[...quantityMonthSegments.flatMap(s=>s.returnRows||[]),...currentEventRows.filter(r=>asNum(r.returnedQty,0)>0)]
     .map(r=>({...r,soldQty:0,netQty:-Math.abs(asNum(r.returnedQty,0)),deliveryDate:'',deliveryDateExact:null,deliveryDateSource:''}));
   const returnSupplement=supplementReturnsFromReturnsApi(baseReturnEvents,returnRows,deliveredSales.rows,postingMap,maps);
   const returnEvents=returnSupplement.rows;
-  if(returnSupplement.addedRows)console.log(`Returns API supplement v10.4: rows=${returnSupplement.addedRows}; units=${returnSupplement.addedUnits}`);
+  if(returnSupplement.addedRows)console.log(`Returns API supplement v10.5: rows=${returnSupplement.addedRows}; units=${returnSupplement.addedUnits}`);
   const pAndLEvents=[...deliveredSales.rows,...returnEvents];
   const retro=applyRetroactiveReturns(pAndLEvents,postingMap,BUSINESS_START,{historyStart:HISTORY_START,fbsComplete:deliveryHistoryContext?.fbsComplete===true},returnRows);
   let rows=retro.rows.filter(r=>r.date&&r.date>=BUSINESS_START&&r.date<=targetEnd);
@@ -1870,12 +1907,12 @@ async function buildDailyBusinessRealization(previous,maps,financeRows,postingMa
   if(orphanReturnDiagnostics.length)logOrphanReturnDiagnostics(orphanReturnDiagnostics);
   if(retro.orphanReturns.length)warnings.push(`Delivered P&L: ${retro.orphanReturns.length} return event rows (${orphanReturnUnits} units) cannot be matched to a delivered sale or proven to be pre-period; principal is not double-counted. See UNMATCHED RETURN DIAGNOSTIC v9.0 lines above.`);
   if(prePeriodReturnUnits)console.log(`Delivered P&L pre-period return context: ${retro.prePeriodReturns.length} row(s), ${prePeriodReturnUnits} unit(s); original delivery is before ${BUSINESS_START}, so current-period revenue is not reduced again.`);
-  console.log(`Delivered-order engine v10.4 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; closedComplete=${closedComplete}; currentPosting=${currentRealizationPostingAvailable}; currentFallback=${!currentRealizationPostingAvailable}; currentUnresolved=${currentUnresolved}; sourceMonthlyReconcile=${sourceMonthlyOk}; currentDailyTimingAudit=${finalCurrentDailyValidation.ok}; financeRecognition=${recognition.financeDated}; recognitionFallback=${recognition.fallbackDated}; returnsApiSupplement=${returnSupplement.addedUnits}; retroReturnedUnits=${retro.retroReturnedUnits}; prePeriodReturnUnits=${prePeriodReturnUnits}; inexactDeliveryRows=${inexactDeliveryRows}; complete=${complete}`);
+  console.log(`Delivered-order engine v10.5 ${BUSINESS_START}..${targetEnd}: rows=${rows.length}; closedComplete=${closedComplete}; currentPosting=${currentRealizationPostingAvailable}; currentFallback=${!currentRealizationPostingAvailable}; currentUnresolved=${currentUnresolved}; sourceMonthlyReconcile=${sourceMonthlyOk}; currentDailyTimingAudit=${finalCurrentDailyValidation.ok}; financeRecognition=${recognition.financeDated}; recognitionFallback=${recognition.fallbackDated}; returnsApiSupplement=${returnSupplement.addedUnits}; retroReturnedUnits=${retro.retroReturnedUnits}; prePeriodReturnUnits=${prePeriodReturnUnits}; inexactDeliveryRows=${inexactDeliveryRows}; complete=${complete}`);
   for(const m of sourceMonthlyValidation.months)console.log(`Source quantity reconcile ${m.month}: sold=${m.dailySold}/${m.officialSold}; returns=${m.dailyReturned}/${m.officialReturned}; net=${m.dailyNet}/${m.officialNet}; absSkuDelta=${m.absSkuDelta}; ok=${m.ok}`);
 
   return {
     rows,
-    segments:[{key:`Q10.4:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'v10.4 delivered FBS postings with item-level guard; sales recognized on positive Finance accrual date; Returns API supplements missing return events; products.price × quantity; future returns applied retroactively',rows}],
+    segments:[{key:`Q10.5:${BUSINESS_START}_${targetEnd}`,kind:'daily',start:BUSINESS_START,end:targetEnd,complete,official:false,source:'v10.5 delivered FBS postings with item-level guard; sales recognized on positive Finance accrual date; Returns API supplements missing return events; products.price × quantity; future returns applied retroactively',rows}],
     officialSegments:controls.segments,quantityMonthSegments,
     coverage:{start:BUSINESS_START,end:targetEnd,complete,gaps:[]},
     diagnostics:{monthlyLoaded:controls.diagnostics.monthlyLoaded,dailyLoaded:controls.diagnostics.dailyLoaded,dailyPremiumAvailable:controls.diagnostics.dailyPremiumAvailable,dailyErrors:controls.diagnostics.dailyErrors,quantityEngineVersion:QUANTITY_ENGINE_VERSION,quantityMonths:monthDiagnostics,ambiguousPartsBeforeAccrual:accrualNeed.parts,accrualPostingsRequested:accrualNeed.postingNumbers.length,accrualPostingBatches:accrualFetch.batches,accrualPostingFailedBatches:accrualFetch.failedBatches,currentOfficialDays:officialDaily.filter(s=>monthKey(s.start)===currentYm).length,currentMissingDays:currentOfficialCoverage?.missingDays?.length||0,fallbackUnresolvedSaleOps:currentUnresolved,fallbackUnresolvedReturnOps:currentFallbackReturnUnresolved,currentFallbackPriceMissing,pAndLPriceMissing,deliveredPostingRows:deliveredSales.rows.length,excludedDeliveredProductRows:deliveredSales.excludedDeliveredProductRows,excludedDeliveredProductUnits:deliveredSales.excludedDeliveredProductUnits,excludedDeliveredProductGross:deliveredSales.excludedDeliveredProductGross,excludedDeliveredProductSample:deliveredSales.excludedRows.slice(0,25),marketplaceBuyoutSalesExpectedPostings:buyoutSales.expectedPostings,marketplaceBuyoutSalesCoveredPostings:buyoutSales.coveredPostings,marketplaceBuyoutSalesFallbackRows:buyoutSales.added.length,marketplaceBuyoutSalesFallbackRevenue:buyoutSales.added.reduce((z,r)=>z+asNum(r.soldQty,0)*asNum(r.unitPrice,0),0),marketplaceBuyoutSalesMissingPostings:buyoutSales.missingPostings,marketplaceBuyoutSalesInvalidRows:buyoutSales.invalid.length,financeRecognitionRows:recognition.financeDated,financeRecognitionFallbackRows:recognition.fallbackDated,financeRecognitionAmbiguousRows:recognition.ambiguous,returnsApiSupplementRows:returnSupplement.addedRows,returnsApiSupplementUnits:returnSupplement.addedUnits,nonFbsDeliveredWithoutExactDate:deliveredSales.nonFbsDeliveredWithoutExactDate,retroReturnedUnits:retro.retroReturnedUnits,retroReturnedRevenue:retro.retroReturnedRevenue,inexactDeliveryRows,unresolvedDeliveryDates,orphanReturnRows:retro.orphanReturns.length,orphanReturnUnits,orphanReturnDiagnostics,prePeriodReturnRows:retro.prePeriodReturns.length,prePeriodReturnUnits,currentRealizationPostingAvailable,currentPostingError,currentFallbackValidation,currentOfficialCoverage,finalCurrentDailyValidation,monthlyValidation:sourceMonthlyValidation}
@@ -2039,7 +2076,7 @@ const dailyRealizationSegments=realization.segments.filter(s=>s.kind==='daily'&&
 const dailyRealizationStart=dailyRealizationSegments.map(s=>s.start).filter(Boolean).sort()[0]||null;
 const dailyRealizationEnd=dailyRealizationSegments.map(s=>s.end).filter(Boolean).sort().at(-1)||null;
 if(funnelRows.length)datasets.push({id:`api-funnel-${salesStart}_${salesEnd}`,apiAuto:true,type:'funnel',label:'Воронка Ozon API',sheetName:'analytics/data',sourceName:'Ozon Seller API',start:salesStart,end:salesEnd,snapshot:null,importedAt:generatedAt,capabilities:{funnel:true,api:true,topTrafficDetail:true,periodSegmented:true,note:'Для SKU детализация до 1000 товаров с наибольшим трафиком на каждом сегменте.'},rows:funnelRows});
-if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Продажи Ozon по дате Finance',sheetName:'sales v10.4: delivered postings recognized by positive Finance accrual date + Returns API',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,financeRecognitionDate:true,officialMonthlyValidation:true,officialPostingQuantities:true,dailyArbitrary:true,quantityEngineVersion:QUANTITY_ENGINE_VERSION,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
+if(realization.rows.length)datasets.push({id:`api-realized-${realizedRange.start}_${realizedRange.end}`,apiAuto:true,type:'realized',label:'Продажи Ozon по дате Finance',sheetName:'sales v10.5: delivered postings recognized by positive Finance accrual date + Returns API',sourceName:'Ozon Seller API',start:realizedRange.start,end:realizedRange.end,snapshot:null,importedAt:generatedAt,capabilities:{realizedQty:true,api:true,returnsExact:true,financeRecognitionDate:true,officialMonthlyValidation:true,officialPostingQuantities:true,dailyArbitrary:true,quantityEngineVersion:QUANTITY_ENGINE_VERSION,coverageComplete:realization.coverage.complete,coverageGaps:realization.coverage.gaps,dailyCoverageStart:realizedRange.start,dailyCoverageEnd:realizedRange.end,monthlyValidation:realization.diagnostics.monthlyValidation},rows:realization.rows});
 if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'stock',label:'Остатки Ozon API',sheetName:stockComplete?stockResult.source:(previousStock?.sheetName||'previous API snapshot'),sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{stock:true,prices:true,api:true,complete:stockComplete},rows:stockRows});
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
@@ -2085,6 +2122,6 @@ const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolic
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.4 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Returns API supplements return events missing from realization reports. Compensation and dispute adjustments stay at period level and are never allocated into order or SKU unit economics. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.5 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus the validated August marketplace-buyout/CIS commission supplement. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Returns API supplements return events missing from realization reports. Compensation and dispute income remains separate from sales revenue: when Ozon supplies an order or posting link it is attributed only inside that order by item value and appears in order/SKU unit economics; seller-level adjustments remain separate period rows. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
 console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
