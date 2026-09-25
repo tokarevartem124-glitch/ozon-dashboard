@@ -87,6 +87,20 @@ assert.equal(compensationRows[0].compensationIncome,6795);
 assert.equal(compensationRows[0].other,-6795);
 assert.equal(compensationRows[0].rawAmount,6795);
 
+const itemCompensationRows=context.normalizeAccrualFinance([{
+  date:'2026-08-16',unit_number:'order-compensation',accrual_id:7002,total_amount:6795,
+  item_fees:{fees:[{sku:'sku-main',quantity:1,fees:[{type_id:25,accrued:6795}]}]}
+}],maps,new Map([[25,'Товарная компенсация']]),{
+  [compensationPosting]:{postingNumber:compensationPosting,orderNumber:'order-compensation',orderDate:'2026-07-17',orderSchema:'FBS',products:[{sku:'sku-main',article:'4466',name:'Компенсированный товар',quantity:1,price:6795}]}
+});
+assert.equal(itemCompensationRows.length,1);
+assert.equal(itemCompensationRows[0].orderNumber,'order-compensation');
+assert.equal(itemCompensationRows[0].financeScope,'order_item');
+assert.equal(itemCompensationRows[0].financeIncomeKind,'compensation');
+assert.equal(itemCompensationRows[0].compensationIncome,6795);
+assert.equal(itemCompensationRows[0].other,-6795);
+assert.equal(itemCompensationRows[0].rawAmount,6795);
+
 const anonymousCompensation=[{
   date:'2026-08-07',article:'',sku:'',postingNumber:'',orderNumber:'',financeScope:'period',financeAttribution:'unallocated',
   transactionId:'anonymous-6795',grossRevenue:null,rawAmount:6795,compensationIncome:0,...context.emptyFinanceComponents(),other:-6795,
