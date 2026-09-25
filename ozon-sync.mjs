@@ -390,7 +390,14 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
     const orderNumber=asStr(first(postingMeta?.orderNumber,orderCandidates.length?unitNumber:''));
     const orderMeta=postingMeta||orderCandidates[0]||{};
     const stable=crypto.createHash('sha1').update(JSON.stringify(acc)).digest('hex').slice(0,16);
-    const operation=asStr(typeNames.get(asNum(first(acc.accrual_id,acc.type_id),NaN))||`Accrual ${first(acc.accrual_id,acc.type_id)}`);
+    const detailedTypeIds=[
+      acc?.non_item_fee?.type_id,
+      ...feeGroups.flatMap(g=>(g?.fees||[]).map(f=>f?.type_id)),
+      ...(acc?.container_fees?.fees||[]).map(f=>f?.type_id)
+    ].map(x=>asNum(x,NaN)).filter(Number.isFinite);
+    const uniqueDetailedTypeIds=[...new Set(detailedTypeIds)];
+    const primaryTypeId=uniqueDetailedTypeIds.length===1?uniqueDetailedTypeIds[0]:asNum(acc.type_id,NaN);
+    const operation=asStr(typeNames.get(primaryTypeId)||`Accrual ${first(acc.accrual_id,acc.type_id)}`);
     const group=asStr(acc.accrued_category);
     const isPeriodAdjustment=/компенсац|декомпенсац|начислени.{0,8}по спору|compensation|dispute/i.test(`${group} ${operation}`);
     const amount=money(acc.total_amount);
@@ -498,7 +505,9 @@ function normalizeAccrualFinance(accruals,maps,typeNames,postingMap){
         const name=typeNames.get(tid)||`type ${tid}`;
         const component=classifyService(name),amount=-a;
         row[component]+=amount;
-        row.chargeLines.push({typeId:tid,typeName:name,component,amount});
+        const compensationFee=a>0&&/компенсац|возмещен|претензи|compensation|reimbursement|claim/i.test(name);
+        if(compensationFee){row.compensationIncome+=a;row.financeIncomeKind='compensation'}
+        row.chargeLines.push({typeId:tid,typeName:name,component,amount,...(compensationFee?{incomeKind:'compensation'}:{})});
       }
     }
 

@@ -74,8 +74,8 @@ assert.equal(retro.rows[0].returnStatus,'full');
 const compensationPosting='0117367898-0030-1';
 const compensationRows=context.normalizeAccrualFinance([{
   date:'2026-08-15',unit_number:compensationPosting,accrual_id:7001,total_amount:6795,
-  non_item_fee:{accrual_id:7001,accrued:6795}
-}],maps,new Map([[7001,'Начисление по спору: компенсация']]),{
+  non_item_fee:{type_id:10,accrued:6795}
+}],maps,new Map([[10,'Компенсация']]),{
   [compensationPosting]:{postingNumber:compensationPosting,orderNumber:'order-compensation',orderDate:'2026-07-17',orderSchema:'FBS',products:[{sku:'sku-main',article:'4466',name:'Компенсированный товар',quantity:1,price:6795}]}
 });
 assert.equal(compensationRows.length,1);
@@ -108,23 +108,30 @@ const augustRealized=[{
 }];
 const rawPeriodFinance=[
   {...context.emptyFinanceComponents(),date:'2026-09-02',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Вознаграждение за продажу',rawAmount:-300,commission:300},
+  {...context.emptyFinanceComponents(),date:'2026-07-20',postingNumber:'',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Эквайринг',rawAmount:-20,acquiring:20},
   {...context.emptyFinanceComponents(),date:'2026-09-05',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Обработка возврата',rawAmount:-140,returns:140},
   {...context.emptyFinanceComponents(),date:'2026-09-06',postingNumber:'',orderNumber:'',sku:'',article:'',operation:'Premium подписка',rawAmount:-990,other:990},
-  {...context.emptyFinanceComponents(),date:'2026-09-07',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Компенсация Ozon',financeIncomeKind:'compensation',rawAmount:200,other:-200}
+  {...context.emptyFinanceComponents(),date:'2026-09-07',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Компенсация Ozon',financeIncomeKind:'compensation',rawAmount:200,other:-200},
+  {...context.emptyFinanceComponents(),date:'2026-09-08',postingNumber:'',orderNumber:'order-aug',sku:'sku-main',article:'4466',operation:'Возврат эквайринга',rawAmount:10,acquiring:-10}
 ];
 const attributed=context.attributeOrderFinanceToSaleDate(rawPeriodFinance,augustRealized);
 assert.equal(attributed.rows[0].date,'2026-08-22');
 assert.equal(attributed.rows[0].financeDate,'2026-09-02');
 assert.equal(attributed.rows[0].accountingDateSource,'order-sale-date');
-assert.equal(attributed.rows[1].date,'2026-09-05');
-assert.equal(attributed.rows[1].returnDatePolicy,'finance-date');
-assert.equal(attributed.rows[2].date,'2026-09-06');
-assert.equal(attributed.rows[2].accountingDateSource,'finance-date');
-assert.equal(attributed.rows[3].date,'2026-09-07');
+assert.equal(attributed.rows[1].date,'2026-08-22');
+assert.equal(attributed.rows[1].financeDate,'2026-07-20');
+assert.equal(attributed.rows[1].accountingDateSource,'order-sale-date');
+assert.equal(attributed.rows[2].date,'2026-09-05');
+assert.equal(attributed.rows[2].returnDatePolicy,'finance-date');
+assert.equal(attributed.rows[3].date,'2026-09-06');
 assert.equal(attributed.rows[3].accountingDateSource,'finance-date');
-assert.equal(attributed.diagnostics.shiftedRows,1);
-assert.equal(attributed.diagnostics.returnRowsKeptOnFinanceDate,1);
-assert.equal(attributed.diagnostics.positiveIncomeRowsKeptOnFinanceDate,1);
+assert.equal(attributed.rows[4].date,'2026-09-07');
+assert.equal(attributed.rows[4].accountingDateSource,'finance-date');
+assert.equal(attributed.rows[5].date,'2026-09-08');
+assert.equal(attributed.rows[5].returnDatePolicy,'finance-date');
+assert.equal(attributed.diagnostics.shiftedRows,2);
+assert.equal(attributed.diagnostics.returnRowsKeptOnFinanceDate,2);
+assert.equal(attributed.diagnostics.positiveIncomeRowsKeptOnFinanceDate,2);
 assert.equal(attributed.diagnostics.totalDelta,0);
 
 const mixedOrderCharge={
