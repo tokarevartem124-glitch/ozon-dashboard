@@ -671,14 +671,13 @@ function commonOzonExpenseGroup(line,row={}){
   if(/досрочн.{0,16}выплат|early.{0,12}pay/.test(text))return'Досрочная выплата';
   if(/рассыл.{0,20}уведом|notification/.test(text))return'Рассылка уведомлений';
   if(/страхов|insurance/.test(text))return'Страховка';
-  if(/хранен.{0,30}(пвз|пункт.{0,12}выдач)|(пвз|пункт.{0,12}выдач).{0,30}хранен/.test(text))return'Платное хранение товаров на ПВЗ';
-  if(/дополнительн.{0,20}упаков.{0,20}возврат/.test(text))return'Дополнительная упаковка возвратов';
+  if(/хранен.{0,30}(пвз|пункт.{0,12}выдач)|(пвз|пункт.{0,12}выдач).{0,30}хранен|временн.{0,12}размещен.{0,16}товар.{0,16}партнер/.test(text))return'Платное хранение товаров на ПВЗ';
+  if(/дополнительн.{0,20}упаков.{0,20}возврат|обеспечен.{0,16}материал.{0,16}упаковк|упаковк.{0,16}товар.{0,16}партнер/.test(text))return'Дополнительная упаковка возвратов';
   const sellerError=component==='fines'||/штраф|penalt|овх|объ?емно.{0,8}вес|жалоб|неполн.{0,12}комплект|не тот товар|нестандартн.{0,12}товар|нерекомендованн.{0,12}слот|по вине продавц|ошибк.{0,12}продавц/.test(text);
   return sellerError?'Ошибки продавца':'';
 }
 function splitCommonOzonExpenses(financeRows){
   const out=[];
-  const augustUnclassified=new Map();
   const diagnostics={sourceRows:(financeRows||[]).length,outputRows:0,splitRows:0,commonRows:0,commonNet:0,commonExpenses:0,groups:{},months:{},ledgerDelta:0};
   const before=financeTotals(financeRows||[]).netAfterOzon;
   for(const source of financeRows||[]){
@@ -690,17 +689,7 @@ function splitCommonOzonExpenses(financeRows){
       if(managementGroup)commonLines.push({...line,managementGroup});
       else orderLines.push(line);
     }
-    if(!commonLines.length){
-      if(monthKey(first(source.financeDate,source.date))==='2026-08')for(const line of lines){
-        const key=`${asStr(line.component)||'other'}|${asStr(line.typeName)||asStr(source.operation)||'без названия'}`;
-        augustUnclassified.set(key,(augustUnclassified.get(key)||0)+asNum(line.amount,0));
-      }
-      out.push(source);continue
-    }
-    if(monthKey(first(source.financeDate,source.date))==='2026-08')for(const line of orderLines){
-      const key=`${asStr(line.component)||'other'}|${asStr(line.typeName)||asStr(source.operation)||'без названия'}`;
-      augustUnclassified.set(key,(augustUnclassified.get(key)||0)+asNum(line.amount,0));
-    }
+    if(!commonLines.length){out.push(source);continue}
     const commonComponents=emptyFinanceComponents();
     for(const line of commonLines){
       const component=FINANCE_COMPONENT_KEYS.includes(line.component)?line.component:'other';
@@ -738,8 +727,7 @@ function splitCommonOzonExpenses(financeRows){
   }
   diagnostics.outputRows=out.length;
   diagnostics.ledgerDelta=financeTotals(out).netAfterOzon-before;
-  const debug={augustUnclassified:[...augustUnclassified.entries()].map(([typeName,amount])=>({typeName,amount})).sort((a,b)=>Math.abs(a.amount)-Math.abs(b.amount))};
-  return {rows:out,diagnostics,debug};
+  return {rows:out,diagnostics};
 }
 
 function attributeOrderFinanceToSaleDate(financeRows,realizedRows){
@@ -2275,7 +2263,6 @@ console.log(`Daily realization rows=${realization.rows.length}; coverage=${reali
 const commonExpenseSplit=splitCommonOzonExpenses(financeRows);
 if(Math.abs(commonExpenseSplit.diagnostics.ledgerDelta)>0.005)throw new Error(`Common Ozon expense split changed ledger total by ${commonExpenseSplit.diagnostics.ledgerDelta}`);
 console.log(`Common Ozon expenses: rows=${commonExpenseSplit.diagnostics.commonRows}; split source rows=${commonExpenseSplit.diagnostics.splitRows}; expenses=${commonExpenseSplit.diagnostics.commonExpenses.toFixed(2)}; August=${JSON.stringify(commonExpenseSplit.diagnostics.months['2026-08']||{})}; ledger delta=${commonExpenseSplit.diagnostics.ledgerDelta.toFixed(6)}`);
-console.log(`August unclassified Finance charge types: ${JSON.stringify(commonExpenseSplit.debug.augustUnclassified)}`);
 const financeAttribution=attributeOrderFinanceToSaleDate(commonExpenseSplit.rows,realization.rows);
 if(Math.abs(financeAttribution.diagnostics.totalDelta)>0.005)throw new Error(`Order-period Finance attribution changed ledger total by ${financeAttribution.diagnostics.totalDelta}`);
 const attributedFinanceRows=financeAttribution.rows;

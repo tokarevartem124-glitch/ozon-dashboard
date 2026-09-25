@@ -159,6 +159,9 @@ const premiumSplit=context.splitCommonOzonExpenses([{...context.emptyFinanceComp
 assert.equal(premiumSplit.rows[0].commonExpenseGroup,'Премиум-подписка');
 assert.equal(premiumSplit.diagnostics.groups['Премиум-подписка'],24990);
 assert.equal(context.commonOzonExpenseGroup({typeName:'Корректировка сверки начисления',component:'other'},{operation:'Premium-подписка'}),'Премиум-подписка');
+assert.equal(context.commonOzonExpenseGroup({typeName:'Временное размещение товара партнерами',component:'other'}),'Платное хранение товаров на ПВЗ');
+assert.equal(context.commonOzonExpenseGroup({typeName:'Обеспечение материалами для упаковки товара',component:'other'}),'Дополнительная упаковка возвратов');
+assert.equal(context.commonOzonExpenseGroup({typeName:'Упаковка товара партнёрами',component:'other'}),'Дополнительная упаковка возвратов');
 
 const realizedRows=cis.rows.map(r=>({...r,returnedQty:0,netQty:r.soldQty,originalRevenue:r.soldQty*r.unitPrice,revenue:r.soldQty*r.unitPrice,retroReturnedRevenue:0}));
 const passed=context.validateRealizationPublishGate({rows:realizedRows,diagnostics:{pAndLPriceMissing:0,marketplaceBuyoutSalesExpectedPostings:1,marketplaceBuyoutSalesCoveredPostings:1,marketplaceBuyoutSalesMissingPostings:[],marketplaceBuyoutSalesInvalidRows:0}});
