@@ -28,9 +28,10 @@ const context={
   crypto,
   money:v=>Number(v?.amount??v??0),
   classifyService:()=> 'other',
+  FINANCE_COMPONENT_KEYS:['commission','acquiring','logistics','storage','ads','fines','returns','other'],
 };
 vm.createContext(context);
-for(const name of ['emptyFinanceComponents','normalizeAccrualFinance','applyValidatedCompensationLinks','financeTotals','attributeOrderFinanceToSaleDate','postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
+for(const name of ['emptyFinanceComponents','normalizeAccrualFinance','applyValidatedCompensationLinks','financeTotals','commonOzonExpenseGroup','splitCommonOzonExpenses','attributeOrderFinanceToSaleDate','postingSkuKey','buildDeliveredItemEvidence','buildDeliveredSalesFromPostingMap','appendMissingMarketplaceBuyoutSales','applyFinanceRecognitionDates','supplementReturnsFromReturnsApi','applyRetroactiveReturns','validateRealizationPublishGate']){
   vm.runInContext(`${extractFunction(name)};this.${name}=${name};`,context);
 }
 
@@ -126,6 +127,39 @@ assert.equal(attributed.diagnostics.returnRowsKeptOnFinanceDate,1);
 assert.equal(attributed.diagnostics.positiveIncomeRowsKeptOnFinanceDate,1);
 assert.equal(attributed.diagnostics.totalDelta,0);
 
+const mixedOrderCharge={
+  ...context.emptyFinanceComponents(),date:'2026-09-02',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',
+  transactionId:'mixed-order-charge',operation:'Штраф по заказу',grossRevenue:1000,rawAmount:650,commission:300,fines:50,financeAttribution:'direct_sku',financeScope:'posting_item',
+  chargeLines:[
+    {typeName:'Вознаграждение за продажу',component:'commission',amount:300},
+    {typeName:'Жалобы покупателей: неполная комплектация',component:'fines',amount:50}
+  ]
+};
+const split=context.splitCommonOzonExpenses([mixedOrderCharge]);
+assert.equal(split.rows.length,2);
+assert.equal(split.diagnostics.ledgerDelta,0);
+assert.equal(split.rows.reduce((z,r)=>z+r.rawAmount,0),650);
+const splitOrder=split.rows.find(r=>!r.commonExpense),splitPeriod=split.rows.find(r=>r.commonExpense);
+assert.equal(splitOrder.rawAmount,700);
+assert.equal(splitOrder.commission,300);
+assert.equal(splitOrder.fines,0);
+assert.equal(splitPeriod.rawAmount,-50);
+assert.equal(splitPeriod.fines,50);
+assert.equal(splitPeriod.article,'');
+assert.equal(splitPeriod.sku,'');
+assert.equal(splitPeriod.financeScope,'period');
+assert.equal(splitPeriod.commonExpenseGroup,'Ошибки продавца');
+assert.equal(splitPeriod.sourcePostingNumber,'post-aug');
+const splitAttributed=context.attributeOrderFinanceToSaleDate(split.rows,augustRealized);
+assert.equal(splitAttributed.rows.find(r=>!r.commonExpense).date,'2026-08-22');
+assert.equal(splitAttributed.rows.find(r=>r.commonExpense).date,'2026-09-02');
+assert.equal(splitAttributed.diagnostics.periodCommonRowsKeptOnFinanceDate,1);
+
+const premiumSplit=context.splitCommonOzonExpenses([{...context.emptyFinanceComponents(),date:'2026-08-10',transactionId:'premium',rawAmount:-24990,other:24990,financeAttribution:'unallocated',financeScope:'period',chargeLines:[{typeName:'Premium-подписка',component:'other',amount:24990}]}]);
+assert.equal(premiumSplit.rows[0].commonExpenseGroup,'Премиум-подписка');
+assert.equal(premiumSplit.diagnostics.groups['Премиум-подписка'],24990);
+assert.equal(context.commonOzonExpenseGroup({typeName:'Корректировка сверки начисления',component:'other'},{operation:'Premium-подписка'}),'Премиум-подписка');
+
 const realizedRows=cis.rows.map(r=>({...r,returnedQty:0,netQty:r.soldQty,originalRevenue:r.soldQty*r.unitPrice,revenue:r.soldQty*r.unitPrice,retroReturnedRevenue:0}));
 const passed=context.validateRealizationPublishGate({rows:realizedRows,diagnostics:{pAndLPriceMissing:0,marketplaceBuyoutSalesExpectedPostings:1,marketplaceBuyoutSalesCoveredPostings:1,marketplaceBuyoutSalesMissingPostings:[],marketplaceBuyoutSalesInvalidRows:0}});
 assert.equal(passed.status,'passed');
@@ -142,6 +176,6 @@ assert.match(dashboardSource,/'Номер отправления Ozon':orders\.m
 assert.match(dashboardSource,/\.\.\.productOrderExportColumns\(p\)/);
 assert.match(dashboardSource,/Доходы от Ozon всего/);
 assert.match(dashboardSource,/'Компенсация Ozon':safe\(r\.compensationIncome\)/);
-assert.match(dashboardSource,/v10\.7-order-period-expenses/);
+assert.match(dashboardSource,/v10\.8-period-common-expenses/);
 
 console.log('Data Guard regression tests passed.');

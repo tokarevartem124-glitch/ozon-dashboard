@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
 /*
-  Ozon Seller Analytics — Seller API + validated supplements sync (v10.7 Order-period Expenses)
+  Ozon Seller Analytics — Seller API + validated supplements sync (v10.8 Period-level Ozon Expenses)
 
   Source policy:
     - operational Ozon data comes from Seller API;
@@ -40,7 +40,7 @@ const HISTORY_DAYS = Math.max(30, Number(process.env.OZON_HISTORY_DAYS || 120));
 const BUSINESS_START = String(process.env.OZON_BUSINESS_START || '2026-06-01').slice(0,10);
 const DAILY_QTY_VERSION = 6;
 const QUANTITY_ENGINE_VERSION = 12;
-const FINANCE_ATTRIBUTION_VERSION = 11;
+const FINANCE_ATTRIBUTION_VERSION = 12;
 const DELIVERY_STATUS_DATE_VERSION = 4;
 // Increment when posting-derived order metadata changes. This forces a one-time
 // full posting refresh so historical orders do not keep stale/fallback dates.
@@ -657,6 +657,79 @@ function financeTotals(rows){
   return {grossRevenue,netAfterOzon,components};
 }
 
+const FINANCE_COMPONENT_KEYS=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
+function commonOzonExpenseGroup(line,row={}){
+  // Charge-line names are authoritative. Row-level operation text is only a
+  // fallback for legacy rows without a detailed charge breakdown; otherwise a
+  // mixed accrual titled "fine" could incorrectly pull its sales commission out
+  // of the order together with the actual fine line.
+  const ownText=asStr(line?.typeName).trim();
+  const genericLine=/^корректировка сверки начисления$|^type \d+$|^other$|^прочее$/i.test(ownText);
+  const text=(ownText&&!genericLine?ownText:`${ownText} ${asStr(row.group)} ${asStr(row.operation)}`).toLowerCase().replaceAll('ё','е');
+  const component=asStr(line?.component);
+  if(/premium|премиум/.test(text))return'Премиум-подписка';
+  if(/досрочн.{0,16}выплат|early.{0,12}pay/.test(text))return'Досрочная выплата';
+  if(/рассыл.{0,20}уведом|notification/.test(text))return'Рассылка уведомлений';
+  if(/страхов|insurance/.test(text))return'Страховка';
+  if(/хранен.{0,30}(пвз|пункт.{0,12}выдач)|(пвз|пункт.{0,12}выдач).{0,30}хранен/.test(text))return'Платное хранение товаров на ПВЗ';
+  if(/дополнительн.{0,20}упаков.{0,20}возврат/.test(text))return'Дополнительная упаковка возвратов';
+  const sellerError=component==='fines'||/штраф|penalt|овх|объ?емно.{0,8}вес|жалоб|неполн.{0,12}комплект|не тот товар|нестандартн.{0,12}товар|нерекомендованн.{0,12}слот|по вине продавц|ошибк.{0,12}продавц/.test(text);
+  return sellerError?'Ошибки продавца':'';
+}
+function splitCommonOzonExpenses(financeRows){
+  const out=[];
+  const diagnostics={sourceRows:(financeRows||[]).length,outputRows:0,splitRows:0,commonRows:0,commonNet:0,commonExpenses:0,groups:{},months:{},ledgerDelta:0};
+  const before=financeTotals(financeRows||[]).netAfterOzon;
+  for(const source of financeRows||[]){
+    const suppliedLines=Array.isArray(source.chargeLines)&&source.chargeLines.length?source.chargeLines:null;
+    const lines=suppliedLines||FINANCE_COMPONENT_KEYS.filter(k=>Math.abs(asNum(source[k],0))>.0005).map(k=>({typeId:null,typeName:first(source.operation,source.group,k),component:k,amount:asNum(source[k],0)}));
+    const commonLines=[],orderLines=[];
+    for(const line of lines){
+      const managementGroup=commonOzonExpenseGroup(line,source);
+      if(managementGroup)commonLines.push({...line,managementGroup});
+      else orderLines.push(line);
+    }
+    if(!commonLines.length){out.push(source);continue}
+    const commonComponents=emptyFinanceComponents();
+    for(const line of commonLines){
+      const component=FINANCE_COMPONENT_KEYS.includes(line.component)?line.component:'other';
+      commonComponents[component]+=asNum(line.amount,0);
+    }
+    const commonNet=-FINANCE_COMPONENT_KEYS.reduce((z,k)=>z+asNum(commonComponents[k],0),0);
+    const normalComponents=Object.fromEntries(FINANCE_COMPONENT_KEYS.map(k=>[k,asNum(source[k],0)-asNum(commonComponents[k],0)]));
+    const normalNet=asNum(source.rawAmount,0)-commonNet;
+    const normalHasValue=Math.abs(normalNet)>.0005||Math.abs(asNum(source.grossRevenue,0))>.0005||FINANCE_COMPONENT_KEYS.some(k=>Math.abs(normalComponents[k])>.0005);
+    if(normalHasValue){
+      out.push({...source,...normalComponents,rawAmount:normalNet,chargeLines:orderLines,transactionId:`${asStr(source.transactionId)}:order`});
+      diagnostics.splitRows++;
+    }
+    const groups=[...new Set(commonLines.map(x=>x.managementGroup).filter(Boolean))];
+    const managementGroup=groups.length===1?groups[0]:'Общие расходы Ozon';
+    const commonRow={...source,...commonComponents,
+      date:dateOnly(first(source.financeDate,source.date)),financeDate:dateOnly(first(source.financeDate,source.date)),
+      article:'',sku:'',itemSkus:[],linkedProducts:[],grossRevenue:null,sellerPriceRaw:0,salePriceRaw:0,saleAmount:0,bonus:0,coinvestment:0,
+      soldQty:0,returnedQty:0,financeQtyResolved:0,financeQtyUnresolved:0,feeQuantity:0,compensationIncome:0,financeIncomeKind:'',
+      rawAmount:commonNet,chargeLines:commonLines,financeAttribution:'unallocated',financeScope:'period',managementScope:'period',commonExpense:true,commonExpenseGroup:managementGroup,
+      sourceArticle:asStr(source.article),sourceSku:asStr(source.sku),sourcePostingNumber:asStr(source.postingNumber),sourceOrderNumber:asStr(source.orderNumber),
+      transactionId:`${asStr(source.transactionId)}:period-common`
+    };
+    out.push(commonRow);
+    diagnostics.commonRows++;
+    diagnostics.commonNet+=commonNet;
+    diagnostics.commonExpenses+=FINANCE_COMPONENT_KEYS.reduce((z,k)=>z+Math.max(0,asNum(commonComponents[k],0)),0);
+    for(const line of commonLines){
+      const group=line.managementGroup||managementGroup;
+      diagnostics.groups[group]=(diagnostics.groups[group]||0)+asNum(line.amount,0);
+      const month=monthKey(commonRow.financeDate);
+      diagnostics.months[month]=diagnostics.months[month]||{};
+      diagnostics.months[month][group]=(diagnostics.months[month][group]||0)+asNum(line.amount,0);
+    }
+  }
+  diagnostics.outputRows=out.length;
+  diagnostics.ledgerDelta=financeTotals(out).netAfterOzon-before;
+  return {rows:out,diagnostics};
+}
+
 function attributeOrderFinanceToSaleDate(financeRows,realizedRows){
   const maps={postingSku:new Map(),postingArticle:new Map(),posting:new Map(),orderSku:new Map(),orderArticle:new Map(),order:new Map()};
   const add=(map,key,date)=>{
@@ -675,7 +748,7 @@ function attributeOrderFinanceToSaleDate(financeRows,realizedRows){
     add(maps.order,order,date);
   }
   const unique=(map,key)=>{const dates=key?map.get(key):null;return dates?.size===1?[...dates][0]:''};
-  const diagnostics={rows:0,linkedRows:0,shiftedRows:0,returnRowsKeptOnFinanceDate:0,positiveIncomeRowsKeptOnFinanceDate:0,linkedWithoutSaleDate:0,shiftedNet:0,shiftedExpenses:0,monthMoves:{}};
+  const diagnostics={rows:0,linkedRows:0,shiftedRows:0,returnRowsKeptOnFinanceDate:0,positiveIncomeRowsKeptOnFinanceDate:0,periodCommonRowsKeptOnFinanceDate:0,linkedWithoutSaleDate:0,shiftedNet:0,shiftedExpenses:0,monthMoves:{}};
   const componentKeys=['commission','acquiring','logistics','storage','ads','fines','returns','other'];
   const rows=(financeRows||[]).map(r=>{
     diagnostics.rows++;
@@ -685,6 +758,7 @@ function attributeOrderFinanceToSaleDate(financeRows,realizedRows){
     if(linked)diagnostics.linkedRows++;
     const operationText=`${asStr(r.group)} ${asStr(r.operation)} ${(r.chargeLines||[]).map(x=>asStr(x?.typeName)).join(' ')}`.toLowerCase();
     const returnRelated=asNum(r.returns,0)>0.0005||asNum(r.returnedQty,0)>0||asNum(r.saleAmount,0)<-0.005||/возврат|return|refund|сторно|reverse/.test(operationText);
+    const periodCommon=Boolean(r.commonExpense||r.managementScope==='period');
     const grossExpense=componentKeys.reduce((z,k)=>z+Math.max(0,asNum(r[k],0)),0);
     const positiveIncome=asStr(r.financeIncomeKind)==='compensation'||(asNum(r.rawAmount,0)>0&&grossExpense<0.0005);
     const saleDate=
@@ -697,7 +771,8 @@ function attributeOrderFinanceToSaleDate(financeRows,realizedRows){
     if(linked&&!saleDate)diagnostics.linkedWithoutSaleDate++;
     if(linked&&returnRelated)diagnostics.returnRowsKeptOnFinanceDate++;
     if(linked&&positiveIncome)diagnostics.positiveIncomeRowsKeptOnFinanceDate++;
-    const useSaleDate=linked&&!returnRelated&&!positiveIncome&&grossExpense>0.0005&&saleDate;
+    if(periodCommon)diagnostics.periodCommonRowsKeptOnFinanceDate++;
+    const useSaleDate=linked&&!returnRelated&&!positiveIncome&&!periodCommon&&grossExpense>0.0005&&saleDate;
     const accountingDate=useSaleDate?saleDate:financeDate;
     if(useSaleDate&&financeDate&&saleDate!==financeDate){
       diagnostics.shiftedRows++;
@@ -2180,17 +2255,20 @@ if(publishQualityGate.criticalIssues.length)throw new Error(`Publication blocked
 const realizedRange={start:realization.coverage.start,end:realization.coverage.end};
 console.log(`Daily realization rows=${realization.rows.length}; coverage=${realizedRange.start||'none'}..${realizedRange.end||'none'}; complete=${realization.coverage.complete}; monthlyLoaded=${realization.diagnostics.monthlyLoaded}; dailyOfficialLoaded=${realization.diagnostics.dailyLoaded}; dailyPremium=${realization.diagnostics.dailyPremiumAvailable}`);
 
-/* Management-period attribution: every Finance operation linked to a realized
-   order follows that order's sale-recognition date, except return-related charges,
-   which remain on their actual Ozon Finance date. That untouched date remains in
-   financeDate for cash/payout reconciliation. Seller-level rows without an
-   order/posting link also remain on their original Finance date. */
-const financeAttribution=attributeOrderFinanceToSaleDate(financeRows,realization.rows);
+/* Management-period attribution: every ordinary Finance operation linked to a
+   realized order follows that order's sale-recognition date. Return-related
+   charges and the explicitly classified common Ozon expenses remain on their
+   actual Finance date. A mixed API accrual is split at charge-line level so only
+   the common component leaves order/SKU economics. */
+const commonExpenseSplit=splitCommonOzonExpenses(financeRows);
+if(Math.abs(commonExpenseSplit.diagnostics.ledgerDelta)>0.005)throw new Error(`Common Ozon expense split changed ledger total by ${commonExpenseSplit.diagnostics.ledgerDelta}`);
+console.log(`Common Ozon expenses: rows=${commonExpenseSplit.diagnostics.commonRows}; split source rows=${commonExpenseSplit.diagnostics.splitRows}; expenses=${commonExpenseSplit.diagnostics.commonExpenses.toFixed(2)}; August=${JSON.stringify(commonExpenseSplit.diagnostics.months['2026-08']||{})}; ledger delta=${commonExpenseSplit.diagnostics.ledgerDelta.toFixed(6)}`);
+const financeAttribution=attributeOrderFinanceToSaleDate(commonExpenseSplit.rows,realization.rows);
 if(Math.abs(financeAttribution.diagnostics.totalDelta)>0.005)throw new Error(`Order-period Finance attribution changed ledger total by ${financeAttribution.diagnostics.totalDelta}`);
 const attributedFinanceRows=financeAttribution.rows;
 const skuFinanceRows=attributedFinanceRows.filter(r=>r.financeAttribution==='direct_sku'&&(r.sku||r.article));
-console.log(`Order-period Finance attribution v11: linked=${financeAttribution.diagnostics.linkedRows}; shifted=${financeAttribution.diagnostics.shiftedRows}; returns kept on Finance date=${financeAttribution.diagnostics.returnRowsKeptOnFinanceDate}; positive income kept on Finance date=${financeAttribution.diagnostics.positiveIncomeRowsKeptOnFinanceDate}; without sale date=${financeAttribution.diagnostics.linkedWithoutSaleDate}; ledger delta=${financeAttribution.diagnostics.totalDelta.toFixed(6)}; moves=${JSON.stringify(financeAttribution.diagnostics.monthMoves)}`);
-console.log(`SKU finance by-day direct v11.0: rows=${skuFinanceRows.length}; accounting date=order sale date when linked; original Finance date retained; source=/v1/finance/accrual/by-day`);
+console.log(`Order-period Finance attribution v12: linked=${financeAttribution.diagnostics.linkedRows}; shifted=${financeAttribution.diagnostics.shiftedRows}; returns kept on Finance date=${financeAttribution.diagnostics.returnRowsKeptOnFinanceDate}; period-common kept on Finance date=${financeAttribution.diagnostics.periodCommonRowsKeptOnFinanceDate}; positive income kept on Finance date=${financeAttribution.diagnostics.positiveIncomeRowsKeptOnFinanceDate}; without sale date=${financeAttribution.diagnostics.linkedWithoutSaleDate}; ledger delta=${financeAttribution.diagnostics.totalDelta.toFixed(6)}; moves=${JSON.stringify(financeAttribution.diagnostics.monthMoves)}`);
+console.log(`SKU finance by-day direct v12.0: rows=${skuFinanceRows.length}; accounting date=order sale date when linked; named common Ozon expenses stay on Finance date; source=/v1/finance/accrual/by-day`);
 
 // Publish management-dated finance and exact SKU accruals on the same range as realization.
 const financeRowsPublished=(realizedRange.start&&realizedRange.end)?attributedFinanceRows.filter(r=>r.date>=realizedRange.start&&r.date<=realizedRange.end):attributedFinanceRows;
@@ -2237,11 +2315,11 @@ if(stockRows.length)datasets.push({id:`api-stock-${TODAY}`,apiAuto:true,type:'st
 if(priceRows.length)datasets.push({id:`api-price-${TODAY}`,apiAuto:true,type:'price',label:'Цены Ozon API',sheetName:'product/info/prices',sourceName:'Ozon Seller API',start:null,end:null,snapshot:TODAY,importedAt:generatedAt,capabilities:{prices:true,tariffEstimate:true,api:true,complete:Boolean(freshPrice.length)},rows:priceRows});
 if(financeRowsPublished.length){
   const rr=datasetRange(financeRowsPublished);
-  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'v11: обычные расходы связанного заказа учитываются по дате его продажи; исходная дата Ozon сохранена в financeDate. Возвратные списания и общие операции без заказа остаются на фактической Finance-дате.'},rows:financeRowsPublished});
+  datasets.push({id:`api-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'finance',label:'Финансы Ozon API',sheetName:financeRefresh.source||'finance API',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{finance:true,accrualReport:true,grossRevenue:true,api:true,incremental:true,components:['commission','acquiring','logistics','storage','ads','fines','returns','other'],grossRevenueTotal:finTotals.grossRevenue,rawNetTotal:finTotals.netAfterOzon,componentTotals:finTotals.components,note:'v12: обычные расходы связанного заказа учитываются по дате его продажи; исходная дата Ozon сохранена в financeDate. Возвратные списания и заданные общие расходы Ozon остаются на фактической Finance-дате и не попадают в заказ/SKU.'},rows:financeRowsPublished});
 }
 if(skuFinanceRowsPublished.length){
   const rr=datasetRange(skuFinanceRowsPublished);
-  datasets.push({id:`api-sku-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'skuFinance',label:'Товарные начисления Ozon API',sheetName:'finance/accrual/by-day · direct SKU',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{skuFinance:true,api:true,directSkuByDay:true,coverageComplete:skuFinanceCoverageComplete,note:'v11: обычные прямые расходы SKU учитываются по дате продажи связанного заказа; возвратные списания остаются на Finance-дате. Исходная дата начисления Ozon хранится отдельно.'},rows:skuFinanceRowsPublished});
+  datasets.push({id:`api-sku-finance-${rr.start}_${rr.end}`,apiAuto:true,type:'skuFinance',label:'Товарные начисления Ozon API',sheetName:'finance/accrual/by-day · direct SKU',sourceName:'Ozon Seller API',start:rr.start,end:rr.end,snapshot:null,importedAt:generatedAt,capabilities:{skuFinance:true,api:true,directSkuByDay:true,coverageComplete:skuFinanceCoverageComplete,note:'v12: обычные прямые расходы SKU учитываются по дате продажи связанного заказа; возвратные списания остаются на Finance-дате, а заданные общие расходы исключены из SKU-экономики. Исходная дата начисления Ozon хранится отдельно.'},rows:skuFinanceRowsPublished});
 }
 if(buyoutSupplement.rows.length){
   const rr=datasetRange(buyoutSupplement.rows);
@@ -2258,7 +2336,7 @@ const payload={
   diagnostics:{
     mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,previousApiOnlyStateLoaded:Boolean(previous),historyStart:HISTORY_START,businessStart:BUSINESS_START,dailyQuantityVersion:persistedDailyQuantityVersion,dailyQuantityUpgrade,quantityEngineVersion:QUANTITY_ENGINE_VERSION,needsPostingBackfill,
     products:products.length,productDetails:productDetails.length,categoryTreeRoots:categoryTree.length,prices:prices.length,stockRows:stockRows.length,stockFreshComplete:stockComplete,
-    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:FINANCE_ATTRIBUTION_VERSION,financeAttributionUpgrade,orderExpenseDateAttribution:financeAttribution.diagnostics,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
+    financeRefreshFrom:financeFrom,financeFreshRows:financeRefresh.rows.length,financeSource:financeRefresh.source,financeRowsAll:financeRows.length,financeRowsPublished:financeRowsPublished.length,financeGrossRevenueTotal:finTotals.grossRevenue,financeNetAfterOzonTotal:finTotals.netAfterOzon,financePublishedRange:{from:realizedRange.start,to:realizedRange.end},financeAttributionVersion:FINANCE_ATTRIBUTION_VERSION,financeAttributionUpgrade,commonOzonExpenses:commonExpenseSplit.diagnostics,orderExpenseDateAttribution:financeAttribution.diagnostics,financeDirectSkuRows:financeDirectRows.length,financeUnallocatedRows:financeUnallocatedRows.length,financeDirectGross,financeDirectNet,financeUnallocatedNet,financeReconcileDelta,
     skuFinanceRefreshFrom:skuFinanceFrom,skuFinanceSource:'finance/accrual/by-day direct SKU',skuFinanceDirectRows:skuFinanceRowsPublished.length,skuFinanceRowsAll:skuFinanceRows.length,skuFinanceRowsPublished:skuFinanceRowsPublished.length,skuFinanceGross,skuFinanceNet,skuFinanceRevenueDelta,skuFinanceReconcileDelta,skuFinanceCoverageComplete,
     compensationLinkSupplementRows:compensationSupplement.rows.length,compensationLinkSupplementTotal:compensationSupplement.total,compensationLinkDiagnostics:compensationLinkResult.diagnostics,
     marketplaceBuyoutSupplementRows:buyoutSupplement.rows.length,marketplaceBuyoutSupplementCommission:buyoutSupplement.total,marketplaceBuyoutSupplementSource:buyoutSupplement.meta?.sourceFile||null,marketplaceBuyoutSalesExpectedPostings:realization.diagnostics.marketplaceBuyoutSalesExpectedPostings||0,marketplaceBuyoutSalesCoveredPostings:realization.diagnostics.marketplaceBuyoutSalesCoveredPostings||0,marketplaceBuyoutSalesFallbackRows:realization.diagnostics.marketplaceBuyoutSalesFallbackRows||0,marketplaceBuyoutSalesFallbackRevenue:realization.diagnostics.marketplaceBuyoutSalesFallbackRevenue||0,marketplaceBuyoutSalesMissingPostings:realization.diagnostics.marketplaceBuyoutSalesMissingPostings||[],marketplaceBuyoutSalesInvalidRows:realization.diagnostics.marketplaceBuyoutSalesInvalidRows||0,publishQualityGate,
@@ -2279,6 +2357,6 @@ const dashboardPayload={version:payload.version,sourcePolicy:payload.sourcePolic
 const dashboardEnvelope=encryptJson(dashboardPayload,DASHBOARD_KEY,{gzip:true});
 await fs.writeFile(path.join(process.cwd(),'data','ozon-data.enc.json'),JSON.stringify(fullEnvelope));
 await fs.writeFile(path.join(process.cwd(),'data','ozon-dashboard.enc.json'),JSON.stringify(dashboardEnvelope));
-await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.7 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus validated supplements for August marketplace-buyout/CIS commissions and compensation-to-posting links omitted by Seller API. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Ordinary Ozon charges linked to an order are attributed to that order sale period, while return-related charges and seller-level charges without an order remain on their actual Finance dates. Original Ozon Finance dates are retained for payout reconciliation. Returns API supplements return events missing from realization reports. Compensation remains separate from sales revenue and appears in linked order/SKU unit economics without changing the Finance ledger total. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
+await fs.writeFile(path.join(process.cwd(),'data','ozon-status.json'),JSON.stringify({ok:warnings.length===0,generatedAt,mode:SYNC_MODE,sourcePolicy:SOURCE_POLICY,dashboardData:'ozon-dashboard.enc.json',compression:'gzip',counts:payload.diagnostics,note:'Public status contains no API key or detailed financial rows. v10.8 serves a slim gzip+AES dashboard payload without workflow history, while ozon-data.enc.json keeps the full encrypted sync state. Product finance uses direct SKU attribution from /v1/finance/accrual/by-day plus validated supplements for August marketplace-buyout/CIS commissions and compensation-to-posting links omitted by Seller API. Confirmed delivered sales are recognized in the reporting period by the positive Finance accrual date; Posting API delivery dates remain separate audit fields. Ordinary Ozon charges linked to an order are attributed to that order sale period. Return-related charges, named common Ozon expenses and other seller-level charges remain on their actual Finance dates. Named common expenses are split from mixed order accruals, shown separately at period level and excluded from order/SKU unit economics without changing the Finance ledger total. Original Ozon Finance dates are retained for payout reconciliation. Returns API supplements return events missing from realization reports. Compensation remains separate from sales revenue and appears in linked order/SKU unit economics without changing the Finance ledger total. Revenue uses posting products.price × quantity; a validated CIS seller price is used only when that posting is completely absent from Seller API delivered sales. A blocking publish gate rejects duplicate order-item rows, broken return/revenue bridges, missing sale prices, and missing validated CIS postings.'},null,2));
 console.log(`Encrypted state written. sourcePolicy=${SOURCE_POLICY}; full=${fullEnvelope.originalBytes}->${fullEnvelope.compressedBytes} bytes; dashboard=${dashboardEnvelope.originalBytes}->${dashboardEnvelope.compressedBytes} bytes; warnings=${warnings.length}`);
 if(warnings.length)console.warn('Non-fatal sync warnings:',warnings);
