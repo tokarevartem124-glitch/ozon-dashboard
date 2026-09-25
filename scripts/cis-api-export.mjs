@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 
 const BASE = 'https://api-seller.ozon.ru';
 const CLIENT_ID = process.env.OZON_CLIENT_ID;
@@ -308,15 +309,16 @@ const payload = {
 const aesKey = crypto.randomBytes(32);
 const iv = crypto.randomBytes(12);
 const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
-const encrypted = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(payload))), cipher.final()]);
+const compressed = gzipSync(Buffer.from(JSON.stringify(payload)), { level: 9 });
+const encrypted = Buffer.concat([cipher.update(compressed), cipher.final()]);
 const tag = cipher.getAuthTag();
 const publicKey = Buffer.from(PUBLIC_KEY_B64, 'base64').toString('utf8');
 const wrappedKey = crypto.publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, aesKey);
 
 await fs.mkdir('diagnostic-output', { recursive: true });
 await fs.writeFile('diagnostic-output/cis-api-export.enc.json', JSON.stringify({
-  version: 1,
-  algorithm: 'RSA-OAEP-SHA256+AES-256-GCM',
+  version: 2,
+  algorithm: 'RSA-OAEP-SHA256+AES-256-GCM+GZIP',
   wrappedKey: wrappedKey.toString('base64'),
   iv: iv.toString('base64'),
   tag: tag.toString('base64'),
