@@ -252,7 +252,7 @@ const ordinaryAccruals = allAccruals.filter(accrual => {
 });
 
 const payload = {
-  kind: 'ozon_cis_buyout_diagnostic',
+  kind: 'ozon_august_finance_reconciliation_export',
   generatedAt: new Date().toISOString(),
   requestedThrough: {
     buyout: '/v1/finance/products/buyout',
@@ -285,6 +285,15 @@ const payload = {
   matchingAccruals,
   matchingTransactions,
   matchingPostings,
+  fullAugust: {
+    accruals: accrualChunks[0]?.rows ?? [],
+    transactions: transactionChunks[0]?.operations ?? [],
+    buyouts: buyoutChunks[0] ? buyoutProducts(buyoutChunks[0]) : [],
+    postings: allPostings.filter(posting => {
+      const orderDate = String(posting?.in_process_at ?? posting?.created_at ?? posting?.shipment_date ?? posting?.delivering_date ?? '');
+      return orderDate.slice(0, 7) <= '2026-08' || String(posting?.status ?? '').toLowerCase() === 'delivered';
+    })
+  },
   ordinarySample: {
     posting: ordinaryPosting,
     accruals: ordinaryAccruals
