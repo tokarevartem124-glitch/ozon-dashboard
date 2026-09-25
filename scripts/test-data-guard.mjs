@@ -123,6 +123,14 @@ assert.equal(linkedCompensation.rows[0].rawAmount,6795);
 assert.equal(linkedCompensation.rows[0].other,-6795);
 assert.equal(linkedCompensation.diagnostics.total,6795);
 
+const autoRecognizedAnonymous=anonymousCompensation.map(r=>({...r,compensationIncome:6795,financeIncomeKind:'compensation'}));
+const linkedAutoRecognized=context.applyValidatedCompensationLinks(autoRecognizedAnonymous,{rows:[{id:'aug-auto-claim-6795',period:'2026-08',postingNumber:compensationPosting,amount:6795,name:'Компенсированный товар'}]}, {
+  [compensationPosting]:{postingNumber:compensationPosting,orderNumber:'order-compensation',orderDate:'2026-07-17',orderSchema:'FBS',products:[{sku:'sku-main',article:'4466',name:'Компенсированный товар',quantity:1,price:6795}]}
+},maps);
+assert.equal(linkedAutoRecognized.diagnostics.linked,1);
+assert.equal(linkedAutoRecognized.diagnostics.total,6795);
+assert.equal(linkedAutoRecognized.rows[0].postingNumber,compensationPosting);
+
 const augustRealized=[{
   date:'2026-08-22',recognitionDate:'2026-08-22',postingNumber:'post-aug',orderNumber:'order-aug',sku:'sku-main',article:'4466',soldQty:1,originalRevenue:2000
 }];

@@ -858,9 +858,10 @@ function applyValidatedCompensationLinks(financeRows,supplement,postingMap,maps)
       continue;
     }
     const candidates=rows.filter(r=>{
-      if(monthKey(r.date)!==spec.period||r.postingNumber||r.orderNumber||r.article||r.sku||asNum(r.compensationIncome,0))return false;
+      if(monthKey(r.date)!==spec.period||r.postingNumber||r.orderNumber||r.article||r.sku)return false;
       const positive=componentKeys.reduce((z,k)=>z+Math.max(0,-asNum(r[k],0)),0);
-      return Math.abs(asNum(r.rawAmount,0)-spec.amount)<=0.01&&Math.abs(positive-spec.amount)<=0.01;
+      const recognized=asNum(r.compensationIncome,0);
+      return Math.abs(asNum(r.rawAmount,0)-spec.amount)<=0.01&&Math.abs(positive-spec.amount)<=0.01&&(recognized===0||Math.abs(recognized-spec.amount)<=0.01);
     });
     if(candidates.length!==1)throw new Error(`Compensation ${spec.id}: expected one unlinked positive Finance row ${spec.amount.toFixed(2)} in ${spec.period}, found ${candidates.length}`);
     const source=candidates[0];
