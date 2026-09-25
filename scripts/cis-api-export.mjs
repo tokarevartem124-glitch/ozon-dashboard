@@ -164,6 +164,7 @@ const matchingTransactions = allTransactions.filter(operation => buyoutPostingNu
 
 const accrualTypes = await fetchAccrualTypes();
 const accrualChunks = [
+  await fetchAccruals('2026-06-01', '2026-07-31'),
   await fetchAccruals('2026-08-01', '2026-08-31'),
   await fetchAccruals('2026-09-01', today)
 ];
@@ -286,13 +287,17 @@ const payload = {
   matchingTransactions,
   matchingPostings,
   fullAugust: {
-    accruals: accrualChunks[0]?.rows ?? [],
+    accruals: accrualChunks[1]?.rows ?? [],
     transactions: transactionChunks[0]?.operations ?? [],
     buyouts: buyoutChunks[0] ? buyoutProducts(buyoutChunks[0]) : [],
     postings: allPostings.filter(posting => {
       const orderDate = String(posting?.in_process_at ?? posting?.created_at ?? posting?.shipment_date ?? posting?.delivering_date ?? '');
       return orderDate.slice(0, 7) <= '2026-08' || String(posting?.status ?? '').toLowerCase() === 'delivered';
     })
+  },
+  fullAudit: {
+    accruals: allAccruals,
+    postings: allPostings
   },
   ordinarySample: {
     posting: ordinaryPosting,
