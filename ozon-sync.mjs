@@ -843,13 +843,14 @@ function applyValidatedCompensationLinks(financeRows,supplement,postingMap,maps)
   const rows=(financeRows||[]).map(r=>({...r,chargeLines:Array.isArray(r.chargeLines)?r.chargeLines.map(x=>({...x})):[]}));
   const diagnostics={linked:0,alreadyLinked:0,sourceRowsConsumed:0,total:0,links:[]};
   for(const spec of supplement?.rows||[]){
+    const meta=postingMap?.[spec.postingNumber];
     const prior=rows.filter(r=>r.validatedCompensationId===spec.id);
     if(prior.length){
       diagnostics.alreadyLinked++;
       diagnostics.total+=prior.reduce((z,r)=>z+asNum(r.compensationIncome,0),0);
       continue;
     }
-    const natural=rows.filter(r=>asStr(r.postingNumber)===spec.postingNumber&&asNum(r.compensationIncome,0)>0);
+    const natural=rows.filter(r=>(asStr(r.postingNumber)===spec.postingNumber||(meta?.orderNumber&&asStr(r.orderNumber)===asStr(meta.orderNumber)))&&asNum(r.compensationIncome,0)>0);
     const naturalTotal=natural.reduce((z,r)=>z+asNum(r.compensationIncome,0),0);
     if(Math.abs(naturalTotal-spec.amount)<=0.01){
       diagnostics.alreadyLinked++;
@@ -862,7 +863,7 @@ function applyValidatedCompensationLinks(financeRows,supplement,postingMap,maps)
       return Math.abs(asNum(r.rawAmount,0)-spec.amount)<=0.01&&Math.abs(positive-spec.amount)<=0.01;
     });
     if(candidates.length!==1)throw new Error(`Compensation ${spec.id}: expected one unlinked positive Finance row ${spec.amount.toFixed(2)} in ${spec.period}, found ${candidates.length}`);
-    const source=candidates[0],meta=postingMap?.[spec.postingNumber];
+    const source=candidates[0];
     const products=(meta?.products||[]).map(p=>({
       sku:asStr(p.sku),article:asStr(first(p.article,maps?.articleBySku?.get(asStr(p.sku)))),
       name:asStr(first(p.name,spec.name,maps?.nameBySku?.get(asStr(p.sku)))),quantity:Math.max(0,asNum(p.quantity,0)),price:Math.max(0,asNum(p.price,0))

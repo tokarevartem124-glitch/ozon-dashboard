@@ -100,6 +100,12 @@ assert.equal(itemCompensationRows[0].financeIncomeKind,'compensation');
 assert.equal(itemCompensationRows[0].compensationIncome,6795);
 assert.equal(itemCompensationRows[0].other,-6795);
 assert.equal(itemCompensationRows[0].rawAmount,6795);
+const itemCompensationValidated=context.applyValidatedCompensationLinks(itemCompensationRows,{rows:[{id:'aug-item-comp',period:'2026-08',postingNumber:compensationPosting,amount:6795,name:'Компенсированный товар'}]}, {
+  [compensationPosting]:{postingNumber:compensationPosting,orderNumber:'order-compensation',orderDate:'2026-07-17',orderSchema:'FBS',products:[{sku:'sku-main',article:'4466',name:'Компенсированный товар',quantity:1,price:6795}]}
+},maps);
+assert.equal(itemCompensationValidated.diagnostics.alreadyLinked,1);
+assert.equal(itemCompensationValidated.diagnostics.total,6795);
+assert.equal(itemCompensationValidated.rows.length,1);
 
 const anonymousCompensation=[{
   date:'2026-08-07',article:'',sku:'',postingNumber:'',orderNumber:'',financeScope:'period',financeAttribution:'unallocated',
